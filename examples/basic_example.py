@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from sampling_strategies import SamplingStrategyFactory
+from core.sampling_strategies import SamplingStrategyFactory
 
 # Создание данных
 data = pd.DataFrame({

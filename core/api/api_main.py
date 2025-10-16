@@ -1,33 +1,20 @@
 from typing import Dict, Any, Union, List
 import numpy as np
 import pandas as pd
-from .base_sampler import BaseSampler
-from .temporal_samplers import TemporalSplitSampler, SeasonalSampler
-from .feature_based_samplers import FeatureBasedClusteringSampler, TSNEClusteringSampler
-from .difficulty_samplers import DifficultyBasedSampler, UncertaintySampler
+from core.sampling_strategies.base_sampler import BaseSampler
+from core.sampling_strategies.temporal_sampler import TemporalSplitSampler
+from core.sampling_strategies.feature_sampler import FeatureBasedClusteringSampler, TSNEClusteringSampler
+from core.sampling_strategies.diff_sampler import DifficultyBasedSampler, UncertaintySampler
 
 
 class SamplingStrategyFactory:
     """
     Фабрика для создания стратегий семплирования
     """
-
-    @staticmethod
-    def create_strategy(strategy_type: str, **kwargs) -> BaseSampler:
-        """
-        Создает стратегию семплирования по названию
-
-        Args:
-            strategy_type: Тип стратегии
-            **kwargs: Параметры для стратегии
-
-        Returns:
-            Объект стратегии семплирования
-        """
-        strategy_map = {
+    def __init__(self):
+        self.strategy_map = {
             # Temporal strategies
             'temporal_split': TemporalSplitSampler,
-            'seasonal': SeasonalSampler,
 
             # Feature-based strategies
             'feature_clustering': FeatureBasedClusteringSampler,
@@ -38,16 +25,29 @@ class SamplingStrategyFactory:
             'uncertainty': UncertaintySampler,
         }
 
-        if strategy_type not in strategy_map:
-            raise ValueError(f"Unknown strategy type: {strategy_type}. "
-                             f"Available: {list(strategy_map.keys())}")
+    def create_strategy(self, strategy_type: str, **kwargs) -> BaseSampler:
+        """
+        Создает стратегию семплирования по названию
 
-        return strategy_map[strategy_type](**kwargs)
+        Args:
+            strategy_type: Тип стратегии
+            **kwargs: Параметры для стратегии
+
+        Returns:
+            Объект стратегии семплирования
+        """
+
+
+        if strategy_type not in self.strategy_map:
+            raise ValueError(f"Unknown strategy type: {strategy_type}. "
+                             f"Available: {list(self.strategy_map.keys())}")
+
+        return self.strategy_map[strategy_type](**kwargs)
 
     @staticmethod
     def get_available_strategies() -> List[str]:
         """Возвращает список доступных стратегий"""
-        return ['temporal_split', 'seasonal', 'feature_clustering',
+        return ['temporal_split', 'feature_clustering',
                 'tsne_clustering', 'difficulty', 'uncertainty']
 
 
