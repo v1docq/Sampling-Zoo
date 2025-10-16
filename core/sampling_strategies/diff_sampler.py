@@ -40,16 +40,13 @@ class DifficultyBasedSampler(BaseSampler):
         predictions = cross_val_predict(self.model, data, target, cv=5)
 
         # Вычисляем сложность примеров
-        self.difficulty_scores_ = self._compute_difficulty_scores(target, predictions)
+        self.difficulty_scores_ = self._compute_difficulty_scores(data, target, predictions)
 
         # Создаем разделы на основе сложности
         hard_indices = np.where(self.difficulty_scores_ > self.difficulty_threshold)[0]
         easy_indices = np.where(self.difficulty_scores_ <= self.difficulty_threshold)[0]
 
-        self.partitions_ = {
-            'hard': hard_indices,
-            'easy': easy_indices
-        }
+        self.partitions = {'hard': hard_indices, 'easy': easy_indices}
 
         return self
 
@@ -57,15 +54,13 @@ class DifficultyBasedSampler(BaseSampler):
         """Определяет тип задачи (классификация или регрессия)"""
         return len(np.unique(target)) < 0.1 * len(target) or target.dtype == 'object'
 
-    def _compute_difficulty_scores(self, target: np.ndarray, predictions: np.ndarray) -> np.ndarray:
+    def _compute_difficulty_scores(self, data, target: np.ndarray, predictions: np.ndarray) -> np.ndarray:
         """Вычисляет оценку сложности для каждого примера"""
         if self._is_classification(target):
             # Для классификации: 1 - вероятность правильного класса
             if hasattr(self.model, 'predict_proba'):
                 # Используем кросс-валидационные вероятности если доступны
-                proba_predictions = cross_val_predict(
-                    self.model, data, target, cv=5, method='predict_proba'
-                )
+                proba_predictions = cross_val_predict(self.model, data, target, cv=5, method='predict_proba')
                 true_class_probs = proba_predictions[np.arange(len(target)), target]
                 return 1 - true_class_probs
             else:
@@ -81,8 +76,10 @@ class DifficultyBasedSampler(BaseSampler):
         """Возвращает вычисленные оценки сложности"""
         return self.difficulty_scores_
 
-    def get_partitions(self) -> Dict[Any, np.ndarray]:
-        return self.partitions_
+    def get_partitions(self,data,target) -> Dict[Any, np.ndarray]:
+        partition = {cluster: dict(feature=data.iloc[idx],
+                                   target=target[idx]) for cluster, idx in self.partitions.items()}
+        return partition
 
 
 class UncertaintySampler(BaseSampler):

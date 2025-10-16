@@ -1,7 +1,7 @@
 import sys
 import os
 
-from core.utils.synt_data import create_synt_time_series_data
+from core.utils.synt_data import create_synt_time_series_data, create_synt_tabular_data
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
@@ -10,8 +10,7 @@ from core.api.api_main import SamplingStrategyFactory
 TEMPORAL_STRATEGY_LIST = ['seasonal', 'sliding_window', 'sequential']
 
 
-
-def split_with_api(data, strategy:str):
+def split_with_api(data, strategy: str):
     """Демонстрация использования API"""
     print("\n=== Factory Pattern Demo ===")
     splitter = SamplingStrategyFactory()
@@ -22,6 +21,5 @@ def split_with_api(data, strategy:str):
 
 
 if __name__ == "__main__":
-    data = create_synt_time_series_data()
-    result_dict = {strategy:split_with_api(data, strategy) for strategy in TEMPORAL_STRATEGY_LIST}
-
+    data = create_synt_tabular_data()
+    result_dict = {strategy: split_with_api(data, strategy) for strategy in TEMPORAL_STRATEGY_LIST}

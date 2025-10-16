@@ -21,7 +21,7 @@ class FeatureBasedClusteringSampler(BaseSampler):
         self.feature_engineering = feature_engineering
         self.scaler = StandardScaler()
         self.clusterer = None
-
+        self.partitions = {}
         # Параметры для различных методов кластеризации
         self.clustering_params = kwargs
 
@@ -70,7 +70,7 @@ class FeatureBasedClusteringSampler(BaseSampler):
         for cluster_id in unique_clusters:
             if cluster_id != -1:  # Игнорируем шум для DBSCAN
                 cluster_indices = np.where(cluster_labels == cluster_id)[0]
-                self.partitions_[f'cluster_{cluster_id}'] = cluster_indices
+                self.partitions[f'cluster_{cluster_id}'] = cluster_indices
 
         return self
 
@@ -91,8 +91,10 @@ class FeatureBasedClusteringSampler(BaseSampler):
 
         return numeric_data
 
-    def get_partitions(self) -> Dict[Any, np.ndarray]:
-        return self.partitions_
+    def get_partitions(self, data, target) -> Dict[Any, np.ndarray]:
+        partition = {cluster: dict(feature=data.iloc[idx],
+                                   target=target[idx]) for cluster, idx in self.partitions.items()}
+        return partition
 
 
 class TSNEClusteringSampler(FeatureBasedClusteringSampler):

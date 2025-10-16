@@ -1,12 +1,12 @@
 import sys
 import os
-
+import numpy as np
+import pandas as pd
 from sklearn.datasets import make_classification, make_regression
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
-import numpy as np
-import pandas as pd
+
 def create_synt_tabular_data(n_samples=1000, n_features=20, problem_type='classification'):
     """Создает пример табличных данных"""
     if problem_type == 'classification':
