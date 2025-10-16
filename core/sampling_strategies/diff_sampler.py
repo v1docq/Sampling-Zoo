@@ -76,13 +76,13 @@ class DifficultyBasedSampler(BaseSampler):
         """Возвращает вычисленные оценки сложности"""
         return self.difficulty_scores_
 
-    def get_partitions(self,data,target) -> Dict[Any, np.ndarray]:
+    def get_partitions(self, data, target) -> Dict[Any, np.ndarray]:
         partition = {cluster: dict(feature=data.iloc[idx],
                                    target=target[idx]) for cluster, idx in self.partitions.items()}
         return partition
 
 
-class UncertaintySampler(BaseSampler):
+class UncertaintySampler(DifficultyBasedSampler):
     """
     Семплирование на основе неопределенности модели
     """
@@ -97,9 +97,7 @@ class UncertaintySampler(BaseSampler):
         model = RandomForestClassifier(random_state=self.random_state, n_estimators=50)
 
         # Получаем вероятности через кросс-валидацию
-        proba_predictions = cross_val_predict(
-            model, data, target, cv=5, method='predict_proba'
-        )
+        proba_predictions = cross_val_predict(model, data, target, cv=5, method='predict_proba')
 
         # Вычисляем неопределенность как энтропию распределения
         epsilon = 1e-8
@@ -110,7 +108,7 @@ class UncertaintySampler(BaseSampler):
         high_uncertainty = np.where(self.uncertainty_scores_ > self.uncertainty_threshold)[0]
         low_uncertainty = np.where(self.uncertainty_scores_ <= self.uncertainty_threshold)[0]
 
-        self.partitions_ = {
+        self.partitions = {
             'high_uncertainty': high_uncertainty,
             'low_uncertainty': low_uncertainty
         }

@@ -8,9 +8,9 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from core.api.api_main import SamplingStrategyFactory
 
 TABULAR_STRATEGY_LIST = {
-    #'feature_clustering': dict(n_clusters=4, method='kmeans'),
+    'feature_clustering': dict(n_clusters=4, method='kmeans'),
     'difficulty': dict(difficulty_threshold=0.7),
-    'uncertainty': dict(n_clusters=4, method='kmeans')
+    'uncertainty': dict(uncertainty_threshold=0.7)
 }
 
 
