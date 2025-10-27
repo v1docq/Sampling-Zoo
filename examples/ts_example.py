@@ -1,9 +1,8 @@
 import sys
 import os
 
-from core.utils.synt_data import create_synt_time_series_data, create_synt_tabular_data
-
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from core.utils.synt_data import create_synt_time_series_data, create_synt_tabular_data
 
 from core.api.api_main import SamplingStrategyFactory
 

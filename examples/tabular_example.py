@@ -1,9 +1,11 @@
 import sys
 import os
 
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
 from core.utils.synt_data import create_synt_tabular_data
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
 
 from core.api.api_main import SamplingStrategyFactory
 

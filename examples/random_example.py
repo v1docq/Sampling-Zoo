@@ -16,7 +16,7 @@ data = pd.DataFrame({
 
 # Использование фабрики для создания стратегии
 factory = SamplingStrategyFactory()
-strategy = factory.create_strategy('feature_clustering', n_clusters=3)
+strategy = factory.create_strategy('random_split', n_partitions=3)
 print(data[['feature_1', 'feature_2']])
 # Обучение и применение стратегии
 strategy.fit(data[['feature_1', 'feature_2']], target=data['target'])

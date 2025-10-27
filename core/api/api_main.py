@@ -5,7 +5,8 @@ from core.sampling_strategies.base_sampler import BaseSampler
 from core.sampling_strategies.temporal_sampler import TemporalSplitSampler
 from core.sampling_strategies.feature_sampler import FeatureBasedClusteringSampler, TSNEClusteringSampler
 from core.sampling_strategies.diff_sampler import DifficultyBasedSampler, UncertaintySampler
-
+from core.sampling_strategies.random_sampler import RandomSplitSampler
+from core.sampling_strategies.stratified_sampler import StratifiedSplitSampler
 
 class SamplingStrategyFactory:
     """
@@ -13,6 +14,13 @@ class SamplingStrategyFactory:
     """
     def __init__(self):
         self.strategy_map = {
+
+            # Random split
+            'random_split': RandomSplitSampler,
+
+            #Stratified Sampling
+            'stratified_split': StratifiedSplitSampler,
+
             # Temporal strategies
             'temporal_split': TemporalSplitSampler,
 
