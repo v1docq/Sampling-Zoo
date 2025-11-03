@@ -16,11 +16,12 @@ class StratifiedSplitSampler(BaseSampler):
         self.uniqueness_threshold = uniqueness_threshold
         self.partitions = {}
     
-    def fit(self, data: pd.DataFrame, strat_target: list[str]):
+    def fit(self, data: pd.DataFrame, strat_target: list[str], data_target: list[str] = None):
         """
         Args:
             data: Матрица признаков или сырые данные
             strat_target: Переменные, для которых будет сохранено распределение
+            data_target: Целевая переменная (опционально)
         """
         mskf = MultilabelStratifiedKFold(n_splits=self.n_partitions, shuffle=True, random_state=self.random_state)
         

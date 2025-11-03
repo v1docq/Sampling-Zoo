@@ -12,8 +12,6 @@ class BaseSampler(ABC):
     def __init__(self, random_state: int = 42, **kwargs):
         self.random_state = random_state
         self.partitions_ = None
-        # # Игнорируем дополнительные аргументы для обратной совместимости
-        # self.__dict__.update(locals())
 
     @abstractmethod
     def fit(self, data: Union[np.ndarray, pd.DataFrame], **kwargs) -> 'BaseSampler':

@@ -7,6 +7,7 @@ from core.sampling_strategies.feature_sampler import FeatureBasedClusteringSampl
 from core.sampling_strategies.diff_sampler import DifficultyBasedSampler, UncertaintySampler
 from core.sampling_strategies.random_sampler import RandomSplitSampler
 from core.sampling_strategies.stratified_sampler import StratifiedSplitSampler
+from core.sampling_strategies.balance_sampler import StratifiedBalancedSplitSampler
 
 class SamplingStrategyFactory:
     """
@@ -31,6 +32,9 @@ class SamplingStrategyFactory:
             # Difficulty-based strategies
             'difficulty': DifficultyBasedSampler,
             'uncertainty': UncertaintySampler,
+
+            #Class balance stratagie
+            'balance': StratifiedBalancedSplitSampler,
         }
 
     def create_strategy(self, strategy_type: str, **kwargs) -> BaseSampler:

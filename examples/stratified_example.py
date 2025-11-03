@@ -42,6 +42,7 @@ strategy = factory.create_strategy('stratified_split', n_partitions=4)
 strategy.fit(data, strat_target=['feature_1', 'feature_2', 'target'])
 partitions = strategy.get_partitions(data[['feature_1', 'feature_2']], target=data['target'])
 
+# Посмотрим, совпадают ли статистики в разделах с исходными
 print("Partition statistics:")
 for name, part in partitions.items():
     indices = part['feature'].index.to_numpy()
@@ -60,20 +61,3 @@ for name, part in partitions.items():
         partition_data['feature_2'].var()
     ))
 
-# for name, part in partitions.items():
-#     idx = part['feature'].index.to_numpy()
-#     y_true = np.asarray(part['target'])
-#     y_pred = predictions[idx]
-#     label = name
-
-#     if idx.size == 0:
-#         print(f"{label}: 0 samples (skipped)")
-#         continue
-
-#     errors = (y_true != y_pred).sum()
-#     total = len(idx)
-#     pct = errors / total
-#     cm = confusion_matrix(y_true, y_pred)
-#     print(f"{label}: {errors} errors out of {total} ({pct:.2%})")
-#     print("Confusion matrix for", label)
-#     print(cm)
