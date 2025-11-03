@@ -58,7 +58,6 @@ class SamplingStrategyFactory:
         return ['temporal_split', 'feature_clustering',
                 'tsne_clustering', 'difficulty', 'uncertainty']
 
-
 class AdaptiveSampler:
     """
     Адаптивный семплер, который автоматически выбирает стратегию

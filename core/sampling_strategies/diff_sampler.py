@@ -12,15 +12,16 @@ class DifficultyBasedSampler(BaseSampler):
     Семплирование на основе сложности примеров
     """
 
-    def __init__(self, difficulty_threshold: float = 0.8,
-                 base_model: str = 'random_forest',
-                 difficulty_metric: str = 'auto', **kwargs):
+    def __init__(self, difficulty_threshold: float = None,
+                 difficulty_metric: str = 'auto', 
+                 n_partitions: int = 2, model: Any = None,
+                 **kwargs):
         super().__init__(**kwargs)
         self.difficulty_threshold = difficulty_threshold
-        self.base_model = base_model
         self.difficulty_metric = difficulty_metric
-        self.model = None
+        self.model = model
         self.difficulty_scores_ = None
+        self.n_partitions = n_partitions
 
     def fit(self, data: Union[np.ndarray, pd.DataFrame],
             target: np.ndarray, **kwargs) -> 'DifficultyBasedSampler':
@@ -30,7 +31,7 @@ class DifficultyBasedSampler(BaseSampler):
             target: Целевая переменная
         """
         # Выбор базовой модели
-        if self.base_model == 'random_forest':
+        if self.model is None:
             if self._is_classification(target):
                 self.model = RandomForestClassifier(random_state=self.random_state, n_estimators=50)
             else:
@@ -43,10 +44,16 @@ class DifficultyBasedSampler(BaseSampler):
         self.difficulty_scores_ = self._compute_difficulty_scores(data, target, predictions)
 
         # Создаем разделы на основе сложности
-        hard_indices = np.where(self.difficulty_scores_ > self.difficulty_threshold)[0]
-        easy_indices = np.where(self.difficulty_scores_ <= self.difficulty_threshold)[0]
+        # Если классов 2 и получен difficulty_threshold, делим на 2 части по нему, иначе - на равные части
+        if self.n_partitions == 2 and self.difficulty_threshold is not None:
+            hard_indices = np.where(self.difficulty_scores_ > self.difficulty_threshold)[0]
+            easy_indices = np.where(self.difficulty_scores_ <= self.difficulty_threshold)[0]
 
-        self.partitions = {'hard': hard_indices, 'easy': easy_indices}
+            self.partitions = {'hard': hard_indices, 'easy': easy_indices}
+        else: 
+            #сортируем по возрастанию сложности и разбиваем на n_partitions равных частей
+            split = np.array_split(np.argsort(self.difficulty_scores_), self.n_partitions)
+            self.partitions = {f'diff_level_{i}': indices for i, indices in enumerate(split)}
 
         return self
 
@@ -81,39 +88,52 @@ class DifficultyBasedSampler(BaseSampler):
                                    target=target[idx]) for cluster, idx in self.partitions.items()}
         return partition
 
-
 class UncertaintySampler(DifficultyBasedSampler):
     """
     Семплирование на основе неопределенности модели
     """
 
-    def __init__(self, uncertainty_threshold: float = 0.5, **kwargs):
+    def __init__(self, uncertainty_threshold: float = None, n_partitions: int = 2, **kwargs):
         super().__init__(**kwargs)
         self.uncertainty_threshold = uncertainty_threshold
         self.uncertainty_scores_ = None
+        self.model = None
+        self.n_partitions = n_partitions
 
     def fit(self, data: Union[np.ndarray, pd.DataFrame],
             target: np.ndarray, **kwargs) -> 'UncertaintySampler':
-        model = RandomForestClassifier(random_state=self.random_state, n_estimators=50)
+        
+        # Выбор базовой модели
+        if self.model is None:
+            self.model = RandomForestClassifier(random_state=self.random_state, n_estimators=50)
 
         # Получаем вероятности через кросс-валидацию
-        proba_predictions = cross_val_predict(model, data, target, cv=5, method='predict_proba')
+        proba_predictions = cross_val_predict(self.model, data, target, cv=5, method='predict_proba')
 
         # Вычисляем неопределенность как энтропию распределения
         epsilon = 1e-8
         entropy = -np.sum(proba_predictions * np.log(proba_predictions + epsilon), axis=1)
         self.uncertainty_scores_ = entropy / np.log(proba_predictions.shape[1])  # Нормализуем
 
-        # Создаем разделы
-        high_uncertainty = np.where(self.uncertainty_scores_ > self.uncertainty_threshold)[0]
-        low_uncertainty = np.where(self.uncertainty_scores_ <= self.uncertainty_threshold)[0]
-
-        self.partitions = {
-            'high_uncertainty': high_uncertainty,
-            'low_uncertainty': low_uncertainty
-        }
-
+        # Если классов 2 и получен difficulty_threshold, делим на 2 части по нему, иначе - на равные части
+        if self.n_partitions == 2 and self.uncertainty_threshold is not None:
+            high_uncertainty_indices = np.where(self.uncertainty_scores_ > self.uncertainty_threshold)[0]
+            low_uncertainty_indices = np.where(self.uncertainty_scores_ <= self.uncertainty_threshold)[0]
+            self.partitions = {
+                'high_uncertainty': high_uncertainty_indices,
+                'low_uncertainty': low_uncertainty_indices
+            }
+        else:
+            #сортируем по возрастанию неопределенности и разбиваем на n_partitions равных частей
+            split = np.array_split(np.argsort(self.uncertainty_scores_), self.n_partitions)
+            self.partitions = {f'uncertainty_level_{i}': indices for i, indices in enumerate(split)}
+            
         return self
-
+    
+    def get_partitions(self, data, target) -> Dict[Any, np.ndarray]:
+        partition = {cluster: dict(feature=data.iloc[idx],
+                                   target=target[idx]) for cluster, idx in self.partitions.items()}
+        return partition
+    
     def get_uncertainty_scores(self) -> np.ndarray:
         return self.uncertainty_scores_
