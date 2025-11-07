@@ -42,7 +42,7 @@ class StratifiedSplitSampler(BaseSampler):
         multilabel = pd.get_dummies(processed_data)
 
         for i, (_, part_idx) in enumerate(mskf.split(data, multilabel)):
-            self.partitions[f'partition_{i}'] = part_idx
+            self.partitions[f'chunk_{i}'] = part_idx
 
         return self
 
@@ -50,4 +50,20 @@ class StratifiedSplitSampler(BaseSampler):
         partition = {cluster: dict(feature=data.iloc[idx],
                                    target=target[idx]) for cluster, idx in self.partitions.items()}
         return partition
-            
+
+    def check_partitions(self, partitions, data):
+        print("Partition statistics:")
+        feature_names = data.columns.to_list()
+        feature_names = [x for x in feature_names if not x.__contains__('target')]
+        for name, part in partitions.items():
+            for feat in feature_names:
+                indices = part['feature'].index.to_numpy()
+                partition_data = data.iloc[indices]
+                partition_data = partition_data[feat]
+                print(f"\n{name} ({len(indices)} samples):")
+                print(f"{feat}:")
+                print("  Mean: {:.3f}, Std: {:.3f}, Var: {:.3f}".format(
+              partition_data.mean(),
+                    partition_data.std(),
+                    partition_data.var()))
+

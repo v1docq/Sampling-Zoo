@@ -1,10 +1,11 @@
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+
 from sklearn.model_selection import cross_val_predict
 from sklearn.metrics import accuracy_score, mean_squared_error
 from typing import Dict, Any, Union, Callable
 from .base_sampler import BaseSampler
+from ..repository.model_repo import SupportingModels
 
 
 class DifficultyBasedSampler(BaseSampler):
@@ -32,10 +33,11 @@ class DifficultyBasedSampler(BaseSampler):
         """
         # Выбор базовой модели
         if self.model is None:
+            model_params = dict(random_state=self.random_state, n_estimators=50)
             if self._is_classification(target):
-                self.model = RandomForestClassifier(random_state=self.random_state, n_estimators=50)
+                self.model = SupportingModels.difficulty_learner.value['classification'](**model_params)
             else:
-                self.model = RandomForestRegressor(random_state=self.random_state, n_estimators=50)
+                self.model = SupportingModels.difficulty_learner.value['regression'](**model_params)
 
         # Получаем out-of-fold предсказания чтобы избежать переобучения
         predictions = cross_val_predict(self.model, data, target, cv=5)
@@ -53,7 +55,7 @@ class DifficultyBasedSampler(BaseSampler):
         else: 
             #сортируем по возрастанию сложности и разбиваем на n_partitions равных частей
             split = np.array_split(np.argsort(self.difficulty_scores_), self.n_partitions)
-            self.partitions = {f'diff_level_{i}': indices for i, indices in enumerate(split)}
+            self.partitions = {f'chunk_{i}': indices for i, indices in enumerate(split)}
 
         return self
 
@@ -105,7 +107,9 @@ class UncertaintySampler(DifficultyBasedSampler):
         
         # Выбор базовой модели
         if self.model is None:
-            self.model = RandomForestClassifier(random_state=self.random_state, n_estimators=50)
+            model_params = dict(random_state=self.random_state, n_estimators=50)
+            if self._is_classification(target):
+                self.model = SupportingModels.difficulty_learner.value['classification'](**model_params)
 
         # Получаем вероятности через кросс-валидацию
         proba_predictions = cross_val_predict(self.model, data, target, cv=5, method='predict_proba')

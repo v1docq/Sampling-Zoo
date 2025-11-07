@@ -17,10 +17,10 @@ class SamplingStrategyFactory:
         self.strategy_map = {
 
             # Random split
-            'random_split': RandomSplitSampler,
+            'random': RandomSplitSampler,
 
             #Stratified Sampling
-            'stratified_split': StratifiedSplitSampler,
+            'stratified': StratifiedSplitSampler,
 
             # Temporal strategies
             'temporal_split': TemporalSplitSampler,

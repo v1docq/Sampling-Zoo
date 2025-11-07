@@ -16,7 +16,6 @@ TABULAR_STRATEGY_LIST = {
 }
 
 
-
 def split_with_api(features, target, strategy: str, strategy_params: dict):
     """Демонстрация использования API"""
     print("\n=== Factory Pattern Demo ===")

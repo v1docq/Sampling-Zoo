@@ -65,3 +65,6 @@ class BaseSampler(ABC):
         """
         self.fit(data, **kwargs)
         return self.transform(data)
+
+    def check_partitions(self, partitions, data):
+        pass

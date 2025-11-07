@@ -1,13 +1,10 @@
 import numpy as np
 import pandas as pd
-from sklearn.cluster import KMeans, DBSCAN
-from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
-from sklearn.manifold import TSNE
 from typing import Dict, Any, Union
 from .base_sampler import BaseSampler
+from ..repository.model_repo import SupportingModels
 
-
+CLUSTERING_MODELS = SupportingModels.clustering_models.value
 class FeatureBasedClusteringSampler(BaseSampler):
     """
     Семплирование на основе кластеризации в пространстве признаков
@@ -19,7 +16,7 @@ class FeatureBasedClusteringSampler(BaseSampler):
         self.n_clusters = n_clusters
         self.method = method
         self.feature_engineering = feature_engineering
-        self.scaler = StandardScaler()
+        self.scaler = SupportingModels.scaling_models.value['scaler']()
         self.clusterer = None
         self.partitions = {}
         # Параметры для различных методов кластеризации
@@ -47,17 +44,17 @@ class FeatureBasedClusteringSampler(BaseSampler):
 
         # Применение dimensionality reduction если много признаков
         if features_scaled.shape[1] > 50:
-            features_scaled = PCA(n_components=50).fit_transform(features_scaled)
+            features_scaled = CLUSTERING_MODELS['pca'](n_components=50).fit_transform(features_scaled)
 
         # Кластеризация
         if self.method == 'kmeans':
-            self.clusterer = KMeans(
+            self.clusterer = CLUSTERING_MODELS[self.method](
                 n_clusters=self.n_clusters,
                 random_state=self.random_state,
                 **self.clustering_params
             )
         elif self.method == 'dbscan':
-            self.clusterer = DBSCAN(**self.clustering_params)
+            self.clusterer = CLUSTERING_MODELS[self.method](**self.clustering_params)
         else:
             raise ValueError(f"Unsupported clustering method: {self.method}")
 
@@ -70,7 +67,7 @@ class FeatureBasedClusteringSampler(BaseSampler):
         for cluster_id in unique_clusters:
             if cluster_id != -1:  # Игнорируем шум для DBSCAN
                 cluster_indices = np.where(cluster_labels == cluster_id)[0]
-                self.partitions[f'cluster_{cluster_id}'] = cluster_indices
+                self.partitions[f'chunk_{cluster_id}'] = cluster_indices
 
         return self
 
