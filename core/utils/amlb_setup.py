@@ -3,11 +3,14 @@ import pandas as pd
 import numpy as np
 import time
 import json
+
+from fedot import Fedot
 from sklearn.metrics import accuracy_score, f1_score, mean_squared_error, r2_score
 
+from core.metrics.eval_metrics import calculate_metrics
 from core.repository.constant_repo import AmlbExperimentDataset
-from examples.experiments.amlb_dataloader import AMLBDatasetLoader
-from examples.experiments.fedot_integration import FedotSamplingEnsemble
+from core.utils.amlb_dataloader import AMLBDatasetLoader
+from core.utils.fedot_integration import FedotSamplingEnsemble
 
 
 class LargeScaleAutoMLExperiment:
@@ -15,8 +18,9 @@ class LargeScaleAutoMLExperiment:
     Полный эксперимент по сравнению Fedot + Sampling-Zoo с другими методами
     """
 
-    def __init__(self, results_path: str = "experiment_results"):
+    def __init__(self, experiment_config:dict = {},results_path: str = "experiment_results"):
         self.results_path = results_path
+        self.experiment_config = experiment_config
         self.loader = AMLBDatasetLoader()
         self.results = {}
 
@@ -38,15 +42,16 @@ class LargeScaleAutoMLExperiment:
 
         return metrics
 
-    def run_fedot_sampling_ensemble(self, X_train, y_train, X_test, y_test, problem_type):
+    def run_fedot_sampling_ensemble(self, X_train, y_train, X_test, y_test, dataset_info):
         """Запуск Fedot с интеллектуальным семплированием"""
         print("Запуск Fedot + Sampling-Zoo ensemble...")
 
         start_time = time.time()
-
+        sampling_config = AmlbExperimentDataset.SAMPLING_PRESET.value
+        sampling_config['n_partitions'] = self.experiment_config[dataset_info['name']]['n_partitions']
         # Создаем ансамбль с семплированием
-        ensemble = FedotSamplingEnsemble(problem=problem_type,
-                                         partitioner_config=AmlbExperimentDataset.SAMPLING_PRESET.value,
+        ensemble = FedotSamplingEnsemble(problem=dataset_info['type'],
+                                         partitioner_config=sampling_config,
                                          fedot_config=AmlbExperimentDataset.FEDOT_PRESET.value,
                                          ensemble_method='weighted'
                                          )
@@ -55,13 +60,13 @@ class LargeScaleAutoMLExperiment:
         partitions = ensemble.prepare_data_partitions(X_train, y_train)
 
         # Обучаем модели на партициях
-        ensemble.train_partition_models(partitions)
+        ensemble.train_partition_models(partitions, X_test, y_test)
 
         # Получаем предсказания ансамбля
         predictions = ensemble.ensemble_predict(X_test)
 
         training_time = time.time() - start_time
-        metrics = self._calculate_metrics(y_test, predictions, problem_type)
+        metrics = self._calculate_metrics(y_test, predictions, dataset_info['type'])
         metrics['training_time'] = training_time
         metrics['data_size'] = len(X_train)
         metrics['n_partitions'] = len(ensemble.models)
@@ -71,18 +76,7 @@ class LargeScaleAutoMLExperiment:
 
     def _calculate_metrics(self, y_true, y_pred, problem_type):
         """Вычисляет метрики качества"""
-        if problem_type == 'classification':
-            return {
-                'accuracy': accuracy_score(y_true, y_pred),
-                'f1_macro': f1_score(y_true, y_pred, average='macro'),
-                'f1_weighted': f1_score(y_true, y_pred, average='weighted')
-            }
-        else:  # regression
-            return {
-                'mse': mean_squared_error(y_true, y_pred),
-                'rmse': np.sqrt(mean_squared_error(y_true, y_pred)),
-                'r2': r2_score(y_true, y_pred)
-            }
+        return calculate_metrics(y_true, y_pred, problem_type)
 
     def run_experiment_on_dataset(self, dataset_info):
         """Запускает полный эксперимент на одном датасете"""
@@ -105,24 +99,24 @@ class LargeScaleAutoMLExperiment:
         }
 
         # 1. Fedot baseline
-        print("\n1. Тестирование Fedot baseline...")
-        try:
-            baseline_metrics = self.run_fedot_baseline(
-                X_train, y_train, X_test, y_test,
-                dataset_info['type']
-            )
-            results['fedot_baseline'] = baseline_metrics
-            print(f"   Baseline metrics: {baseline_metrics}")
-        except Exception as e:
-            print(f"   Ошибка в baseline: {str(e)}")
-            results['fedot_baseline'] = {'error': str(e)}
+        # print("\n1. Тестирование Fedot baseline...")
+        # try:
+        #     baseline_metrics = self.run_fedot_baseline(
+        #         X_train, y_train, X_test, y_test,
+        #         dataset_info['type']
+        #     )
+        #     results['fedot_baseline'] = baseline_metrics
+        #     print(f"   Baseline metrics: {baseline_metrics}")
+        # except Exception as e:
+        #     print(f"   Ошибка в baseline: {str(e)}")
+        #     results['fedot_baseline'] = {'error': str(e)}
 
         # 2. Fedot + Sampling-Zoo
         print("\n2. Тестирование Fedot + Sampling-Zoo...")
         try:
             sampling_metrics, ensemble_model = self.run_fedot_sampling_ensemble(
                 X_train, y_train, X_test, y_test,
-                dataset_info['type']
+                dataset_info
             )
             results['fedot_sampling'] = sampling_metrics
             print(f"   Sampling ensemble metrics: {sampling_metrics}")
@@ -161,12 +155,13 @@ class LargeScaleAutoMLExperiment:
 
         return comparison
 
-    def run_full_benchmark(self):
+    def run_full_benchmark(self, dataset_list: str = 'custom'):
         """Запускает полный бенчмарк на всех датасетах"""
-        all_datasets = (self.loader.get_classification_datasets() +
-                        self.loader.get_regression_datasets())
-
-        for dataset_info in all_datasets[:3]:  # Начнем с 3 датасетов для теста
+        dataset_dict = {'custom': self.loader.get_custom_datasets(),
+                        'classification': self.loader.get_classification_datasets(),
+                        'regression': self.loader.get_regression_datasets()}
+        all_datasets = dataset_dict[dataset_list]
+        for dataset_info in all_datasets:
             result = self.run_experiment_on_dataset(dataset_info)
             if result:
                 self.results[dataset_info['name']] = result

@@ -7,6 +7,10 @@ from fedot.core.data.data import InputData
 from fedot.core.data.data_split import train_test_data_setup
 from fedot.core.repository.tasks import Task, TaskTypesEnum
 
+from core.api.api_main import SamplingStrategyFactory
+from core.metrics.eval_metrics import calculate_metrics
+from core.repository.constant_repo import AmlbExperimentDataset
+
 
 class FedotSamplingEnsemble:
     """
@@ -44,46 +48,38 @@ class FedotSamplingEnsemble:
         Разбивает данные на интеллектуальные поднаборы с помощью Sampling-Zoo
         """
         try:
-            # Импортируем ваш фреймворк
-            from sampling_zoo import SamplingStrategyFactory
-
             # Создаем стратегию семплирования
             factory = SamplingStrategyFactory()
             partitioner = factory.create_strategy(
-                self.partitioner_config['strategy'],
-                n_clusters=self.partitioner_config['n_clusters'],
-                method=self.partitioner_config.get('method', 'kmeans'),
+                strategy_type=self.partitioner_config['strategy'],
+                n_partitions=self.partitioner_config['n_partitions'],
                 random_state=random_state
             )
 
             # Применяем семплирование
             if self.partitioner_config['strategy'] in ['difficulty', 'uncertainty']:
                 partitioner.fit(features, target=target)
+                self.partitions = partitioner.get_partitions(features, target)
+            elif self.partitioner_config['strategy'] in ['stratified']:
+                features['target'] = target
+                partitioner.fit(features, target=features.columns.to_list())
+                self.partitions = partitioner.get_partitions(features, target=features['target'])
+                for chunk in self.partitions:
+                    del self.partitions[chunk]['feature']['target']
             else:
                 partitioner.fit(features)
-
-            partitions_indices = partitioner.get_partitions()
-
-            # Создаем разделенные датасеты
-            self.partitions = {}
-            for partition_name, indices in partitions_indices.items():
-                partition_features = features.iloc[indices]
-                partition_target = target.iloc[indices]
-                self.partitions[partition_name] = {
-                    'features': partition_features,
-                    'target': partition_target
-                }
+                self.partitions = partitioner.get_partitions(features, target)
 
             print(f"Создано {len(self.partitions)} партиций:")
             for name, data in self.partitions.items():
-                print(f"  {name}: {len(data['features'])} samples")
+                print(f"  {name}: {len(data['feature'])} samples")
 
             return self.partitions
 
         except ImportError:
             raise ImportError("Sampling-Zoo не установлен. Установите его из https://github.com/v1docq/Sampling-Zoo")
 
-    def train_partition_models(self, partitions: Dict[str, Dict]):
+    def train_partition_models(self, partitions: Dict[str, Dict], X_test, y_test):
         """
         Обучает отдельные Fedot модели на каждой партиции
         """
@@ -92,8 +88,10 @@ class FedotSamplingEnsemble:
         # Определяем тип задачи для Fedot
         if self.problem == 'classification':
             task = Task(TaskTypesEnum.classification)
+            self.fedot_config['available_operations'] = AmlbExperimentDataset.FEDOT_MODELS_FOR_CLF.value
         elif self.problem == 'regression':
             task = Task(TaskTypesEnum.regression)
+            self.fedot_config['available_operations'] = AmlbExperimentDataset.FEDOT_MODELS_FOR_CLF.value
         else:
             raise ValueError("Problem type must be 'classification' or 'regression'")
 
@@ -102,28 +100,26 @@ class FedotSamplingEnsemble:
 
             try:
                 # Создаем Fedot модель
-                fedot_model = Fedot(
-                    problem=self.problem,
-                    task_params=task.task_params,
-                    **self.fedot_config
-                )
-
+                fedot_model = Fedot(problem=self.problem, task_params=task.task_params, **self.fedot_config)
                 # Обучаем на партиции
-                fedot_model.fit(
-                    features=partition_data['features'],
-                    target=partition_data['target']
-                )
-
+                fedot_model.fit(features=partition_data['feature'], target=partition_data['target'])
+                predict_labels = fedot_model.predict(features=X_test)
+                predict_proba = fedot_model.predict_proba(features=X_test)
                 # Сохраняем модель и метрики
+                metrics = calculate_metrics(y_true=y_test,
+                                            problem_type=self.problem,
+                                            y_labels=predict_labels,
+                                            y_proba=predict_proba
+                                            )
                 model_info = {
                     'name': partition_name,
                     'model': fedot_model,
                     'data_size': len(partition_data['features']),
-                    'metrics': fedot_model.get_metrics()
+                    'metrics': metrics
                 }
 
                 self.models.append(model_info)
-                self.partition_metrics[partition_name] = fedot_model.get_metrics()
+                self.partition_metrics[partition_name] = metrics
 
                 print(f"  Модель {partition_name} обучена. Размер данных: {model_info['data_size']}")
 

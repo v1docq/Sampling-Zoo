@@ -10,10 +10,10 @@ class FeatureBasedClusteringSampler(BaseSampler):
     Семплирование на основе кластеризации в пространстве признаков
     """
 
-    def __init__(self, n_clusters: int = 5, method: str = 'kmeans',
+    def __init__(self, n_partitions: int = 5, method: str = 'kmeans',
                  feature_engineering: str = 'auto', **kwargs):
         super().__init__(**kwargs)
-        self.n_clusters = n_clusters
+        self.n_clusters = n_partitions
         self.method = method
         self.feature_engineering = feature_engineering
         self.scaler = SupportingModels.scaling_models.value['scaler']()
@@ -50,7 +50,7 @@ class FeatureBasedClusteringSampler(BaseSampler):
         if self.method == 'kmeans':
             self.clusterer = CLUSTERING_MODELS[self.method](
                 n_clusters=self.n_clusters,
-                random_state=self.random_state,
+                #random_state=self.random_state,
                 **self.clustering_params
             )
         elif self.method == 'dbscan':

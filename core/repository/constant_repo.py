@@ -88,19 +88,55 @@ class AmlbExperimentDataset(Enum):
             'type': 'regression'
         }
     ]
+    AMLB_CUSTOM_DATASET = [{'name': 'covtype-normalized',
+                            'type': 'classification',
+                            'target': 'class',
+                            'path': './dataset/covtype-normalized.csv'},
+                           {'name': 'kddcup',
+                            'type': 'classification',
+                            'target': 'label',
+                            'path': './dataset/kddcup.csv'},
+                           {'name': 'airlines',
+                            'type': 'regression',
+                            'target': 'DepDelay',
+                            'path': './dataset/airlines_train_regression_10M.csv'},
+                           {'name': 'sf-police-incidents',
+                            'type': 'classification',
+                            'target': 'ViolentCrime',
+                            'path': './dataset/sf-police-incidents.csv'}]
     AMLB_EXPERIMENT_RESULTS = {
-            'adult': {'accuracy': 0.85, 'f1_macro': 0.65},
-            'covertype': {'accuracy': 0.70, 'f1_macro': 0.55},
-            'electricity': {'accuracy': 0.75, 'f1_macro': 0.60},
-            'boston': {'rmse': 4.5, 'r2': 0.75},
-            'california': {'rmse': 0.8, 'r2': 0.65}
-        }
-    FEDOT_BASELINE_PRESET = dict(timeout=10,preset='best_quality',cv_folds=3)
+        'adult': {'accuracy': 0.85, 'f1_macro': 0.65},
+        'covertype': {'accuracy': 0.70, 'f1_macro': 0.55},
+        'electricity': {'accuracy': 0.75, 'f1_macro': 0.60},
+        'boston': {'rmse': 4.5, 'r2': 0.75},
+        'california': {'rmse': 0.8, 'r2': 0.65}
+    }
+    FEDOT_BASELINE_PRESET = dict(timeout=10, preset='best_quality', cv_folds=3)
     FEDOT_PRESET = {'timeout': 5,  # Меньше timeout для каждой модели
                     'preset': 'best_quality',
-                    'cv_folds': 2
+                    'cv_folds': 2,
+                    'logging_level': 20,
+                    'metric': 'f1'
                     }
-    SAMPLING_PRESET = {'strategy': 'feature_clustering',
+    FEDOT_MODELS_FOR_CLF = [
+        # 'bernb',
+        # 'catboost',
+        # 'dt',
+        'fast_ica',
+        'isolation_forest_class',
+        'knn',
+        'lgbm',
+        'logit',
+        'mlp',
+        'normalization',
+        'pca',
+        # 'poly_features',
+        # 'qda',
+        'resample',
+        'rf',
+        'scaling',
+        'xgboost'
+    ]
+    SAMPLING_PRESET = {'strategy': 'stratified',
                        'n_clusters': 3,
-                       'method': 'kmeans'
                        }

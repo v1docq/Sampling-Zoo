@@ -22,12 +22,22 @@ class AMLBDatasetLoader:
     def get_regression_datasets():
         """Регрессия - наибольшее число samples"""
         return AmlbExperimentDataset.REG_DATASET.value
-
+    @staticmethod
+    def get_custom_datasets():
+        """Регрессия - наибольшее число samples"""
+        return AmlbExperimentDataset.AMLB_CUSTOM_DATASET.value
     def load_dataset(self, dataset_info):
         """Загружает датасет по его описанию"""
+
         try:
-            X, y = fetch_openml(data_id=dataset_info['openml_id'],
-                                return_X_y=True, as_frame=True)
+            if 'path' in dataset_info.keys():
+                df = pd.read_csv(dataset_info['path'])
+                y = df[dataset_info['target']]
+                del df[dataset_info['target']]
+                X = df
+            else:
+                X, y = fetch_openml(data_id=dataset_info['openml_id'],
+                                    return_X_y=True, as_frame=True)
 
             # Предобработка
             if dataset_info['type'] == 'classification':

@@ -16,7 +16,7 @@ class StratifiedSplitSampler(BaseSampler):
         self.uniqueness_threshold = uniqueness_threshold
         self.partitions = {}
     
-    def fit(self, data: pd.DataFrame, strat_target: list[str], data_target: list[str] = None):
+    def fit(self, data: pd.DataFrame, target: list[str], data_target: list[str] = None):
         """
         Args:
             data: Матрица признаков или сырые данные
@@ -27,7 +27,7 @@ class StratifiedSplitSampler(BaseSampler):
         
         processed_data = pd.DataFrame(index=data.index)
         
-        for name in strat_target:
+        for name in target:
             # Если число уникальных слагаемых в столбце больше порога, то делим его на квантили 
             if len(data[name].unique()) / len(data) > self.uniqueness_threshold:
                 processed_data[name] = pd.qcut(
@@ -48,7 +48,7 @@ class StratifiedSplitSampler(BaseSampler):
 
     def get_partitions(self, data, target) -> Dict[Any, np.ndarray]:
         partition = {cluster: dict(feature=data.iloc[idx],
-                                   target=target[idx]) for cluster, idx in self.partitions.items()}
+                                   target=target.iloc[idx]) for cluster, idx in self.partitions.items()}
         return partition
 
     def check_partitions(self, partitions, data):
