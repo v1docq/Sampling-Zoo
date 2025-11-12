@@ -112,15 +112,19 @@ class AmlbExperimentDataset(Enum):
         'california': {'rmse': 0.8, 'r2': 0.65}
     }
     FEDOT_BASELINE_PRESET = dict(timeout=10, preset='best_quality', cv_folds=3)
-    FEDOT_PRESET = {'timeout': 5,  # Меньше timeout для каждой модели
+    FEDOT_PRESET = {'timeout': 1,  # Меньше timeout для каждой модели
                     'preset': 'best_quality',
                     'cv_folds': 2,
                     'logging_level': 20,
+                    'with_tuning': False,
+                    'pop_size': 5,
+                    'num_of_generations': 10,
+                    'n_jobs': 1,
                     'metric': 'f1'
                     }
     FEDOT_MODELS_FOR_CLF = [
         # 'bernb',
-        # 'catboost',
+        'catboost',
         # 'dt',
         'fast_ica',
         'isolation_forest_class',

@@ -18,7 +18,7 @@ class LargeScaleAutoMLExperiment:
     Полный эксперимент по сравнению Fedot + Sampling-Zoo с другими методами
     """
 
-    def __init__(self, experiment_config:dict = {},results_path: str = "experiment_results"):
+    def __init__(self, experiment_config: dict = {}, results_path: str = "experiment_results"):
         self.results_path = results_path
         self.experiment_config = experiment_config
         self.loader = AMLBDatasetLoader()
@@ -98,26 +98,11 @@ class LargeScaleAutoMLExperiment:
             'test_size': len(X_test)
         }
 
-        # 1. Fedot baseline
-        # print("\n1. Тестирование Fedot baseline...")
-        # try:
-        #     baseline_metrics = self.run_fedot_baseline(
-        #         X_train, y_train, X_test, y_test,
-        #         dataset_info['type']
-        #     )
-        #     results['fedot_baseline'] = baseline_metrics
-        #     print(f"   Baseline metrics: {baseline_metrics}")
-        # except Exception as e:
-        #     print(f"   Ошибка в baseline: {str(e)}")
-        #     results['fedot_baseline'] = {'error': str(e)}
-
         # 2. Fedot + Sampling-Zoo
         print("\n2. Тестирование Fedot + Sampling-Zoo...")
         try:
-            sampling_metrics, ensemble_model = self.run_fedot_sampling_ensemble(
-                X_train, y_train, X_test, y_test,
-                dataset_info
-            )
+            sampling_metrics, ensemble_model = self.run_fedot_sampling_ensemble(X_train, y_train, X_test, y_test,
+                                                                                dataset_info)
             results['fedot_sampling'] = sampling_metrics
             print(f"   Sampling ensemble metrics: {sampling_metrics}")
         except Exception as e:
@@ -155,6 +140,22 @@ class LargeScaleAutoMLExperiment:
 
         return comparison
 
+    def _run_fedot_baseline(self):
+        # 1. Fedot baseline
+        # print("\n1. Тестирование Fedot baseline...")
+        # try:
+        #     baseline_metrics = self.run_fedot_baseline(
+        #         X_train, y_train, X_test, y_test,
+        #         dataset_info['type']
+        #     )
+        #     results['fedot_baseline'] = baseline_metrics
+        #     print(f"   Baseline metrics: {baseline_metrics}")
+        # except Exception as e:
+        #     print(f"   Ошибка в baseline: {str(e)}")
+        #     results['fedot_baseline'] = {'error': str(e)}
+
+        pass
+
     def run_full_benchmark(self, dataset_list: str = 'custom'):
         """Запускает полный бенчмарк на всех датасетах"""
         dataset_dict = {'custom': self.loader.get_custom_datasets(),
@@ -162,12 +163,11 @@ class LargeScaleAutoMLExperiment:
                         'regression': self.loader.get_regression_datasets()}
         all_datasets = dataset_dict[dataset_list]
         for dataset_info in all_datasets:
-            result = self.run_experiment_on_dataset(dataset_info)
-            if result:
-                self.results[dataset_info['name']] = result
-
-                # Сохраняем промежуточные результаты
-                self.save_results()
+            if dataset_info['name'] in list(self.experiment_config.keys()):
+                result = self.run_experiment_on_dataset(dataset_info)
+                if result:
+                    self.results[dataset_info['name']] = result
+                    self.save_results()
 
     def save_results(self):
         """Сохраняет результаты эксперимента"""

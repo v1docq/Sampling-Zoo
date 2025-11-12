@@ -6,10 +6,12 @@ from fedot.api.main import Fedot
 from fedot.core.data.data import InputData
 from fedot.core.data.data_split import train_test_data_setup
 from fedot.core.repository.tasks import Task, TaskTypesEnum
+from tqdm import tqdm
 
 from core.api.api_main import SamplingStrategyFactory
 from core.metrics.eval_metrics import calculate_metrics
 from core.repository.constant_repo import AmlbExperimentDataset
+from core.repository.model_repo import SamplingModels, SupportingModels
 
 
 class FedotSamplingEnsemble:
@@ -36,6 +38,7 @@ class FedotSamplingEnsemble:
             'cv_folds': 3
         }
         self.ensemble_method = ensemble_method
+        self.bs_size = 1000
         self.partitions = None
         self.models = []
         self.partition_metrics = {}
@@ -62,7 +65,7 @@ class FedotSamplingEnsemble:
                 self.partitions = partitioner.get_partitions(features, target)
             elif self.partitioner_config['strategy'] in ['stratified']:
                 features['target'] = target
-                partitioner.fit(features, target=features.columns.to_list())
+                partitioner.fit(data=features, target=features.columns.to_list(), data_target=features['target'])
                 self.partitions = partitioner.get_partitions(features, target=features['target'])
                 for chunk in self.partitions:
                     del self.partitions[chunk]['feature']['target']
@@ -89,9 +92,11 @@ class FedotSamplingEnsemble:
         if self.problem == 'classification':
             task = Task(TaskTypesEnum.classification)
             self.fedot_config['available_operations'] = AmlbExperimentDataset.FEDOT_MODELS_FOR_CLF.value
+            init_assumption = SupportingModels.fedot_clf_pipelines.value['lgbm'].build()
         elif self.problem == 'regression':
             task = Task(TaskTypesEnum.regression)
             self.fedot_config['available_operations'] = AmlbExperimentDataset.FEDOT_MODELS_FOR_CLF.value
+            init_assumption = SupportingModels.fedot_reg_pipelines.value['rfr'].build()
         else:
             raise ValueError("Problem type must be 'classification' or 'regression'")
 
@@ -100,28 +105,33 @@ class FedotSamplingEnsemble:
 
             try:
                 # Создаем Fedot модель
-                fedot_model = Fedot(problem=self.problem, task_params=task.task_params, **self.fedot_config)
+                fedot_model = Fedot(problem=self.problem,
+                                    task_params=task.task_params,
+                                    initial_assumption=init_assumption,
+                                    **self.fedot_config)
                 # Обучаем на партиции
                 fedot_model.fit(features=partition_data['feature'], target=partition_data['target'])
-                predict_labels = fedot_model.predict(features=X_test)
-                predict_proba = fedot_model.predict_proba(features=X_test)
+                # batch prediction
+                batch_data = [X_test.iloc[i:i + self.bs_size] for i in list(range(0, len(X_test), self.bs_size))]
+                predict_labels = [fedot_model.predict(features=batch) for batch in tqdm(batch_data)]
+                predict_proba = [fedot_model.predict_proba(features=batch) for batch in tqdm(batch_data)]
                 # Сохраняем модель и метрики
                 metrics = calculate_metrics(y_true=y_test,
                                             problem_type=self.problem,
-                                            y_labels=predict_labels,
-                                            y_proba=predict_proba
+                                            y_labels=np.concatenate(predict_labels),
+                                            y_proba=np.concatenate(predict_proba, axis=0)
                                             )
                 model_info = {
                     'name': partition_name,
                     'model': fedot_model,
-                    'data_size': len(partition_data['features']),
+                    'data_size': len(partition_data['feature']),
                     'metrics': metrics
                 }
 
                 self.models.append(model_info)
                 self.partition_metrics[partition_name] = metrics
 
-                print(f"  Модель {partition_name} обучена. Размер данных: {model_info['data_size']}")
+                print(f"Модель {partition_name} обучена. Размер данных: {model_info['data_size']}")
 
             except Exception as e:
                 print(f"Ошибка при обучении модели {partition_name}: {str(e)}")
