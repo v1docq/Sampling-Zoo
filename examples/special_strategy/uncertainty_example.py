@@ -2,7 +2,7 @@ import numpy as np
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import confusion_matrix
 from core.api.api_main import SamplingStrategyFactory
-from examples.utils import create_noisy_dataset
+from core.utils.synt_data import create_noisy_dataset
 
 DATASET_SAMPLES = 10000
 

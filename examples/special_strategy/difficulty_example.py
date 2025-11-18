@@ -1,6 +1,6 @@
 from sklearn.linear_model import LogisticRegression
 from core.api.api_main import SamplingStrategyFactory
-from examples.utils import create_sklearn_dataset
+from core.utils.synt_data import create_sklearn_dataset
 
 TASK_TYPE = 'classification'
 STRATEGY_TYPE = 'difficulty'

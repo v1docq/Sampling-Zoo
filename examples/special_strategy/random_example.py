@@ -1,5 +1,5 @@
-from examples.utils import create_noisy_dataset
 from core.api.api_main import SamplingStrategyFactory
+from core.utils.synt_data import create_noisy_dataset
 
 DATASET_SAMPLES = 10000
 

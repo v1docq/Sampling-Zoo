@@ -153,7 +153,8 @@ class HierarchicalStratifiedMixin:
 
     def _distribute_rare_classes(self, base_folds: List[np.ndarray], rare_classes: List, y: np.ndarray):
         rare_indices_by_class = {class_label: np.where(y == class_label)[0] for class_label in rare_classes}
-        rare_sample_idx = np.concatenate([class_indices for class_indices in rare_indices_by_class.values()]) if rare_indices_by_class else np.array([], dtype=int)
+        rare_sample_idx = np.concatenate([class_indices for class_indices in rare_indices_by_class.values()])\
+            if rare_indices_by_class else np.array([], dtype=int)
         return [np.append(base_folds[fold_idx], rare_sample_idx) for fold_idx in range(len(base_folds))]
 
     def _validate_folds(self, folds, y: np.ndarray, expected_n_classes: int):

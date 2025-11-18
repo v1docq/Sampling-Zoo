@@ -1,5 +1,5 @@
-from examples.utils import create_distrib_dataset
 from core.api.api_main import SamplingStrategyFactory
+from core.utils.synt_data import create_distrib_dataset
 
 DATASET_SAMPLES = 10000
 STRATEGY_TYPE = 'stratified'

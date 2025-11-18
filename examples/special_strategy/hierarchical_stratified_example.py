@@ -49,6 +49,7 @@ def run_factory_sampler():
     sampler = StratifiedSplitSampler(n_partitions=3, random_state=1)
     sampler.fit(df, target=["feature_1", "target"], data_target=df["target"])
     _print_fold_summary("StratifiedSplitSampler", sampler.partitions, df["target"])
+
 if __name__ == "__main__":
     run_advanced_sampler()
     run_factory_sampler()
