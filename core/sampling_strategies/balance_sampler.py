@@ -2,11 +2,11 @@ import numpy as np
 import pandas as pd
 from typing import Dict, Any, Union
 from sklearn.model_selection import StratifiedKFold
-from .base_sampler import BaseSampler
+from .base_sampler import BaseSampler, HierarchicalStratifiedMixin
 from ..repository.model_repo import SamplingModels
 
 
-class StratifiedBalancedSplitSampler(BaseSampler):
+class StratifiedBalancedSplitSampler(BaseSampler, HierarchicalStratifiedMixin):
     """
     Семплер, который выполняет стратифицированное разбиение,
     а затем применяет к каждому чанку метод балансировки
@@ -14,8 +14,14 @@ class StratifiedBalancedSplitSampler(BaseSampler):
 
     def __init__(self, n_partitions: int = 5, random_state: int = 42,
                  balance_method: str = None, balancer_kwargs: Dict = None):
+        BaseSampler.__init__(self, random_state=random_state)
+        HierarchicalStratifiedMixin.__init__(
+            self,
+            n_splits=n_partitions,
+            random_state=random_state,
+            logger_name="StratifiedBalancedSplitSampler",
+        )
         self.n_partitions = n_partitions
-        self.random_state = random_state
         self.BALANCERS = SamplingModels.balance_samplers.value
         if balance_method and balance_method.lower() not in self.BALANCERS:
             raise ValueError(f"Unknown method '{balance_method}'. Available methods: {list(self.BALANCERS.keys())}")

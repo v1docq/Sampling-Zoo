@@ -11,7 +11,7 @@ if __name__ == "__main__":
     factory = SamplingStrategyFactory()
     strategy = factory.create_strategy(strategy_type=STRATEGY_TYPE, **STRATEGY_PARAMS)
     # Обучение и применение стратегии
-    strategy.fit(data, strat_target=['feature_1', 'feature_2', 'target'])
+    strategy.fit(data, target=['feature_1', 'feature_2', 'target'])
     partitions = strategy.get_partitions(data[['feature_1', 'feature_2']], target=data['target'])
     # Посмотрим, совпадают ли статистики в разделах с исходными
     strategy.check_partitions(partitions, data)

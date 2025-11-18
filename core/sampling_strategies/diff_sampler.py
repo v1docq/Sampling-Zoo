@@ -4,20 +4,27 @@ import pandas as pd
 from sklearn.model_selection import cross_val_predict
 from sklearn.metrics import accuracy_score, mean_squared_error
 from typing import Dict, Any, Union, Callable
-from .base_sampler import BaseSampler
+from .base_sampler import BaseSampler, HierarchicalStratifiedMixin
 from ..repository.model_repo import SupportingModels
 
 
-class DifficultyBasedSampler(BaseSampler):
+class DifficultyBasedSampler(BaseSampler, HierarchicalStratifiedMixin):
     """
     Семплирование на основе сложности примеров
     """
 
     def __init__(self, difficulty_threshold: float = None,
-                 difficulty_metric: str = 'auto', 
+                 difficulty_metric: str = 'auto',
                  n_partitions: int = 2, model: Any = None,
+                 random_state: int = 42,
                  **kwargs):
-        super().__init__(**kwargs)
+        BaseSampler.__init__(self, random_state=random_state)
+        HierarchicalStratifiedMixin.__init__(
+            self,
+            n_splits=n_partitions,
+            random_state=random_state,
+            logger_name="DifficultyBasedSampler",
+        )
         self.difficulty_threshold = difficulty_threshold
         self.difficulty_metric = difficulty_metric
         self.model = model
@@ -95,8 +102,8 @@ class UncertaintySampler(DifficultyBasedSampler):
     Семплирование на основе неопределенности модели
     """
 
-    def __init__(self, uncertainty_threshold: float = None, n_partitions: int = 2, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, uncertainty_threshold: float = None, n_partitions: int = 2, random_state: int = 42, **kwargs):
+        super().__init__(n_partitions=n_partitions, random_state=random_state, **kwargs)
         self.uncertainty_threshold = uncertainty_threshold
         self.uncertainty_scores_ = None
         self.model = None

@@ -14,10 +14,12 @@ if __name__ == "__main__":
     # Создаём стратегию и передаём в неё модель
     STRATEGY_PARAMS['model'] = model
     factory = SamplingStrategyFactory()
-    strategy = factory.create_strategy(strategy_type=STRATEGY_TYPE, **STRATEGY_PARAMS)
-
-    # Применяем стратегию
-    strategy.fit(features, target=data['target'])
+    strategy = factory.create_and_fit(
+        strategy_type=STRATEGY_TYPE,
+        data=features,
+        target=data['target'],
+        strategy_kwargs=STRATEGY_PARAMS,
+    )
     partitions = strategy.get_partitions(features, target=data['target'])
 
     predictions = model.predict(features)

@@ -12,10 +12,12 @@ if __name__ == "__main__":
 
     # Создаём стратегию UncertaintySampler
     factory = SamplingStrategyFactory()
-    strategy = factory.create_strategy('uncertainty', n_partitions=3, random_state=42)
-
-    # Применяем стратегию
-    strategy.fit(features, target=data['target'])
+    strategy = factory.create_and_fit(
+        'uncertainty',
+        data=features,
+        target=data['target'],
+        strategy_kwargs={'n_partitions': 3, 'random_state': 42},
+    )
     partitions = strategy.get_partitions(features, target=data['target'])
 
     # Получаем массив оценок неопределённости

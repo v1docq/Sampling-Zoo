@@ -13,10 +13,13 @@ def split_with_api(data, strategy: str):
     """Демонстрация использования API"""
     print("\n=== Factory Pattern Demo ===")
     splitter = SamplingStrategyFactory()
-    strategy = splitter.create_strategy('temporal_split', n_splits=3, method=strategy)
-    strategy.fit(data, time_column='timestamp', series_id_column='series_id')
-    partitions = strategy.get_partitions(data)
-    return partitions
+    trained_strategy = splitter.create_and_fit(
+        'temporal_split',
+        data,
+        strategy_kwargs={'n_splits': 3, 'method': strategy},
+        fit_kwargs={'time_column': 'timestamp', 'series_id_column': 'series_id'},
+    )
+    return trained_strategy.get_partitions(data)
 
 
 if __name__ == "__main__":

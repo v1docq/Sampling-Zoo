@@ -10,14 +10,20 @@ from sklearn.utils import check_random_state
 
 from .base_sampler import BaseSampler, HierarchicalStratifiedMixin
 
-class StratifiedSplitSampler(BaseSampler):
+class StratifiedSplitSampler(BaseSampler, HierarchicalStratifiedMixin):
     """
     Семплирование с сохранением распределений в указанных классах
     """
 
     def __init__(self, n_partitions: int = 5, random_state: int = 42, uniqueness_threshold: int = 0.3):
+        BaseSampler.__init__(self, random_state=random_state)
+        HierarchicalStratifiedMixin.__init__(
+            self,
+            n_splits=n_partitions,
+            random_state=random_state,
+            logger_name="StratifiedSplitSampler",
+        )
         self.n_partitions = n_partitions
-        self.random_state = random_state
         self.uniqueness_threshold = uniqueness_threshold
         self.partitions = {}
 
