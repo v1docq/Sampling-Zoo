@@ -15,7 +15,6 @@ import pandas as pd
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.append(str(ROOT))
 
-from core.sampling_strategies.base_sampler import HierarchicalStratifiedMixin
 from core.sampling_strategies.stratified_sampler import AdvancedStratifiedSampler, StratifiedSplitSampler
 
 
@@ -29,9 +28,7 @@ def run_advanced_sampler():
 
     sampler = AdvancedStratifiedSampler(n_splits=5, random_state=0)
     sampler.fit(features, classes, min_samples_per_class=1)
-    HierarchicalStratifiedMixin.print_fold_summary(
-        "AdvancedStratifiedSampler", sampler.get_partitions(), pd.Series(classes)
-    )
+    sampler.print_fold_summary("AdvancedStratifiedSampler", sampler.get_partitions(), pd.Series(classes))
 
 
 def run_factory_sampler():
@@ -43,7 +40,7 @@ def run_factory_sampler():
 
     sampler = StratifiedSplitSampler(n_partitions=3, random_state=1)
     sampler.fit(df, target=["feature_1", "target"], data_target=df["target"])
-    HierarchicalStratifiedMixin.print_fold_summary("StratifiedSplitSampler", sampler.partitions, df["target"])
+    sampler.print_fold_summary("StratifiedSplitSampler", sampler.partitions, df["target"])
 
 if __name__ == "__main__":
     run_advanced_sampler()

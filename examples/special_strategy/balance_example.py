@@ -9,7 +9,6 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.append(str(ROOT))
 
 from core.api.api_main import SamplingStrategyFactory
-from core.sampling_strategies.base_sampler import HierarchicalStratifiedMixin
 from core.utils.synt_data import create_noisy_dataset
 
 DATASET_SAMPLES = 10_000
@@ -28,9 +27,9 @@ def run_balance_sampler() -> None:
     )
     partitions = strategy.get_partitions()
     indices = {name: part["feature"].index.to_numpy() for name, part in partitions.items()}
-    HierarchicalStratifiedMixin.print_fold_summary("BalanceSampler", indices, pd.concat(
-        [part["target"] for part in partitions.values()]
-    ))
+    strategy.print_fold_summary(
+        "BalanceSampler", indices, pd.concat([part["target"] for part in partitions.values()])
+    )
 
 
 if __name__ == "__main__":

@@ -12,7 +12,6 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.append(str(ROOT))
 
 from core.api.api_main import SamplingStrategyFactory
-from core.sampling_strategies.base_sampler import HierarchicalStratifiedMixin
 from core.utils.synt_data import create_noisy_dataset
 
 DATASET_SAMPLES = 10_000
@@ -36,7 +35,7 @@ def run_uncertainty_sampler() -> None:
     predictions = model.predict(features)
 
     indices = {name: part["feature"].index.to_numpy() for name, part in partitions.items()}
-    HierarchicalStratifiedMixin.print_fold_summary("UncertaintySampler", indices, data["target"])
+    strategy.print_fold_summary("UncertaintySampler", indices, data["target"])
 
     uncertainty_scores = strategy.get_uncertainty_scores()
     for name, part in partitions.items():
