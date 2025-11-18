@@ -85,6 +85,16 @@ class HierarchicalStratifiedMixin:
             n_splits=self.n_splits, test_size=1 / self.n_splits, random_state=self.random_state
         )
 
+    @staticmethod
+    def print_fold_summary(name: str, folds: Dict[str, np.ndarray], targets: Union[pd.Series, np.ndarray]) -> None:
+        """Кратко печатает размеры и распределения классов по фолдам."""
+
+        series = pd.Series(targets)
+        print(f"\n{name}")
+        for fold_name, indices in folds.items():
+            fold_classes = Counter(series.iloc[indices])
+            print(f"{fold_name}: size={len(indices)}, classes={dict(fold_classes)}")
+
     def _setup_logger(self, name: str):
         logger = logging.getLogger(name)
         logger.setLevel(logging.INFO)

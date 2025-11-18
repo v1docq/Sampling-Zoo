@@ -1,231 +1,186 @@
-# full_experiment.py
-import pandas as pd
-import numpy as np
-import time
-import json
+"""Инфраструктура для экспериментов AMLB с декомпозицией по модулям."""
 
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+from typing import Dict, Tuple
+
+import numpy as np
 from fedot import Fedot
-from sklearn.metrics import accuracy_score, f1_score, mean_squared_error, r2_score
 
 from core.metrics.eval_metrics import calculate_metrics
 from core.repository.constant_repo import AmlbExperimentDataset
+from core.utils.amlb_config import AutoMLModelSpec, ExperimentConfig, ExperimentConfigBuilder, SamplingStrategySpec
 from core.utils.amlb_dataloader import AMLBDatasetLoader
+from core.utils.amlb_tracking import ExperimentTracker
 from core.utils.fedot_integration import FedotSamplingEnsemble
 
 
-class LargeScaleAutoMLExperiment:
-    """
-    Полный эксперимент по сравнению Fedot + Sampling-Zoo с другими методами
-    """
+def _resolve_dataset(dataset_loader: AMLBDatasetLoader, dataset_name: str):
+    all_datasets = (
+        dataset_loader.get_custom_datasets()
+        + dataset_loader.get_classification_datasets()
+        + dataset_loader.get_regression_datasets()
+    )
+    for dataset in all_datasets:
+        if dataset.get("name") == dataset_name:
+            return dataset
+    return None
 
-    def __init__(self, experiment_config: dict = {}, results_path: str = "experiment_results"):
-        self.results_path = results_path
+
+class SamplingRunner:
+    """Отвечает за запуск стратегий семплирования и базовых моделей."""
+
+    def __init__(self, experiment_config: ExperimentConfig):
         self.experiment_config = experiment_config
-        self.loader = AMLBDatasetLoader()
-        self.results = {}
 
-    def run_fedot_baseline(self, X_train, y_train, X_test, y_test, problem_type):
-        """Запуск стандартного Fedot без семплирования"""
-        print("Запуск Fedot baseline...")
-
-        start_time = time.time()
-        baseline_params = AmlbExperimentDataset.FEDOT_BASELINE_PRESET.value
-        baseline_params['problem'] = problem_type
-        fedot_model = Fedot(**baseline_params)
-        fedot_model.fit(X_train, y_train)
-        predictions = fedot_model.predict(X_test)
-
-        training_time = time.time() - start_time
-        metrics = self._calculate_metrics(y_test, predictions, problem_type)
-        metrics['training_time'] = training_time
-        metrics['data_size'] = len(X_train)
-
+    def run_fedot_baseline(self, X_train, y_train, X_test, y_test, problem_type: str) -> Dict:
+        params = {**AmlbExperimentDataset.FEDOT_BASELINE_PRESET.value, "problem": problem_type}
+        model = Fedot(**params)
+        model.fit(X_train, y_train)
+        predictions = model.predict(X_test)
+        metrics = calculate_metrics(y_test, predictions, problem_type)
+        metrics["training_time"] = 0.0
         return metrics
 
-    def run_fedot_sampling_ensemble(self, X_train, y_train, X_test, y_test, dataset_info):
-        """Запуск Fedot с интеллектуальным семплированием"""
-        print("Запуск Fedot + Sampling-Zoo ensemble...")
+    def run_sampling_ensemble(self, X_train, y_train, X_test, y_test, dataset_info: Dict) -> Tuple[Dict, FedotSamplingEnsemble]:
+        sampling_config = {**AmlbExperimentDataset.SAMPLING_PRESET.value}
+        strategy: SamplingStrategySpec = self.experiment_config.sampling_strategies[0]
+        sampling_config.update(strategy.params)
+        sampling_config.setdefault("n_partitions", dataset_info.get("n_partitions", 3))
 
-        start_time = time.time()
-        sampling_config = AmlbExperimentDataset.SAMPLING_PRESET.value
-        sampling_config['n_partitions'] = self.experiment_config[dataset_info['name']]['n_partitions']
-        # Создаем ансамбль с семплированием
-        ensemble = FedotSamplingEnsemble(problem=dataset_info['type'],
-                                         partitioner_config=sampling_config,
-                                         fedot_config=AmlbExperimentDataset.FEDOT_PRESET.value,
-                                         ensemble_method='weighted'
-                                         )
+        ensemble = FedotSamplingEnsemble(
+            problem=dataset_info["type"],
+            partitioner_config=sampling_config,
+            fedot_config=AmlbExperimentDataset.FEDOT_PRESET.value,
+            ensemble_method="weighted",
+        )
 
-        # Разбиваем данные на партиции
         partitions = ensemble.prepare_data_partitions(X_train, y_train)
-
-        # Обучаем модели на партициях
         ensemble.train_partition_models(partitions, X_test, y_test)
-
-        # Получаем предсказания ансамбля
         predictions = ensemble.ensemble_predict(X_test)
 
-        training_time = time.time() - start_time
-        metrics = self._calculate_metrics(y_test, predictions, dataset_info['type'])
-        metrics['training_time'] = training_time
-        metrics['data_size'] = len(X_train)
-        metrics['n_partitions'] = len(ensemble.models)
-        metrics['partition_metrics'] = ensemble.partition_metrics
-
+        metrics = calculate_metrics(y_test, predictions, dataset_info["type"])
+        metrics["training_time"] = ensemble.training_time
+        metrics["n_partitions"] = len(ensemble.models)
+        metrics["partition_metrics"] = ensemble.partition_metrics
         return metrics, ensemble
 
-    def _calculate_metrics(self, y_true, y_pred, problem_type):
-        """Вычисляет метрики качества"""
-        return calculate_metrics(y_true, y_pred, problem_type)
+    def run_framework(self, model: AutoMLModelSpec, X_train, y_train, X_test, y_test, dataset_info: Dict):
+        if model.name.lower() == "fedot":
+            return self.run_sampling_ensemble(X_train, y_train, X_test, y_test, dataset_info)
+        raise ValueError(f"Framework {model.name} пока не поддерживается")
 
-    def run_experiment_on_dataset(self, dataset_info):
-        """Запускает полный эксперимент на одном датасете"""
-        print(f"\n{'=' * 50}")
-        print(f"ЭКСПЕРИМЕНТ: {dataset_info['name']}")
-        print(f"{'=' * 50}")
 
-        # Загружаем данные
+class ResultLogger:
+    """Сохраняет результаты и формирует отчеты."""
+
+    def __init__(self, results_path: str = "experiment_results"):
+        self.results_path = Path(results_path)
+        self.results_path.mkdir(parents=True, exist_ok=True)
+
+    def save(self, payload: Dict) -> str:
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        filename = self.results_path / f"experiment_results_{timestamp}.json"
+
+        def convert_types(obj):
+            if isinstance(obj, (np.integer,)):
+                return int(obj)
+            if isinstance(obj, (np.floating,)):
+                return float(obj)
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            return obj
+
+        with open(filename, "w") as fh:
+            json.dump(payload, fh, indent=2, default=convert_types)
+        return str(filename)
+
+    @staticmethod
+    def report(results: Dict) -> None:
+        print("\n" + "=" * 70)
+        print("ИТОГОВЫЙ ОТЧЕТ ЭКСПЕРИМЕНТА")
+        print("=" * 70)
+        for dataset_name, result in results.items():
+            print(f"\n📊 ДАТАСЕТ: {dataset_name}")
+            print(f"   Размер данных: {result['train_size']} train, {result['test_size']} test")
+            sampling = result.get("fedot_sampling", {})
+            if "error" not in sampling:
+                for metric_name, metric_value in sampling.items():
+                    if isinstance(metric_value, (int, float)):
+                        print(f"   {metric_name}: {metric_value}")
+
+
+class LargeScaleAutoMLExperiment:
+    """Оркестратор экспериментов на датасетах AutoML Benchmark."""
+
+    def __init__(
+        self,
+        experiment_config: ExperimentConfig,
+        results_path: str = "experiment_results",
+        tracker: ExperimentTracker | None = None,
+    ):
+        self.config = experiment_config
+        self.loader = AMLBDatasetLoader()
+        self.results: Dict[str, Dict] = {}
+        self.runner = SamplingRunner(experiment_config)
+        self.logger = ResultLogger(results_path)
+        self.tracker = tracker or ExperimentTracker(
+            experiment_name=self.config.experiment_name,
+            tracking_uri=self.config.tracking_uri,
+        )
+
+    def run_full_benchmark(self) -> None:
+        for dataset_spec in self.config.datasets:
+            dataset_info = _resolve_dataset(self.loader, dataset_spec.name)
+            if not dataset_info:
+                print(f"Датасет {dataset_spec.name} не найден в репозитории")
+                continue
+            dataset_info = {**dataset_info, **dataset_spec.params}
+            result = self.run_experiment_on_dataset(dataset_info)
+            if result:
+                self.results[dataset_info["name"]] = result
+
+        saved_path = self.logger.save(self.results)
+        print(f"Результаты сохранены в {saved_path}")
+        self.logger.report(self.results)
+
+    def run_experiment_on_dataset(self, dataset_info: Dict) -> Dict | None:
         X, y, dataset_info = self.loader.load_dataset(dataset_info)
         if X is None:
             return None
 
-        # Разделяем на train/test
         X_train, X_test, y_train, y_test = self.loader.prepare_train_test(X, y)
-
-        results = {
-            'dataset': dataset_info,
-            'train_size': len(X_train),
-            'test_size': len(X_test)
+        dataset_result = {
+            "dataset": dataset_info,
+            "train_size": len(X_train),
+            "test_size": len(X_test),
         }
 
-        # 2. Fedot + Sampling-Zoo
-        print("\n2. Тестирование Fedot + Sampling-Zoo...")
+        run_obj = self.tracker.start_run(
+            run_name=dataset_info["name"],
+            params={"time_budget": self.config.time_budget_minutes},
+        )
+
         try:
-            sampling_metrics, ensemble_model = self.run_fedot_sampling_ensemble(X_train, y_train, X_test, y_test,
-                                                                                dataset_info)
-            results['fedot_sampling'] = sampling_metrics
-            print(f"   Sampling ensemble metrics: {sampling_metrics}")
-        except Exception as e:
-            print(f"   Ошибка в sampling ensemble: {str(e)}")
-            results['fedot_sampling'] = {'error': str(e)}
+            metrics, ensemble_model = self.runner.run_sampling_ensemble(
+                X_train, y_train, X_test, y_test, dataset_info
+            )
+            dataset_result["fedot_sampling"] = metrics
+            self.tracker.log_metrics(metrics)
+            dataset_result["version"] = self.tracker.version_label(run_obj)
+        except Exception as exc:  # pragma: no cover - пример для ручного запуска
+            dataset_result["fedot_sampling"] = {"error": str(exc)}
+        finally:
+            self.tracker.end_run()
 
-        # 3. Сравнение с AMLB benchmark (заглушка - нужны реальные данные из статьи)
-        print("\n3. Сравнение с AMLB benchmark...")
-        amlb_comparison = self._compare_with_amlb_benchmark(dataset_info['name'], results)
-        results['amlb_comparison'] = amlb_comparison
+        return dataset_result
 
-        return results
 
-    def _compare_with_amlb_benchmark(self, dataset_name, results):
-        """Сравнивает результаты с AMLB benchmark"""
-        # Здесь должны быть реальные данные из статьи AMLB
-        # Пока используем заглушку с ожидаемыми улучшениями
-
-        amlb_baselines = AmlbExperimentDataset.AMLB_EXPERIMENT_RESULTS.value
-
-        comparison = {}
-        if dataset_name in amlb_baselines:
-            baseline = amlb_baselines[dataset_name]
-            our_results = results.get('fedot_sampling', {})
-
-            for metric, amlb_value in baseline.items():
-                if metric in our_results:
-                    improvement = our_results[metric] - amlb_value
-                    comparison[metric] = {
-                        'amlb': amlb_value,
-                        'our_result': our_results[metric],
-                        'improvement': improvement,
-                        'improvement_pct': (improvement / amlb_value) * 100
-                    }
-
-        return comparison
-
-    def _run_fedot_baseline(self):
-        # 1. Fedot baseline
-        # print("\n1. Тестирование Fedot baseline...")
-        # try:
-        #     baseline_metrics = self.run_fedot_baseline(
-        #         X_train, y_train, X_test, y_test,
-        #         dataset_info['type']
-        #     )
-        #     results['fedot_baseline'] = baseline_metrics
-        #     print(f"   Baseline metrics: {baseline_metrics}")
-        # except Exception as e:
-        #     print(f"   Ошибка в baseline: {str(e)}")
-        #     results['fedot_baseline'] = {'error': str(e)}
-
-        pass
-
-    def run_full_benchmark(self, dataset_list: str = 'custom'):
-        """Запускает полный бенчмарк на всех датасетах"""
-        dataset_dict = {'custom': self.loader.get_custom_datasets(),
-                        'classification': self.loader.get_classification_datasets(),
-                        'regression': self.loader.get_regression_datasets()}
-        all_datasets = dataset_dict[dataset_list]
-        for dataset_info in all_datasets:
-            if dataset_info['name'] in list(self.experiment_config.keys()):
-                result = self.run_experiment_on_dataset(dataset_info)
-                if result:
-                    self.results[dataset_info['name']] = result
-                    self.save_results()
-
-    def save_results(self):
-        """Сохраняет результаты эксперимента"""
-        import os
-        os.makedirs(self.results_path, exist_ok=True)
-
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        filename = f"{self.results_path}/experiment_results_{timestamp}.json"
-
-        with open(filename, 'w') as f:
-            # Конвертируем numpy types в native Python types для JSON
-            def convert_types(obj):
-                if isinstance(obj, (np.int_, np.intc, np.intp, np.int8,
-                                    np.int16, np.int32, np.int64, np.uint8,
-                                    np.uint16, np.uint32, np.uint64)):
-                    return int(obj)
-                elif isinstance(obj, (np.float_, np.float16, np.float32, np.float64)):
-                    return float(obj)
-                elif isinstance(obj, (np.ndarray,)):
-                    return obj.tolist()
-                return obj
-
-            json.dump(self.results, f, indent=2, default=convert_types)
-
-        print(f"Результаты сохранены в {filename}")
-
-    def generate_report(self):
-        """Генерирует итоговый отчет"""
-        print("\n" + "=" * 70)
-        print("ИТОГОВЫЙ ОТЧЕТ ЭКСПЕРИМЕНТА")
-        print("=" * 70)
-
-        for dataset_name, result in self.results.items():
-            print(f"\n📊 ДАТАСЕТ: {dataset_name}")
-            print(f"   Размер данных: {result['train_size']} train, {result['test_size']} test")
-
-            baseline = result.get('fedot_baseline', {})
-            sampling = result.get('fedot_sampling', {})
-
-            if 'error' not in baseline and 'error' not in sampling:
-                # Сравниваем метрики
-                if 'accuracy' in baseline:  # Классификация
-                    print(f"   Точность:")
-                    print(f"     Baseline: {baseline['accuracy']:.4f}")
-                    print(f"     Sampling: {sampling['accuracy']:.4f}")
-                    improvement = sampling['accuracy'] - baseline['accuracy']
-                    print(f"     Улучшение: {improvement:+.4f}")
-
-                elif 'rmse' in baseline:  # Регрессия
-                    print(f"   RMSE:")
-                    print(f"     Baseline: {baseline['rmse']:.4f}")
-                    print(f"     Sampling: {sampling['rmse']:.4f}")
-                    improvement = baseline['rmse'] - sampling['rmse']  # Меньше = лучше
-                    print(f"     Улучшение: {improvement:+.4f}")
-
-                # Время обучения
-                print(f"   Время обучения:")
-                print(f"     Baseline: {baseline['training_time']:.2f} сек")
-                print(f"     Sampling: {sampling['training_time']:.2f} сек")
-                time_diff = sampling['training_time'] - baseline['training_time']
-                print(f"     Разница: {time_diff:+.2f} сек")
+__all__ = [
+    "ExperimentConfig",
+    "ExperimentConfigBuilder",
+    "LargeScaleAutoMLExperiment",
+]
