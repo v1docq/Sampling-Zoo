@@ -1,11 +1,37 @@
-from core.utils.amlb_setup import LargeScaleAutoMLExperiment
+"""Запуск LargeScaleAutoMLExperiment через текстовый конфиг."""
 
-EXPERIMENT_CONFIFG = {
-    #'covtype-normalized': {'n_partitions': 10},
-    'kddcup': {'n_partitions': 100}
-}
-# Запуск эксперимента
-if __name__ == "__main__":
-    experiment = LargeScaleAutoMLExperiment(experiment_config=EXPERIMENT_CONFIFG)
+from __future__ import annotations
+
+import pathlib
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+sys.path.append(str(ROOT))
+
+from core.utils.amlb_config import ExperimentConfigBuilder
+from core.utils.amlb_setup import ExperimentConfig, LargeScaleAutoMLExperiment
+
+
+EXPERIMENT_REQUEST = """
+datasets: kddcup
+sampling: hierarchical_stratified(n_splits=10)
+models: fedot(preset=best_quality)
+time_budget: 15
+tracking_uri: file:./mlruns
+"""
+
+
+def run_from_request(request: str) -> None:
+    builder = ExperimentConfigBuilder(default_time_budget=10)
+    experiment_config: ExperimentConfig = builder.from_text(request)
+
+    print("Экспериментная конфигурация:")
+    for key, value in experiment_config.to_dict().items():
+        print(f"  {key}: {value}")
+
+    experiment = LargeScaleAutoMLExperiment(experiment_config=experiment_config)
     experiment.run_full_benchmark()
-    experiment.generate_report()
+
+
+if __name__ == "__main__":
+    run_from_request(EXPERIMENT_REQUEST)
