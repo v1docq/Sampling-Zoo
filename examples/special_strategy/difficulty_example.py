@@ -21,6 +21,4 @@ if __name__ == "__main__":
         strategy_kwargs=STRATEGY_PARAMS,
     )
     partitions = strategy.get_partitions(features, target=data['target'])
-
     predictions = model.predict(features)
-    _ = 1

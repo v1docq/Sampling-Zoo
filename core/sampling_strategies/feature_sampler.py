@@ -53,17 +53,7 @@ class FeatureBasedClusteringSampler(BaseSampler, HierarchicalStratifiedMixin):
             features_scaled = CLUSTERING_MODELS['pca'](n_components=50).fit_transform(features_scaled)
 
         # Кластеризация
-        if self.method == 'kmeans':
-            self.clusterer = CLUSTERING_MODELS[self.method](
-                n_clusters=self.n_clusters,
-                #random_state=self.random_state,
-                **self.clustering_params
-            )
-        elif self.method == 'dbscan':
-            self.clusterer = CLUSTERING_MODELS[self.method](**self.clustering_params)
-        else:
-            raise ValueError(f"Unsupported clustering method: {self.method}")
-
+        self.clusterer = CLUSTERING_MODELS[self.method](**self.clustering_params)
         cluster_labels = self.clusterer.fit_predict(features_scaled)
 
         # Создание разделов
