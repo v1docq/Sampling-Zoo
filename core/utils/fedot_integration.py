@@ -1,7 +1,7 @@
 # fedot_sampling_integration.py
 import pandas as pd
 import numpy as np
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable
 from fedot.api.main import Fedot
 from fedot.core.data.data import InputData
 from fedot.core.data.data_split import train_test_data_setup
@@ -72,22 +72,14 @@ class FedotSamplingEnsemble:
             else:
                 partitioner.fit(features)
                 self.partitions = partitioner.get_partitions(features, target)
-
-            print(f"Создано {len(self.partitions)} партиций:")
-            for name, data in self.partitions.items():
-                print(f"  {name}: {len(data['feature'])} samples")
-
+            print(f"Создано {len(self.partitions)} поднаборов данных:")
+            print(f"Число семплов в 1 поднаборе -  {len(self.partitions['chunk_0']['feature'])}")
             return self.partitions
 
         except ImportError:
             raise ImportError("Sampling-Zoo не установлен. Установите его из https://github.com/v1docq/Sampling-Zoo")
 
-    def train_partition_models(self, partitions: Dict[str, Dict], X_test, y_test):
-        """
-        Обучает отдельные Fedot модели на каждой партиции
-        """
-        self.models = []
-
+    def _define_fedot_setup(self):
         # Определяем тип задачи для Fedot
         if self.problem == 'classification':
             task = Task(TaskTypesEnum.classification)
@@ -99,22 +91,35 @@ class FedotSamplingEnsemble:
             init_assumption = SupportingModels.fedot_reg_pipelines.value['rfr'].build()
         else:
             raise ValueError("Problem type must be 'classification' or 'regression'")
+        return task, init_assumption
 
+    def _run_inference(self, fitted_model: Callable, test_data: pd.DataFrame, batch_size: int = None):
+        # batch prediction
+        predict_labels, predict_proba = [], []
+        batch_size = batch_size if batch_size is not None else self.bs_size
+        batch_data = [test_data.iloc[i:i + self.bs_size] for i in list(range(0, len(test_data), batch_size))]
+        for batch in tqdm(batch_data):
+            predict_labels.append(fitted_model.predict(batch))
+            predict_proba.append(fitted_model.predict_proba(batch))
+        return predict_labels, predict_proba
+
+    def train_partition_models(self, partitions: Dict[str, Dict], X_test, y_test):
+        """
+        Обучает отдельные Fedot модели на каждой партиции
+        """
+        task, init_assumption = self._define_fedot_setup()
         for partition_name, partition_data in partitions.items():
-            print(f"Обучение модели для партиции {partition_name}...")
+            print(f"Обучение модели для поднабора {partition_name}...")
 
             try:
                 # Создаем Fedot модель
-                fedot_model = Fedot(problem=self.problem,
-                                    task_params=task.task_params,
-                                    initial_assumption=init_assumption,
-                                    **self.fedot_config)
+                fitted_fedot_model = Fedot(problem=self.problem,
+                                           task_params=task.task_params,
+                                           initial_assumption=init_assumption,
+                                           **self.fedot_config)
                 # Обучаем на партиции
-                fedot_model.fit(features=partition_data['feature'], target=partition_data['target'])
-                # batch prediction
-                batch_data = [X_test.iloc[i:i + self.bs_size] for i in list(range(0, len(X_test), self.bs_size))]
-                predict_labels = [fedot_model.predict(features=batch) for batch in tqdm(batch_data)]
-                predict_proba = [fedot_model.predict_proba(features=batch) for batch in tqdm(batch_data)]
+                fitted_fedot_model.fit(features=partition_data['feature'], target=partition_data['target'])
+                predict_labels, predict_proba = self._run_inference(fitted_fedot_model, X_test)
                 # Сохраняем модель и метрики
                 metrics = calculate_metrics(y_true=y_test,
                                             problem_type=self.problem,
@@ -123,7 +128,7 @@ class FedotSamplingEnsemble:
                                             )
                 model_info = {
                     'name': partition_name,
-                    'model': fedot_model,
+                    'model': fitted_fedot_model,
                     'data_size': len(partition_data['feature']),
                     'metrics': metrics
                 }

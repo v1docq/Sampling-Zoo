@@ -123,15 +123,17 @@ class HierarchicalStratifiedMixin:
                 analysis['problematic_classes'].append((class_label, count))
 
         self.logger.info(f"Анализ распределения: {analysis['n_classes']} классов")
-        self.logger.info(f"Минимальный класс: {analysis['min_class_count']} samples")
-        self.logger.info(f"Проблемные классы: {len(analysis['problematic_classes'])}")
+        self.logger.info(f"Минимальное число семплов в классе: {analysis['min_class_count']} samples")
+        #self.logger.info(f"Проблемные классы: {analysis['problematic_classes']}")
 
         return analysis
 
     def hierarchical_stratified_split(self, X: pd.DataFrame, y: np.ndarray, min_samples_per_class: int = 2):
         analysis = self.analyze_class_distribution(y)
         frequent_classes, rare_classes = self._separate_classes_by_frequency(y, analysis, min_samples_per_class)
-        self.logger.info(f"Частые классы: {len(frequent_classes)}, Редкие классы: {len(rare_classes)}")
+        self.logger.info(f"Распределение семплов по классам: (имя класса: число семплов)")
+        self.logger.info(f"Частые классы: {frequent_classes}")
+        self.logger.info(f"Редкие классы: {rare_classes}")
 
         base_folds = self._create_base_folds(y, frequent_classes)
         final_folds = self._distribute_rare_classes(base_folds, rare_classes, y)

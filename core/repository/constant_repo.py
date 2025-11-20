@@ -142,5 +142,5 @@ class AmlbExperimentDataset(Enum):
         'xgboost'
     ]
     SAMPLING_PRESET = {'strategy': 'stratified',
-                       'n_clusters': 3,
+                       "n_partitions": 3,
                        }
