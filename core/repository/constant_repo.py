@@ -144,3 +144,10 @@ class AmlbExperimentDataset(Enum):
     SAMPLING_PRESET = {'strategy': 'stratified',
                        "n_partitions": 3,
                        }
+    REGRESSION_SAMPLING_PRESET = {
+        'strategy': 'regression_stratified',
+        'n_partitions': 3,
+        'n_bins': 5,
+        'encode': 'ordinal',
+        'binning_strategy': 'quantile'
+    }
