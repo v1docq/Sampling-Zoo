@@ -6,16 +6,20 @@ import json
 import time
 from pathlib import Path
 from typing import Dict, Tuple
-
 import numpy as np
 from fedot import Fedot
-
 from core.metrics.eval_metrics import calculate_metrics
 from core.repository.constant_repo import AmlbExperimentDataset
 from core.utils.amlb_config import AutoMLModelSpec, ExperimentConfig, ExperimentConfigBuilder, SamplingStrategySpec
 from core.utils.amlb_dataloader import AMLBDatasetLoader
 from core.utils.amlb_tracking import ExperimentTracker
 from core.utils.fedot_integration import FedotSamplingEnsemble
+
+__all__ = [
+    "ExperimentConfig",
+    "ExperimentConfigBuilder",
+    "LargeScaleAutoMLExperiment",
+]
 
 
 def _resolve_dataset(dataset_loader: AMLBDatasetLoader, dataset_name: str):
@@ -177,10 +181,3 @@ class LargeScaleAutoMLExperiment:
             self.tracker.end_run()
 
         return dataset_result
-
-
-__all__ = [
-    "ExperimentConfig",
-    "ExperimentConfigBuilder",
-    "LargeScaleAutoMLExperiment",
-]

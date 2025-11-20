@@ -1,7 +1,6 @@
 """Запуск LargeScaleAutoMLExperiment через текстовый конфиг."""
 
 from __future__ import annotations
-
 import pathlib
 import sys
 
@@ -14,7 +13,7 @@ from core.utils.amlb_setup import ExperimentConfig, LargeScaleAutoMLExperiment
 
 EXPERIMENT_REQUEST = """
 datasets: kddcup
-sampling: hierarchical_stratified(n_splits=10)
+sampling: hierarchical_stratified(n_partitions=50)
 models: fedot(preset=best_quality)
 time_budget: 15
 tracking_uri: file:./mlruns
@@ -25,7 +24,7 @@ def run_from_request(request: str) -> None:
     builder = ExperimentConfigBuilder(default_time_budget=10)
     experiment_config: ExperimentConfig = builder.from_text(request)
 
-    print("Экспериментная конфигурация:")
+    print("Конфигурация эксперимента:")
     for key, value in experiment_config.to_dict().items():
         print(f"  {key}: {value}")
 
