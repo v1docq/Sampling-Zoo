@@ -6,7 +6,11 @@ from core.sampling_strategies.temporal_sampler import TemporalSplitSampler
 from core.sampling_strategies.feature_sampler import FeatureBasedClusteringSampler, TSNEClusteringSampler
 from core.sampling_strategies.diff_sampler import DifficultyBasedSampler, UncertaintySampler
 from core.sampling_strategies.random_sampler import RandomSplitSampler
-from core.sampling_strategies.stratified_sampler import StratifiedSplitSampler, AdvancedStratifiedSampler
+from core.sampling_strategies.stratified_sampler import (
+    AdvancedStratifiedSampler,
+    RegressionStratifiedSampler,
+    StratifiedSplitSampler,
+)
 from core.sampling_strategies.balance_sampler import StratifiedBalancedSplitSampler
 from core.sampling_strategies.spectral.spectral_leverage import SpectralLeverageSampler
 from core.sampling_strategies.spectral.tensor_energy import TensorEnergySampler
@@ -25,6 +29,7 @@ class SamplingStrategyFactory:
             # Stratified Sampling
             'stratified': StratifiedSplitSampler,
             'advanced_stratified': AdvancedStratifiedSampler,
+            'regression_stratified': RegressionStratifiedSampler,
 
             # Temporal strategies
             'temporal_split': TemporalSplitSampler,
@@ -97,6 +102,7 @@ class SamplingStrategyFactory:
             'feature_clustering',
             'random',
             'random_split',
+            'regression_stratified',
             'stratified',
             'temporal',
             'temporal_split',

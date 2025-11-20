@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 from iterstrat.ml_stratifiers import MultilabelStratifiedKFold, RepeatedMultilabelStratifiedKFold, IterativeStratification
 from sklearn.model_selection import RepeatedStratifiedKFold, StratifiedGroupKFold, StratifiedKFold
-from sklearn.preprocessing import OneHotEncoder
+from sklearn.preprocessing import KBinsDiscretizer, OneHotEncoder
 from sklearn.utils import check_random_state
 
 from .base_sampler import BaseSampler, HierarchicalStratifiedMixin
@@ -193,3 +193,102 @@ class AdvancedStratifiedSampler(BaseSampler, HierarchicalStratifiedMixin):
             })
 
         return pd.DataFrame(stats)
+
+
+class RegressionStratifiedSampler(BaseSampler, HierarchicalStratifiedMixin):
+    """Стратифицированный семплер для регрессионных целей.
+
+    Непрерывные цели дискретизируются на ``n_bins`` корзин перед стратификацией.
+    Поддерживает стратегии ``uniform``/``quantile``/``kmeans`` из
+    :class:`~sklearn.preprocessing.KBinsDiscretizer` или квантование через
+    :func:`pandas.qcut` для квантильной стратегии.
+    """
+
+    def __init__(
+        self,
+        n_bins: int = 5,
+        encode: str = "ordinal",
+        strategy: str = "quantile",
+        n_splits: int = 5,
+        random_state: int = 42,
+        use_advanced: bool = True,
+    ) -> None:
+        BaseSampler.__init__(self, random_state=random_state)
+        HierarchicalStratifiedMixin.__init__(
+            self,
+            n_splits=n_splits,
+            random_state=random_state,
+            logger_name="RegressionStratifiedSampler",
+        )
+        self.n_bins = n_bins
+        self.encode = encode
+        self.strategy = strategy
+        self.use_advanced = use_advanced
+        self.partitions_: Dict[str, np.ndarray] = {}
+        self.bin_edges_: Optional[np.ndarray] = None
+        self.binned_target_: Optional[np.ndarray] = None
+        self.discretizer_: Optional[KBinsDiscretizer] = None
+
+    def _discretize_target(self, target: Union[pd.Series, np.ndarray]) -> np.ndarray:
+        target_series = pd.Series(target)
+
+        if self.strategy == "quantile":
+            binned, bin_edges = pd.qcut(
+                target_series,
+                q=self.n_bins,
+                labels=False,
+                retbins=True,
+                duplicates="drop",
+            )
+            self.bin_edges_ = bin_edges
+            return binned.to_numpy(dtype=int)
+
+        if self.strategy not in {"uniform", "kmeans"}:
+            raise ValueError(
+                f"Unknown strategy '{self.strategy}'. Use one of ['uniform', 'quantile', 'kmeans']."
+            )
+
+        discretizer = KBinsDiscretizer(
+            n_bins=self.n_bins,
+            encode=self.encode,
+            strategy=self.strategy,
+            random_state=self.random_state,
+        )
+        transformed = discretizer.fit_transform(target_series.to_numpy().reshape(-1, 1))
+
+        if hasattr(transformed, "toarray"):
+            transformed = transformed.toarray()
+
+        # Приводим к одномерным меткам даже при onehot-кодировании
+        binned_target = np.argmax(transformed, axis=1) if transformed.ndim > 1 else transformed.ravel()
+        self.bin_edges_ = discretizer.bin_edges_[0]
+        self.discretizer_ = discretizer
+        return binned_target.astype(int)
+
+    def fit(self, data: pd.DataFrame, target: Union[pd.Series, np.ndarray]):
+        discrete_target = self._discretize_target(target)
+        self.binned_target_ = discrete_target
+
+        if self.use_advanced:
+            stratified_sampler = AdvancedStratifiedSampler(
+                n_splits=self.n_splits,
+                random_state=self.random_state,
+            )
+            placeholder = pd.DataFrame(index=data.index)
+            stratified_sampler.fit(placeholder, discrete_target, min_samples_per_class=1)
+            self.partitions_ = stratified_sampler.get_partitions()
+        else:
+            partitions = {}
+            for i, (_, test_idx) in enumerate(
+                self.stratification_model.split(np.zeros_like(discrete_target), discrete_target)
+            ):
+                partitions[f"chunk_{i}"] = test_idx
+            self.partitions_ = partitions
+
+        return self
+
+    def get_partitions(self, include_bin_edges: bool = False) -> Dict[str, Any]:
+        partitions: Dict[str, Any] = {name: indices for name, indices in self.partitions_.items()}
+        if include_bin_edges:
+            partitions["bin_edges"] = self.bin_edges_
+        return partitions
