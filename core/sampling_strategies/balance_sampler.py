@@ -17,7 +17,7 @@ class StratifiedBalancedSplitSampler(BaseSampler, HierarchicalStratifiedMixin):
         BaseSampler.__init__(self, random_state=random_state)
         HierarchicalStratifiedMixin.__init__(
             self,
-            n_splits=n_partitions,
+            n_partitions=n_partitions,
             random_state=random_state,
             logger_name="StratifiedBalancedSplitSampler",
         )

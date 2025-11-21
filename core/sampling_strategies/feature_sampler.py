@@ -1,6 +1,9 @@
 import numpy as np
 import pandas as pd
 from typing import Dict, Any, Union
+
+from sklearn.manifold import TSNE
+
 from .base_sampler import BaseSampler, HierarchicalStratifiedMixin
 from ..repository.model_repo import SupportingModels
 

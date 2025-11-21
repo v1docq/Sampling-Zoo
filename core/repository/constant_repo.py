@@ -141,6 +141,21 @@ class AmlbExperimentDataset(Enum):
         'scaling',
         'xgboost'
     ]
+    FEDOT_MODELS_FOR_REG = [
+        'ridge',
+        'rfr',
+        'lgbmreg',
+        'treg',
+        'knnreg',
+        'scaling'
+    ]
     SAMPLING_PRESET = {'strategy': 'stratified',
-                       'n_clusters': 3,
+                       "n_partitions": 3,
                        }
+    REGRESSION_SAMPLING_PRESET = {
+        'strategy': 'regression_stratified',
+        'n_partitions': 3,
+        'n_bins': 5,
+        'encode': 'ordinal',
+        'binning_strategy': 'quantile'
+    }

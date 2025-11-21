@@ -6,7 +6,6 @@
 * проверку, что в каждом фолде присутствуют все классы.
 """
 
-from collections import Counter
 import pathlib
 import sys
 
@@ -19,13 +18,6 @@ sys.path.append(str(ROOT))
 from core.sampling_strategies.stratified_sampler import AdvancedStratifiedSampler, StratifiedSplitSampler
 
 
-def _print_fold_summary(name: str, folds: dict[str, np.ndarray], targets: pd.Series) -> None:
-    print(f"\n{name}")
-    for fold_name, indices in folds.items():
-        fold_classes = Counter(targets.iloc[indices])
-        print(f"{fold_name}: size={len(indices)}, classes={dict(fold_classes)}")
-
-
 def run_advanced_sampler():
     """Разбиение с явным контролем редких классов."""
     rng = np.random.default_rng(0)
@@ -36,7 +28,7 @@ def run_advanced_sampler():
 
     sampler = AdvancedStratifiedSampler(n_splits=5, random_state=0)
     sampler.fit(features, classes, min_samples_per_class=1)
-    _print_fold_summary("AdvancedStratifiedSampler", sampler.get_partitions(), pd.Series(classes))
+    sampler.print_fold_summary("AdvancedStratifiedSampler", sampler.get_partitions(), pd.Series(classes))
 
 
 def run_factory_sampler():
@@ -48,7 +40,7 @@ def run_factory_sampler():
 
     sampler = StratifiedSplitSampler(n_partitions=3, random_state=1)
     sampler.fit(df, target=["feature_1", "target"], data_target=df["target"])
-    _print_fold_summary("StratifiedSplitSampler", sampler.partitions, df["target"])
+    sampler.print_fold_summary("StratifiedSplitSampler", sampler.partitions, df["target"])
 
 if __name__ == "__main__":
     run_advanced_sampler()
