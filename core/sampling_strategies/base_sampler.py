@@ -77,12 +77,12 @@ class BaseSampler(ABC):
 class HierarchicalStratifiedMixin:
     """Mixin с реализацией многоуровневого стратифицированного разбиения."""
 
-    def __init__(self, n_splits: int = 5, random_state: int = 42, logger_name: str = "StratifiedSampler"):
-        self.n_splits = n_splits
+    def __init__(self, n_partitions: int = 5, random_state: int = 42, logger_name: str = "StratifiedSampler"):
+        self.n_partitions = n_partitions
         self.random_state = random_state
         self.logger = self._setup_logger(logger_name)
         self.stratification_model = StratifiedShuffleSplit(
-            n_splits=self.n_splits, test_size=1 / self.n_splits, random_state=self.random_state
+            n_splits=self.n_partitions, test_size=1 / self.n_partitions, random_state=self.random_state
         )
 
     @staticmethod
@@ -119,7 +119,7 @@ class HierarchicalStratifiedMixin:
         }
 
         for class_label, count in class_counts.items():
-            if count < self.n_splits:
+            if count < self.n_partitions:
                 analysis['problematic_classes'].append((class_label, count))
 
         self.logger.info(f"Анализ распределения: {analysis['n_classes']} классов")
@@ -144,7 +144,7 @@ class HierarchicalStratifiedMixin:
     def _separate_classes_by_frequency(self, y: np.ndarray, analysis: Dict, min_samples: int):
         frequent_classes, rare_classes = [], []
         for class_label, count in analysis['class_distribution'].items():
-            if count < self.n_splits * min_samples:
+            if count < self.n_partitions * min_samples:
                 rare_classes.append(class_label)
             else:
                 frequent_classes.append(class_label)
@@ -156,9 +156,9 @@ class HierarchicalStratifiedMixin:
         frequent_indices = np.where(frequent_mask)[0]
 
         if len(frequent_classes) == 0:
-            return [np.array([], dtype=int) for _ in range(self.n_splits)]
+            return [np.array([], dtype=int) for _ in range(self.n_partitions)]
 
-        folds = [[] for _ in range(self.n_splits)]
+        folds = [[] for _ in range(self.n_partitions)]
         for fold_idx, (_, test_idx) in enumerate(self.stratification_model.split(frequent_indices, y_frequent)):
             folds[fold_idx] = frequent_indices[test_idx]
         return folds
