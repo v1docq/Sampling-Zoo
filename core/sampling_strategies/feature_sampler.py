@@ -1,27 +1,33 @@
 import numpy as np
 import pandas as pd
-from sklearn.cluster import KMeans, DBSCAN
-from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
-from sklearn.manifold import TSNE
 from typing import Dict, Any, Union
-from .base_sampler import BaseSampler
 
+from sklearn.manifold import TSNE
 
-class FeatureBasedClusteringSampler(BaseSampler):
+from .base_sampler import BaseSampler, HierarchicalStratifiedMixin
+from ..repository.model_repo import SupportingModels
+
+CLUSTERING_MODELS = SupportingModels.clustering_models.value
+class FeatureBasedClusteringSampler(BaseSampler, HierarchicalStratifiedMixin):
     """
     Семплирование на основе кластеризации в пространстве признаков
     """
 
-    def __init__(self, n_clusters: int = 5, method: str = 'kmeans',
-                 feature_engineering: str = 'auto', **kwargs):
-        super().__init__(**kwargs)
-        self.n_clusters = n_clusters
+    def __init__(self, n_partitions: int = 5, method: str = 'kmeans',
+                 feature_engineering: str = 'auto', random_state: int = 42, **kwargs):
+        BaseSampler.__init__(self, random_state=random_state)
+        HierarchicalStratifiedMixin.__init__(
+            self,
+            n_splits=n_partitions,
+            random_state=random_state,
+            logger_name="FeatureBasedClusteringSampler",
+        )
+        self.n_clusters = n_partitions
         self.method = method
         self.feature_engineering = feature_engineering
-        self.scaler = StandardScaler()
+        self.scaler = SupportingModels.scaling_models.value['scaler']()
         self.clusterer = None
-
+        self.partitions = {}
         # Параметры для различных методов кластеризации
         self.clustering_params = kwargs
 
@@ -47,20 +53,10 @@ class FeatureBasedClusteringSampler(BaseSampler):
 
         # Применение dimensionality reduction если много признаков
         if features_scaled.shape[1] > 50:
-            features_scaled = PCA(n_components=50).fit_transform(features_scaled)
+            features_scaled = CLUSTERING_MODELS['pca'](n_components=50).fit_transform(features_scaled)
 
         # Кластеризация
-        if self.method == 'kmeans':
-            self.clusterer = KMeans(
-                n_clusters=self.n_clusters,
-                random_state=self.random_state,
-                **self.clustering_params
-            )
-        elif self.method == 'dbscan':
-            self.clusterer = DBSCAN(**self.clustering_params)
-        else:
-            raise ValueError(f"Unsupported clustering method: {self.method}")
-
+        self.clusterer = CLUSTERING_MODELS[self.method](**self.clustering_params)
         cluster_labels = self.clusterer.fit_predict(features_scaled)
 
         # Создание разделов
@@ -70,7 +66,7 @@ class FeatureBasedClusteringSampler(BaseSampler):
         for cluster_id in unique_clusters:
             if cluster_id != -1:  # Игнорируем шум для DBSCAN
                 cluster_indices = np.where(cluster_labels == cluster_id)[0]
-                self.partitions_[f'cluster_{cluster_id}'] = cluster_indices
+                self.partitions[f'chunk_{cluster_id}'] = cluster_indices
 
         return self
 
@@ -91,8 +87,10 @@ class FeatureBasedClusteringSampler(BaseSampler):
 
         return numeric_data
 
-    def get_partitions(self) -> Dict[Any, np.ndarray]:
-        return self.partitions_
+    def get_partitions(self, data, target) -> Dict[Any, np.ndarray]:
+        partition = {cluster: dict(feature=data.iloc[idx],
+                                   target=target[idx]) for cluster, idx in self.partitions.items()}
+        return partition
 
 
 class TSNEClusteringSampler(FeatureBasedClusteringSampler):
@@ -100,8 +98,8 @@ class TSNEClusteringSampler(FeatureBasedClusteringSampler):
     Кластеризация на основе t-SNE проекции для визуализации и семплирования
     """
 
-    def __init__(self, n_components: int = 2, perplexity: float = 30.0, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, n_components: int = 2, perplexity: float = 30.0, random_state: int = 42, **kwargs):
+        super().__init__(random_state=random_state, **kwargs)
         self.n_components = n_components
         self.perplexity = perplexity
         self.tsne = TSNE(n_components=n_components, perplexity=perplexity, random_state=self.random_state)
