@@ -3,12 +3,14 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
-from iterstrat.ml_stratifiers import MultilabelStratifiedKFold, RepeatedMultilabelStratifiedKFold, IterativeStratification
+from iterstrat.ml_stratifiers import MultilabelStratifiedKFold, RepeatedMultilabelStratifiedKFold, \
+    IterativeStratification
 from sklearn.model_selection import RepeatedStratifiedKFold, StratifiedGroupKFold, StratifiedKFold
 from sklearn.preprocessing import KBinsDiscretizer, OneHotEncoder
 from sklearn.utils import check_random_state
 
 from .base_sampler import BaseSampler, HierarchicalStratifiedMixin
+
 
 class StratifiedSplitSampler(BaseSampler, HierarchicalStratifiedMixin):
     """
@@ -57,7 +59,8 @@ class StratifiedSplitSampler(BaseSampler, HierarchicalStratifiedMixin):
             stratified_sampler.fit(data, data_target.values)
             split_iteration = stratified_sampler.get_partitions()
 
-        for i, part_idx in enumerate(split_iteration.values() if isinstance(split_iteration, dict) else split_iteration):
+        for i, part_idx in enumerate(
+                split_iteration.values() if isinstance(split_iteration, dict) else split_iteration):
             self.partitions[f'chunk_{i}'] = part_idx
 
         return self
@@ -84,91 +87,15 @@ class StratifiedSplitSampler(BaseSampler, HierarchicalStratifiedMixin):
                     partition_data.var()))
 
 
-class IterativeStratifiedSampler:
-    """
-    Итеративный стратифицированный семплер для очень несбалансированных данных
-    """
-
-    def __init__(self, n_splits: int = 100, random_state: int = 42):
-        self.n_splits = n_splits
-        self.random_state = random_state
-        np.random.seed(random_state)
-
-    def iterative_stratified_split(self, features: np.ndarray, target: np.ndarray):
-        """
-        Итеративный алгоритм стратифицированного разбиения
-        Основан на алгоритме итеративного стратифицирования из sklearn
-        """
-
-        random_state, n_samples = check_random_state(self.random_state), len(target)
-
-        # Инициализируем фолды
-        folds = [np.array([], dtype=int) for _ in range(self.n_splits)]
-        fold_sizes = np.zeros(self.n_splits, dtype=int)
-
-        # Целевой размер фолда
-        target_fold_size = round(n_samples // self.n_splits)
-
-        # Группируем индексы по классам
-        class_indices = {}
-        for class_label in np.unique(target):
-            class_indices[class_label] = np.where(target == class_label)[0]
-
-        # Сортируем классы по возрастанию частоты (сначала редкие)
-        sorted_classes = sorted(class_indices.keys(),
-                                key=lambda x: len(class_indices[x]))
-
-        # Распределяем samples итеративно
-        for class_label in sorted_classes:
-            indices = class_indices[class_label]
-            n_class_samples = len(indices)
-
-            # Перемешиваем индексы класса
-            random_state.shuffle(indices)
-
-            # Распределяем по фолдам
-            samples_assigned = 0
-
-            while samples_assigned < n_class_samples:
-                # Находим фолд с наименьшим количеством samples
-                min_fold_idx = np.argmin(fold_sizes)
-
-                # Добавляем один sample в этот фолд
-                if samples_assigned < n_class_samples:
-                    sample_idx = indices[samples_assigned]
-                    folds[min_fold_idx] = np.append(folds[min_fold_idx], sample_idx)
-                    fold_sizes[min_fold_idx] += 1
-                    samples_assigned += 1
-
-        # Создаем train/test сплиты
-        return self._create_splits(n_samples, folds)
-
-    def _create_splits(self, n_samples, folds):
-
-        # Создаем train/test сплиты
-        splits = []
-        all_indices = np.arange(n_samples)
-
-        for test_indices in folds:
-            train_indices = np.setdiff1d(all_indices, test_indices)
-            splits.append((train_indices, test_indices))
-
-        return splits
-
-    def split(self):
-        for train, test in super().split(X, y, groups):
-            yield train, test
-
-
 class AdvancedStratifiedSampler(BaseSampler, HierarchicalStratifiedMixin):
     """
     Продвинутый стратифицированный семплер для многоклассовых задач
     с гарантированным присутствием всех классов в каждом фолде
     """
 
-    def __init__(self, n_splits: int = 100, random_state: int = 42):
+    def __init__(self, n_partitions: int = 100, random_state: int = 42):
         BaseSampler.__init__(self, random_state=random_state)
-        HierarchicalStratifiedMixin.__init__(self, n_splits=n_splits, random_state=random_state)
+        HierarchicalStratifiedMixin.__init__(self, n_partitions=n_partitions, random_state=random_state)
         self.partitions = {}
 
     def fit(self, data: pd.DataFrame, target: Union[pd.Series, np.ndarray], min_samples_per_class: int = 2):
@@ -198,28 +125,27 @@ class AdvancedStratifiedSampler(BaseSampler, HierarchicalStratifiedMixin):
 class RegressionStratifiedSampler(BaseSampler, HierarchicalStratifiedMixin):
     """Стратифицированный семплер для регрессионных целей.
 
-    Непрерывные цели дискретизируются на ``n_bins`` корзин перед стратификацией.
-    Поддерживает стратегии ``uniform``/``quantile``/``kmeans`` из
-    :class:`~sklearn.preprocessing.KBinsDiscretizer` или квантование через
-    :func:`pandas.qcut` для квантильной стратегии.
+    Непрерывные цели дискретизируются на ``n_bins`` перед стратификацией.Поддерживает стратегии
+    ``uniform``/``quantile``/``kmeans`` или квантование через `pandas.qcut` для квантильной стратегии.
     """
 
     def __init__(
-        self,
-        n_bins: int = 5,
-        encode: str = "ordinal",
-        strategy: str = "quantile",
-        n_splits: int = 5,
-        random_state: int = 42,
-        use_advanced: bool = True,
+            self,
+            n_bins: int = 5,
+            encode: str = "ordinal",
+            strategy: str = "quantile",
+            n_partitions: int = 5,
+            random_state: int = 42,
+            use_advanced: bool = True,
     ) -> None:
         BaseSampler.__init__(self, random_state=random_state)
         HierarchicalStratifiedMixin.__init__(
             self,
-            n_splits=n_splits,
+            n_partitions=n_partitions,
             random_state=random_state,
             logger_name="RegressionStratifiedSampler",
         )
+        self.binning_model = RegressionStratifiedBinning(n_partitions=n_partitions, random_state=random_state)
         self.n_bins = n_bins
         self.encode = encode
         self.strategy = strategy
@@ -265,30 +191,143 @@ class RegressionStratifiedSampler(BaseSampler, HierarchicalStratifiedMixin):
         self.discretizer_ = discretizer
         return binned_target.astype(int)
 
-    def fit(self, data: pd.DataFrame, target: Union[pd.Series, np.ndarray]):
-        discrete_target = self._discretize_target(target)
+    def fit(self, data: pd.DataFrame, data_target: Union[pd.Series, np.ndarray], target=None):
+        discrete_target = self._discretize_target(data_target)
         self.binned_target_ = discrete_target
 
         if self.use_advanced:
-            stratified_sampler = AdvancedStratifiedSampler(
-                n_splits=self.n_splits,
-                random_state=self.random_state,
-            )
+            stratified_sampler = AdvancedStratifiedSampler(n_partitions=self.n_partitions,
+                                                           random_state=self.random_state)
             placeholder = pd.DataFrame(index=data.index)
             stratified_sampler.fit(placeholder, discrete_target, min_samples_per_class=1)
-            self.partitions_ = stratified_sampler.get_partitions()
+            self.partitions = stratified_sampler.get_partitions()
         else:
             partitions = {}
             for i, (_, test_idx) in enumerate(
-                self.stratification_model.split(np.zeros_like(discrete_target), discrete_target)
+                    self.stratification_model.split(np.zeros_like(discrete_target), discrete_target)
             ):
                 partitions[f"chunk_{i}"] = test_idx
-            self.partitions_ = partitions
+            self.partitions = partitions
 
         return self
 
-    def get_partitions(self, include_bin_edges: bool = False) -> Dict[str, Any]:
-        partitions: Dict[str, Any] = {name: indices for name, indices in self.partitions_.items()}
-        if include_bin_edges:
-            partitions["bin_edges"] = self.bin_edges_
-        return partitions
+    def get_partitions(self, data, target) -> Dict[str, np.ndarray]:
+        partition = {cluster: dict(feature=data.iloc[idx],
+                                   target=target.iloc[idx]) for cluster, idx in self.partitions.items()}
+        return partition
+
+
+
+class RegressionStratifiedBinning(BaseSampler, HierarchicalStratifiedMixin):
+    SUPPORTED_BIN_RULES = ("freedman_diaconis", "scott", "quantile")
+
+    def __init__(self, n_partitions: int = 5, random_state: int = 42, bin_rule: str = "freedman_diaconis"):
+        if bin_rule not in self.SUPPORTED_BIN_RULES:
+            raise ValueError(f"bin_rule должен быть одним из {self.SUPPORTED_BIN_RULES}, получено: {bin_rule}")
+
+        BaseSampler.__init__(self, random_state=random_state)
+        HierarchicalStratifiedMixin.__init__(self, n_partitions=n_partitions, random_state=random_state,
+                                             logger_name="RegressionStratifiedSampler")
+        self.bin_rule = bin_rule
+        self.partitions: Dict[str, np.ndarray] = {}
+        self.bin_edges_: Optional[np.ndarray] = None
+        self.binned_target_: Optional[np.ndarray] = None
+
+    def fit(self, data: pd.DataFrame, data_target: Union[pd.Series, np.ndarray], min_samples_per_class: int = 1,
+            target=None):
+        y = np.asarray(data_target, dtype=float)
+        if y.ndim != 1:
+            y = y.reshape(-1)
+
+        binned_target, bin_edges = self._bin_target(y, min_samples_per_class)
+        self.bin_edges_ = bin_edges
+        self.binned_target_ = binned_target
+
+        self.logger.info(f"Правило биннинга: {self.bin_rule}")
+        self.logger.info(f"Число бинов после объединения: {len(np.unique(binned_target))}")
+
+        folds = self.hierarchical_stratified_split(data, binned_target, min_samples_per_class)
+        self.partitions = {f'chunk_{i}': fold_indices for i, fold_indices in enumerate(folds)}
+        return self
+
+    def _bin_target(self, y: np.ndarray, min_samples_per_class: int) -> Tuple[np.ndarray, np.ndarray]:
+        bin_edges = self._calculate_bin_edges(y)
+        initial_labels = np.digitize(y, bins=bin_edges[1:-1], right=False)
+        merged_labels, merged_edges = self._merge_small_bins(initial_labels, bin_edges, min_samples_per_class)
+        return merged_labels, merged_edges
+
+    def _calculate_bin_edges(self, y: np.ndarray) -> np.ndarray:
+        y_min, y_max = np.min(y), np.max(y)
+        if y_min == y_max:
+            return np.array([y_min, y_max + 1e-9])
+
+        if self.bin_rule == "quantile":
+            n_bins = max(2, min(len(np.unique(y)), self.n_splits))
+            edges = np.quantile(y, np.linspace(0, 1, n_bins + 1))
+            edges = np.unique(edges)
+            if len(edges) < 2:
+                edges = np.array([y_min, y_max])
+            return edges
+
+        width = self._calculate_bin_width(y)
+        if not np.isfinite(width) or width <= 0:
+            return np.array([y_min, y_max])
+
+        n_bins = max(1, int(np.ceil((y_max - y_min) / width)))
+        return np.linspace(y_min, y_max, n_bins + 1)
+
+    def _calculate_bin_width(self, y: np.ndarray) -> float:
+        n = len(y)
+        if self.bin_rule == "freedman_diaconis":
+            q75, q25 = np.percentile(y, [75, 25])
+            iqr = q75 - q25
+            return 2 * iqr / np.cbrt(n) if iqr > 0 else np.inf
+        elif self.bin_rule == "scott":
+            std = np.std(y, ddof=1)
+            return 3.5 * std / np.cbrt(n) if std > 0 else np.inf
+        else:
+            return np.inf
+
+    def _merge_small_bins(self, labels: np.ndarray, edges: np.ndarray, min_samples: int) -> Tuple[
+        np.ndarray, np.ndarray]:
+        bins = []
+        for i in range(len(edges) - 1):
+            idx = np.where(labels == i)[0]
+            bins.append({"indices": idx, "start": edges[i], "end": edges[i + 1]})
+
+        i = 0
+        while i < len(bins):
+            if len(bins[i]["indices"]) >= min_samples or len(bins) == 1:
+                i += 1
+                continue
+
+            if i == 0:
+                neighbor = 1
+            elif i == len(bins) - 1:
+                neighbor = i - 1
+            else:
+                left_size = len(bins[i - 1]["indices"])
+                right_size = len(bins[i + 1]["indices"])
+                neighbor = i - 1 if left_size <= right_size else i + 1
+
+            bins[neighbor]["indices"] = np.concatenate((bins[neighbor]["indices"], bins[i]["indices"]))
+            bins[neighbor]["start"] = min(bins[neighbor]["start"], bins[i]["start"])
+            bins[neighbor]["end"] = max(bins[neighbor]["end"], bins[i]["end"])
+            bins.pop(i)
+
+            if neighbor > i:
+                neighbor -= 1
+            i = max(neighbor, 0)
+
+        merged_labels = np.zeros_like(labels)
+        merged_edges = [bins[0]["start"]]
+        for idx, bin_info in enumerate(bins):
+            merged_labels[bin_info["indices"]] = idx
+            merged_edges.append(bin_info["end"])
+
+        return merged_labels, np.array(merged_edges)
+
+    def get_partitions(self, data, target) -> Dict[str, np.ndarray]:
+        partition = {cluster: dict(feature=data.iloc[idx],
+                                   target=target.iloc[idx]) for cluster, idx in self.partitions.items()}
+        return partition

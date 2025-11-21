@@ -53,7 +53,7 @@ class SamplingRunner:
         sampling_config = {**AmlbExperimentDataset.SAMPLING_PRESET.value}
         strategy: SamplingStrategySpec = self.experiment_config.sampling_strategies[0]
         sampling_config.update(strategy.params)
-        sampling_config.setdefault("n_partitions", dataset_info.get("n_partitions", 3))
+        sampling_config['strategy'] = strategy.name
 
         ensemble = FedotSamplingEnsemble(
             problem=dataset_info["type"],

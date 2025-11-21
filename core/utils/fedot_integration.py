@@ -63,7 +63,7 @@ class FedotSamplingEnsemble:
             if self.partitioner_config['strategy'] in ['difficulty', 'uncertainty']:
                 partitioner.fit(features, target=target)
                 self.partitions = partitioner.get_partitions(features, target)
-            elif self.partitioner_config['strategy'] in ['stratified']:
+            elif self.partitioner_config['strategy'].__contains__('stratified'):
                 features['target'] = target
                 partitioner.fit(data=features, target=features.columns.to_list(), data_target=features['target'])
                 self.partitions = partitioner.get_partitions(features, target=features['target'])
@@ -99,8 +99,12 @@ class FedotSamplingEnsemble:
         batch_size = batch_size if batch_size is not None else self.bs_size
         batch_data = [test_data.iloc[i:i + self.bs_size] for i in list(range(0, len(test_data), batch_size))]
         for batch in tqdm(batch_data):
-            predict_labels.append(fitted_model.predict(batch))
-            predict_proba.append(fitted_model.predict_proba(batch))
+            labels = fitted_model.predict(batch)
+            predict_labels.append(labels)
+            if self.problem == 'regression':
+                predict_proba.append(labels)
+            else:
+                predict_proba.append(fitted_model.predict_proba(batch))
         return predict_labels, predict_proba
 
     def train_partition_models(self, partitions: Dict[str, Dict], X_test, y_test):
@@ -117,8 +121,9 @@ class FedotSamplingEnsemble:
                                            task_params=task.task_params,
                                            initial_assumption=init_assumption,
                                            **self.fedot_config)
-                # Обучаем на партиции
+                # Обучаем на поднаборе
                 fitted_fedot_model.fit(features=partition_data['feature'], target=partition_data['target'])
+                # Инференс
                 predict_labels, predict_proba = self._run_inference(fitted_fedot_model, X_test)
                 # Сохраняем модель и метрики
                 metrics = calculate_metrics(y_true=y_test,
