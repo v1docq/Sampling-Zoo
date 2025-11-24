@@ -1,16 +1,22 @@
 import numpy as np
 import pandas as pd
 from typing import Dict, Any, Union
-from .base_sampler import BaseSampler
+from .base_sampler import BaseSampler, HierarchicalStratifiedMixin
 
 
-class TemporalSplitSampler(BaseSampler):
+class TemporalSplitSampler(BaseSampler, HierarchicalStratifiedMixin):
     """
     Стратегия временного разбиения для временных рядов
     """
 
-    def __init__(self, n_splits: int = 4, method: str = 'sequential', **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, n_splits: int = 4, method: str = 'sequential', random_state: int = 42, **kwargs):
+        BaseSampler.__init__(self, random_state=random_state)
+        HierarchicalStratifiedMixin.__init__(
+            self,
+            n_splits=n_splits,
+            random_state=random_state,
+            logger_name="TemporalSplitSampler",
+        )
         self._init_constant()
         self.n_splits = n_splits
         self.method = method  # 'sequential', 'sliding_window', 'seasonal'

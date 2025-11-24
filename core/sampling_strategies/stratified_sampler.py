@@ -1,25 +1,29 @@
+from collections import Counter
+from typing import Any, Dict, List, Optional, Tuple, Union
+
 import numpy as np
 import pandas as pd
-from typing import Dict, Any, Union
-from iterstrat.ml_stratifiers import MultilabelStratifiedKFold, RepeatedMultilabelStratifiedKFold, \
-    IterativeStratification
-from sklearn.model_selection import RepeatedStratifiedKFold, StratifiedKFold, StratifiedGroupKFold
+from iterstrat.ml_stratifiers import MultilabelStratifiedKFold, RepeatedMultilabelStratifiedKFold, IterativeStratification
+from sklearn.model_selection import RepeatedStratifiedKFold, StratifiedGroupKFold, StratifiedKFold
 from sklearn.preprocessing import OneHotEncoder
-from .base_sampler import BaseSampler
 from sklearn.utils import check_random_state
-from collections import defaultdict, Counter
-from sklearn.model_selection import StratifiedShuffleSplit
-from typing import List, Dict, Tuple, Optional
-import logging
 
-class StratifiedSplitSampler(BaseSampler):
+from .base_sampler import BaseSampler, HierarchicalStratifiedMixin
+
+class StratifiedSplitSampler(BaseSampler, HierarchicalStratifiedMixin):
     """
     Семплирование с сохранением распределений в указанных классах
     """
 
     def __init__(self, n_partitions: int = 5, random_state: int = 42, uniqueness_threshold: int = 0.3):
+        BaseSampler.__init__(self, random_state=random_state)
+        HierarchicalStratifiedMixin.__init__(
+            self,
+            n_splits=n_partitions,
+            random_state=random_state,
+            logger_name="StratifiedSplitSampler",
+        )
         self.n_partitions = n_partitions
-        self.random_state = random_state
         self.uniqueness_threshold = uniqueness_threshold
         self.partitions = {}
 
@@ -49,10 +53,11 @@ class StratifiedSplitSampler(BaseSampler):
             multilabel = pd.get_dummies(processed_data)
             split_iteration = mskf.split(multilabel.values, data_target.values)
         else:
-            mskf = AdvancedStratifiedSampler(n_splits=self.n_partitions, random_state=self.random_state)
-            split_iteration = mskf.hierarchical_stratified_split(data,data_target.values)
+            stratified_sampler = AdvancedStratifiedSampler(n_splits=self.n_partitions, random_state=self.random_state)
+            stratified_sampler.fit(data, data_target.values)
+            split_iteration = stratified_sampler.get_partitions()
 
-        for i, part_idx in enumerate(split_iteration):
+        for i, part_idx in enumerate(split_iteration.values() if isinstance(split_iteration, dict) else split_iteration):
             self.partitions[f'chunk_{i}'] = part_idx
 
         return self
@@ -155,166 +160,36 @@ class IterativeStratifiedSampler:
             yield train, test
 
 
-class AdvancedStratifiedSampler:
+class AdvancedStratifiedSampler(BaseSampler, HierarchicalStratifiedMixin):
     """
     Продвинутый стратифицированный семплер для многоклассовых задач
     с гарантированным присутствием всех классов в каждом фолде
     """
 
     def __init__(self, n_splits: int = 100, random_state: int = 42):
-        self.n_splits = n_splits
-        self.random_state = random_state
-        self.logger = self._setup_logger()
-        # Используем StratifiedShuffleSplit для частых классов
-        self.stratification_model = StratifiedShuffleSplit(n_splits=self.n_splits,
-                                                           test_size=1 / self.n_splits, random_state=self.random_state)
+        BaseSampler.__init__(self, random_state=random_state)
+        HierarchicalStratifiedMixin.__init__(self, n_splits=n_splits, random_state=random_state)
+        self.partitions = {}
 
-    def _setup_logger(self):
-        logger = logging.getLogger('StratifiedSampler')
-        logger.setLevel(logging.INFO)
-        handler = logging.StreamHandler()
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
-        return logger
+    def fit(self, data: pd.DataFrame, target: Union[pd.Series, np.ndarray], min_samples_per_class: int = 2):
+        folds = self.hierarchical_stratified_split(data, np.asarray(target), min_samples_per_class)
+        self.partitions = {f'chunk_{i}': fold_indices for i, fold_indices in enumerate(folds)}
+        return self
 
-    def analyze_class_distribution(self, y: np.ndarray) -> Dict:
-        """Анализирует распределение классов"""
-        class_counts = Counter(y)
-        total_samples = len(y)
+    def get_partitions(self) -> Dict[str, np.ndarray]:
+        return self.partitions
 
-        analysis = {
-            'n_classes': len(class_counts),
-            'total_samples': total_samples,
-            'class_distribution': class_counts,
-            'min_class_count': min(class_counts.values()),
-            'max_class_count': max(class_counts.values()),
-            'problematic_classes': []
-        }
-
-        # Определяем проблемные классы (слишком редкие для n_splits)
-        min_samples_per_fold = round(total_samples / self.n_splits)
-        for class_label, count in class_counts.items():
-            if count < self.n_splits:  # Меньше 1 sample на фолд в среднем
-                analysis['problematic_classes'].append((class_label, count))
-
-        self.logger.info(f"Анализ распределения: {analysis['n_classes']} классов")
-        self.logger.info(f"Минимальный класс: {analysis['min_class_count']} samples")
-        self.logger.info(f"Проблемные классы: {len(analysis['problematic_classes'])}")
-
-        return analysis
-
-    def hierarchical_stratified_split(self, X: pd.DataFrame, y: np.ndarray, min_samples_per_class: int = 2)\
-            -> List[Tuple[np.ndarray, np.ndarray]]:
-        """
-        Многоуровневый стратифицированный сплит с гарантией всех классов в каждом фолде
-
-        Args:
-            X: Признаки
-            y: Целевые переменные
-            min_samples_per_class: Минимальное количество samples каждого класса в фолде
-
-        Returns:
-            List of (train_indices, test_indices) for each fold
-        """
-
-        # Анализируем распределение
-        analysis = self.analyze_class_distribution(y)
-
-        # Шаг 1: Разделяем классы на группы по частоте
-        frequent_classes, rare_classes = self._separate_classes_by_frequency(y, analysis, min_samples_per_class)
-
-        self.logger.info(f"Частые классы: {len(frequent_classes)}, Редкие классы: {len(rare_classes)}")
-
-        # Шаг 2: Создаем базовые фолды только для частых классов
-        base_folds = self._create_base_folds(y, frequent_classes)
-
-        # Шаг 3: Распределяем редкие классы по фолдам
-        final_folds = self._distribute_rare_classes(X, y, base_folds, rare_classes,
-                                                    min_samples_per_class)
-
-        # Шаг 4: Валидация результатов
-        self._validate_folds(final_folds, y, analysis['n_classes'])
-
-        return final_folds
-
-    def _separate_classes_by_frequency(self, y: np.ndarray, analysis: Dict,
-                                       min_samples: int) -> Tuple[List, List]:
-        """Разделяет классы на частые и редкие"""
-        frequent_classes = []
-        rare_classes = []
-
-        for class_label, count in analysis['class_distribution'].items():
-            # Класс считается редким если его меньше чем n_splits * min_samples
-            if count < self.n_splits * min_samples:
-                rare_classes.append(class_label)
-            else:
-                frequent_classes.append(class_label)
-
-        return frequent_classes, rare_classes
-
-    def _create_base_folds(self, y: np.ndarray, frequent_classes: List) -> List[np.ndarray]:
-        """Создает базовые фолды для частых классов"""
-        # Фильтруем данные только для частых классов
-        frequent_mask = np.isin(y, frequent_classes)
-        y_frequent = y[frequent_mask]
-        frequent_indices = np.where(frequent_mask)[0]
-        folds = [[] for _ in range(self.n_splits)]
-        if len(frequent_classes) == 0:
-            return [np.array([], dtype=int) for _ in range(self.n_splits)]
-
-        for fold_idx, (_, test_idx) in enumerate(self.stratification_model.split(frequent_indices, y_frequent)):
-            # Преобразуем индексы обратно к оригинальным
-            original_indices = frequent_indices[test_idx]
-            folds[fold_idx] = original_indices
-
-        return folds
-
-    def _distribute_rare_classes(self, X: pd.DataFrame, y: np.ndarray,
-                                 base_folds: List[np.ndarray], rare_classes: List,
-                                 min_samples_per_class: int) -> List[Tuple[np.ndarray, np.ndarray]]:
-        """Распределяет редкие классы по фолдам"""
-
-        rare_indices_by_class = {class_label: np.where(y == class_label)[0] for class_label in rare_classes}
-        rare_sample_idx = np.concatenate([class_indices for class_label, class_indices in rare_indices_by_class.items()])
-        updated_fold = [np.append(base_folds[fold_idx], rare_sample_idx) for fold_idx in range(len(base_folds))]
-        return updated_fold
-
-    def _validate_folds(self, folds: List[Tuple[np.ndarray, np.ndarray]],
-                        y: np.ndarray, expected_n_classes: int):
-        """Валидирует что все фолды содержат все классы"""
-        validation_passed = True
-
-        for i, idx in enumerate(folds):
-            train_classes = set(y[idx])
-
-            if len(train_classes) != expected_n_classes:
-                self.logger.warning(f"Фолд {i}: train содержит {len(train_classes)} из {expected_n_classes} классов")
-                validation_passed = False
-
-        if validation_passed:
-            self.logger.info("Валидация пройдена: все классы присутствуют в каждом фолде")
-        else:
-            self.logger.error("Валидация не пройдена: некоторые классы отсутствуют в фолдах")
-
-    def get_fold_statistics(self, folds: List[Tuple[np.ndarray, np.ndarray]], y: np.ndarray) -> pd.DataFrame:
-        """Возвращает статистику по фолдам"""
+    def get_fold_statistics(self, folds: List[np.ndarray], y: np.ndarray) -> pd.DataFrame:
         stats = []
 
-        for i, (train_idx, test_idx) in enumerate(folds):
-            train_classes = Counter(y[train_idx])
-            test_classes = Counter(y[test_idx])
-
+        for i, fold_indices in enumerate(folds):
+            fold_classes = Counter(y[fold_indices])
             stats.append({
                 'fold': i,
-                'train_size': len(train_idx),
-                'test_size': len(test_idx),
-                'train_n_classes': len(train_classes),
-                'test_n_classes': len(test_classes),
-                'train_min_class': min(train_classes.values()) if train_classes else 0,
-                'test_min_class': min(test_classes.values()) if test_classes else 0,
-                'train_max_class': max(train_classes.values()) if train_classes else 0,
-                'test_max_class': max(test_classes.values()) if test_classes else 0
+                'test_size': len(fold_indices),
+                'test_n_classes': len(fold_classes),
+                'test_min_class': min(fold_classes.values()) if fold_classes else 0,
+                'test_max_class': max(fold_classes.values()) if fold_classes else 0
             })
 
         return pd.DataFrame(stats)

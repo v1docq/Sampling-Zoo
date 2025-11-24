@@ -20,12 +20,8 @@ def split_with_api(features, target, strategy: str, strategy_params: dict):
     """Демонстрация использования API"""
     print("\n=== Factory Pattern Demo ===")
     splitter = SamplingStrategyFactory()
-    strategy = splitter.create_strategy(strategy, **strategy_params)
-    strategy.fit(features, target)
-    partitions = strategy.get_partitions(features, target)
-    # difficulty_scores = difficulty_sampler.get_difficulty_scores()
-    # uncertainty_scores = uncertainty_sampler.get_uncertainty_scores()
-    return partitions
+    strategy = splitter.create_and_fit(strategy, data=features, target=target, strategy_kwargs=strategy_params)
+    return strategy.get_partitions(features, target)
 
 
 if __name__ == "__main__":

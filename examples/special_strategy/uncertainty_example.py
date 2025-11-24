@@ -2,7 +2,7 @@ import numpy as np
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import confusion_matrix
 from core.api.api_main import SamplingStrategyFactory
-from examples.utils import create_noisy_dataset
+from core.utils.synt_data import create_noisy_dataset
 
 DATASET_SAMPLES = 10000
 
@@ -12,10 +12,12 @@ if __name__ == "__main__":
 
     # Создаём стратегию UncertaintySampler
     factory = SamplingStrategyFactory()
-    strategy = factory.create_strategy('uncertainty', n_partitions=3, random_state=42)
-
-    # Применяем стратегию
-    strategy.fit(features, target=data['target'])
+    strategy = factory.create_and_fit(
+        'uncertainty',
+        data=features,
+        target=data['target'],
+        strategy_kwargs={'n_partitions': 3, 'random_state': 42},
+    )
     partitions = strategy.get_partitions(features, target=data['target'])
 
     # Получаем массив оценок неопределённости
@@ -46,4 +48,5 @@ if __name__ == "__main__":
         print(f"{name}: {errors} errors out of {total} ({pct:.2%}), avg uncertainty={avg_unc:.4f}")
         print("Confusion matrix for", name)
         print(cm)
+
 

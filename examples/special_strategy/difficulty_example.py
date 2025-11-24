@@ -1,6 +1,6 @@
 from sklearn.linear_model import LogisticRegression
 from core.api.api_main import SamplingStrategyFactory
-from examples.utils import create_sklearn_dataset
+from core.utils.synt_data import create_sklearn_dataset
 
 TASK_TYPE = 'classification'
 STRATEGY_TYPE = 'difficulty'
@@ -14,11 +14,11 @@ if __name__ == "__main__":
     # Создаём стратегию и передаём в неё модель
     STRATEGY_PARAMS['model'] = model
     factory = SamplingStrategyFactory()
-    strategy = factory.create_strategy(strategy_type=STRATEGY_TYPE, **STRATEGY_PARAMS)
-
-    # Применяем стратегию
-    strategy.fit(features, target=data['target'])
+    strategy = factory.create_and_fit(
+        strategy_type=STRATEGY_TYPE,
+        data=features,
+        target=data['target'],
+        strategy_kwargs=STRATEGY_PARAMS,
+    )
     partitions = strategy.get_partitions(features, target=data['target'])
-
     predictions = model.predict(features)
-    _ = 1
