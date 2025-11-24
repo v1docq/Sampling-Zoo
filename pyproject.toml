@@ -1,0 +1,18 @@
+[project]
+name = "sampling-zoo"
+version = "0.1.0"
+readme = "README.md"
+requires-python = "==3.10.3"
+dependencies = [
+    "numpy>=1.21.0",
+    "pandas>=1.3.0",
+    "scikit-learn>=1.0.0",
+    "scipy>=1.7.0",
+    "tqdm>=4.62.0",
+    "imbalanced-learn>=0.8.0",
+    "iterative-stratification>=0.1.9",
+    "hdbscan>=0.8.29",
+    "fedot",
+    "setuptools",
+    "umap-learn",
+]
