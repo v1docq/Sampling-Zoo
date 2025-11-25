@@ -27,6 +27,7 @@ class DatasetSpec:
 @dataclass
 class ExperimentConfig:
     datasets: List[DatasetSpec]
+    fedot_config: Dict
     sampling_strategies: List[SamplingStrategySpec]
     automl_models: List[AutoMLModelSpec]
     time_budget_minutes: int = 10
@@ -50,7 +51,7 @@ class ExperimentConfigBuilder:
     def __init__(self, default_time_budget: int = 10):
         self.default_time_budget = default_time_budget
 
-    def from_text(self, text: str) -> ExperimentConfig:
+    def from_text(self, text: str, fedot_config: Dict) -> ExperimentConfig:
         sections = self._parse_sections(text)
 
         datasets = [DatasetSpec(name=item.strip()) for item in sections.get("datasets", []) if item.strip()]
@@ -68,6 +69,7 @@ class ExperimentConfigBuilder:
             time_budget_minutes=time_budget,
             tracking_uri=tracking_uri,
             experiment_name=experiment_name,
+            fedot_config=fedot_config
         )
 
     @staticmethod

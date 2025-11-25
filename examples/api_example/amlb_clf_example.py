@@ -9,6 +9,7 @@ sys.path.append(str(ROOT))
 
 from core.utils.amlb_config import ExperimentConfigBuilder
 from core.utils.amlb_setup import ExperimentConfig, LargeScaleAutoMLExperiment
+from core.repository.constant_repo import AmlbExperimentDataset
 
 
 EXPERIMENT_REQUEST = """
@@ -22,7 +23,10 @@ tracking_uri: file:./mlruns
 
 def run_from_request(request: str) -> None:
     builder = ExperimentConfigBuilder(default_time_budget=10)
-    experiment_config: ExperimentConfig = builder.from_text(request)
+    experiment_config: ExperimentConfig = builder.from_text(
+        request,
+        fedot_config=AmlbExperimentDataset.FEDOT_PRESET_CLF.value
+    )
 
     print("Конфигурация эксперимента:")
     for key, value in experiment_config.to_dict().items():

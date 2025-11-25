@@ -49,7 +49,9 @@ class SamplingRunner:
         metrics["training_time"] = 0.0
         return metrics
 
-    def run_sampling_ensemble(self, X_train, y_train, X_test, y_test, dataset_info: Dict) -> Tuple[Dict, FedotSamplingEnsemble]:
+    def run_sampling_ensemble(
+            self, X_train, y_train, X_val, y_val, X_test, y_test, dataset_info: Dict
+    ) -> Tuple[Dict, FedotSamplingEnsemble]:
         sampling_config = {**AmlbExperimentDataset.SAMPLING_PRESET.value}
         strategy: SamplingStrategySpec = self.experiment_config.sampling_strategies[0]
         sampling_config.update(strategy.params)
@@ -58,12 +60,12 @@ class SamplingRunner:
         ensemble = FedotSamplingEnsemble(
             problem=dataset_info["type"],
             partitioner_config=sampling_config,
-            fedot_config=AmlbExperimentDataset.FEDOT_PRESET.value,
+            fedot_config=self.experiment_config.fedot_config,
             ensemble_method="weighted",
         )
 
         partitions = ensemble.prepare_data_partitions(X_train, y_train)
-        ensemble.train_partition_models(partitions, X_test, y_test)
+        ensemble.train_partition_models(partitions, X_val, y_val)
         predictions = ensemble.ensemble_predict(X_test)
 
         metrics = calculate_metrics(y_test, predictions, dataset_info["type"])
@@ -157,9 +159,11 @@ class LargeScaleAutoMLExperiment:
             return None
 
         X_train, X_test, y_train, y_test = self.loader.prepare_train_test(X, y)
+        X_val, X_test, y_val, y_test = self.loader.prepare_train_test(X_test, y_test, test_size=0.5)
         dataset_result = {
             "dataset": dataset_info,
             "train_size": len(X_train),
+            "val_size": len(X_val),
             "test_size": len(X_test),
         }
 
@@ -170,7 +174,7 @@ class LargeScaleAutoMLExperiment:
 
         try:
             metrics, ensemble_model = self.runner.run_sampling_ensemble(
-                X_train, y_train, X_test, y_test, dataset_info
+                X_train, y_train, X_val, y_val, X_test, y_test, dataset_info
             )
             dataset_result["fedot_sampling"] = metrics
             self.tracker.log_metrics(metrics)
