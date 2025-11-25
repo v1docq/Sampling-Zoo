@@ -9,7 +9,7 @@ from fedot.core.repository.tasks import Task, TaskTypesEnum
 from tqdm import tqdm
 
 from core.api.api_main import SamplingStrategyFactory
-from core.metrics.eval_metrics import calculate_metrics
+from core.metrics.eval_metrics import calculate_metrics, get_metric_comparator
 from core.repository.constant_repo import AmlbExperimentDataset
 from core.repository.model_repo import SamplingModels, SupportingModels
 
@@ -87,7 +87,7 @@ class FedotSamplingEnsemble:
             init_assumption = SupportingModels.fedot_clf_pipelines.value['lgbm'].build()
         elif self.problem == 'regression':
             task = Task(TaskTypesEnum.regression)
-            self.fedot_config['available_operations'] = AmlbExperimentDataset.FEDOT_MODELS_FOR_CLF.value
+            self.fedot_config['available_operations'] = AmlbExperimentDataset.FEDOT_MODELS_FOR_REG.value
             init_assumption = SupportingModels.fedot_reg_pipelines.value['rfr'].build()
         else:
             raise ValueError("Problem type must be 'classification' or 'regression'")
@@ -107,11 +107,18 @@ class FedotSamplingEnsemble:
                 predict_proba.append(fitted_model.predict_proba(batch))
         return predict_labels, predict_proba
 
-    def train_partition_models(self, partitions: Dict[str, Dict], X_test, y_test):
+    def train_partition_models(self, partitions: Dict[str, Dict], X_val, y_val):
         """
         Обучает отдельные Fedot модели на каждой партиции
         """
         task, init_assumption = self._define_fedot_setup()
+        validation_results = []
+        best_validation_result, best_validation_result_not_updated = None, 0
+        if 'metric' in self.fedot_config:
+            validation_metric = self.fedot_config['metric']
+        else:
+            validation_metric = 'f1_macro' if self.problem == 'classification' else 'rmse'
+        metric_is_better = get_metric_comparator(validation_metric)
         for partition_name, partition_data in partitions.items():
             print(f"Обучение модели для поднабора {partition_name}...")
 
@@ -123,10 +130,10 @@ class FedotSamplingEnsemble:
                                            **self.fedot_config)
                 # Обучаем на поднаборе
                 fitted_fedot_model.fit(features=partition_data['feature'], target=partition_data['target'])
-                # Инференс
-                predict_labels, predict_proba = self._run_inference(fitted_fedot_model, X_test)
+                # Инференс на валидационных данных
+                predict_labels, predict_proba = self._run_inference(fitted_fedot_model, X_val)
                 # Сохраняем модель и метрики
-                metrics = calculate_metrics(y_true=y_test,
+                metrics = calculate_metrics(y_true=y_val,
                                             problem_type=self.problem,
                                             y_labels=np.concatenate(predict_labels),
                                             y_proba=np.concatenate(predict_proba, axis=0)
@@ -142,6 +149,22 @@ class FedotSamplingEnsemble:
                 self.partition_metrics[partition_name] = metrics
 
                 print(f"Модель {partition_name} обучена. Размер данных: {model_info['data_size']}")
+
+                predictions = self.ensemble_predict(X_val)
+                current_validation_result = calculate_metrics(
+                    y_true=y_val, y_labels=predictions, y_proba=None, problem_type=self.problem
+                )[validation_metric]
+                validation_results.append(current_validation_result)
+                if best_validation_result is None or metric_is_better(current_validation_result, best_validation_result):
+                    best_validation_result = current_validation_result
+                    best_validation_result_not_updated = 0
+                else:
+                    best_validation_result_not_updated += 1
+                if metric_is_better(np.mean(validation_results[:-5]), current_validation_result):
+                    del self.models[-1]
+                if best_validation_result_not_updated >= 5:
+                    break
+
 
             except Exception as e:
                 print(f"Ошибка при обучении модели {partition_name}: {str(e)}")
