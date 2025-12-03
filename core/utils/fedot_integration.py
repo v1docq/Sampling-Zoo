@@ -6,6 +6,7 @@ from fedot.api.main import Fedot
 from fedot.core.data.data import InputData
 from fedot.core.data.data_split import train_test_data_setup
 from fedot.core.repository.tasks import Task, TaskTypesEnum
+from lightgbm import LGBMRegressor, LGBMClassifier
 from tqdm import tqdm
 
 from core.api.api_main import SamplingStrategyFactory
@@ -61,7 +62,15 @@ class FedotSamplingEnsemble:
 
             # Применяем семплирование
             if self.partitioner_config['strategy'] in ['difficulty', 'uncertainty']:
-                partitioner.fit(features, target=target)
+                difficulty_model_class = LGBMClassifier if self.problem == 'classification' else LGBMRegressor
+                difficulty_model = difficulty_model_class(n_estimators=50, n_jobs=-1)
+                partitioner.fit(
+                    features,
+                    target=target,
+                    problem=self.problem,
+                    model=difficulty_model,
+                    chunks_percent=self.partitioner_config['chunks_percent']
+                )
                 self.partitions = partitioner.get_partitions(features, target)
             elif self.partitioner_config['strategy'].__contains__('stratified'):
                 features['target'] = target

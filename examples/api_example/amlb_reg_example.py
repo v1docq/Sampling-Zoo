@@ -14,7 +14,7 @@ from core.repository.constant_repo import AmlbExperimentDataset
 
 EXPERIMENT_REQUEST = """
 datasets: airlines
-sampling: regression_stratified(n_partitions=100)
+sampling: difficulty(n_partitions=100, chunks_percent=100)
 models: fedot(preset=best_quality)
 time_budget: 15
 tracking_uri: file:./mlruns

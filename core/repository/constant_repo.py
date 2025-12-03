@@ -161,6 +161,7 @@ class AmlbExperimentDataset(Enum):
     ]
     SAMPLING_PRESET = {'strategy': 'stratified',
                        "n_partitions": 3,
+                       "chunks_percent": 100
                        }
     REGRESSION_SAMPLING_PRESET = {
         'strategy': 'regression_stratified',
