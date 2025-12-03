@@ -89,23 +89,57 @@ class ExperimentConfigBuilder:
                 continue
             key, value = raw_line.split(":", maxsplit=1)
             key = key.strip().lower()
-            values = [item.strip() for item in value.split(",") if item.strip()]
+            values = [item.strip() for item in self._split_top_level_commas(value) if item.strip()]
             sections[key] = values
         return sections
 
     def _parse_named_entity(self, cls, token: str):
-        if "(" not in token:
+        token = token.strip()
+        if "(" not in token or not token.endswith(")"):
             return cls(name=token.strip())
 
-        name, raw_params = token.split("(", maxsplit=1)
+        start = token.find("(")
+        end = token.rfind(")")
+        if start == -1 or end == -1 or end <= start:
+            return cls(name=token.strip())
+
+        name = token[:start].strip()
+        raw_params = token[start + 1:end].strip()
+
         params: Dict[str, Any] = {}
-        for pair in raw_params.rstrip(")").split(","):
-            if not pair:
-                continue
-            if "=" in pair:
-                param_key, param_value = pair.split("=", maxsplit=1)
-                params[param_key.strip()] = self._coerce_value(param_value.strip())
-        return cls(name=name.strip(), params=params)
+        if raw_params:
+            pairs = self._split_top_level_commas(raw_params)
+            for pair in pairs:
+                pair = pair.strip()
+                if not pair:
+                    continue
+                if "=" in pair:
+                    param_key, param_value = pair.split("=", maxsplit=1)
+                    params[param_key.strip()] = self._coerce_value(param_value.strip())
+
+        return cls(name=name, params=params)
+
+    @staticmethod
+    def _split_top_level_commas(s: str) -> List[str]:
+        parts: List[str] = []
+        buf = []
+        level = 0
+        for ch in s:
+            if ch == "(":
+                level += 1
+                buf.append(ch)
+            elif ch == ")":
+                level = max(level - 1, 0)
+                buf.append(ch)
+            elif ch == "," and level == 0:
+                parts.append("".join(buf).strip())
+                buf = []
+            else:
+                buf.append(ch)
+        remaining = "".join(buf).strip()
+        if remaining:
+            parts.append(remaining)
+        return parts
 
     @staticmethod
     def _coerce_value(raw: str) -> Any:
