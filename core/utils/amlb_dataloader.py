@@ -62,3 +62,63 @@ class AMLBDatasetLoader:
         return train_test_split(X, y, test_size=test_size,
                                 random_state=random_state,
                                 stratify=y if len(np.unique(y)) < 100 else None)
+
+    @staticmethod
+    def prepare_train_val_test_balanced(
+        X, y, test_size=0.1, val_size=0.1, min_samples=20, problem='regression', random_state=42
+    ):
+        if problem == 'regression':
+            X_train, X_temp, y_train, y_temp = train_test_split(
+                X, y, test_size=test_size+val_size, random_state=random_state,
+            )
+            X_val, X_test, y_val, y_test = train_test_split(
+                X_temp, y_temp, test_size=test_size / (test_size + val_size), random_state=random_state,
+            )
+            return X_train, X_val, X_test, y_train, y_val, y_test
+
+        classes, counts = np.unique(y, return_counts=True)
+        rare_classes = classes[counts < min_samples]
+        common_classes = classes[counts >= min_samples]
+
+        rare_mask = np.isin(y, rare_classes)
+        common_mask = np.isin(y, common_classes)
+
+        X_rare, y_rare = X[rare_mask], y[rare_mask]
+        X_common, y_common = X[common_mask], y[common_mask]
+
+        X_train, X_temp, y_train, y_temp = train_test_split(
+            X_common, y_common, test_size=test_size+val_size, random_state=random_state, stratify=y_common
+        )
+
+        X_val, X_test, y_val, y_test = train_test_split(
+            X_temp, y_temp, test_size=test_size / (test_size + val_size), random_state=random_state, stratify=y_temp
+        )
+
+        for cls in rare_classes:
+            cls_indices = np.where(y_rare == cls)[0]
+            if len(cls_indices) > 0:
+                # Первый пример идет в тест
+                idx_test = cls_indices[0]
+                X_test = np.vstack([X_test, X_rare[idx_test:idx_test + 1]])
+                y_test = np.hstack([y_test, y_rare[idx_test:idx_test + 1]])
+
+                # Остальные в train
+                if len(cls_indices) > 1:
+                    X_train = np.vstack([X_train, X_rare.iloc[cls_indices[1:]]])
+                    y_train = np.hstack([y_train, y_rare[cls_indices[1:]]])
+
+        return X_train, X_val, X_test, y_train, y_val, y_test
+
+    @staticmethod
+    def select_one_sample_per_class(X, y, random_state=42):
+        rng = np.random.default_rng(random_state)
+        unique_classes = np.unique(y)
+
+        class_samples = {}
+
+        for cls in unique_classes:
+            indices = np.where(y == cls)[0]
+            idx = rng.choice(indices)
+            class_samples[cls] = (X[idx], y[idx])
+
+        return class_samples

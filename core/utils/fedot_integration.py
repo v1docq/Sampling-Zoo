@@ -103,6 +103,7 @@ class FedotSamplingEnsemble:
         return task, init_assumption
 
     def _run_inference(self, fitted_model: Callable, test_data: pd.DataFrame, batch_size: int = None):
+        return fitted_model.predict(test_data), None
         # batch prediction
         predict_labels, predict_proba = [], []
         batch_size = batch_size if batch_size is not None else self.bs_size
@@ -116,7 +117,36 @@ class FedotSamplingEnsemble:
                 predict_proba.append(fitted_model.predict_proba(batch))
         return predict_labels, predict_proba
 
-    def train_partition_models(self, partitions: Dict[str, Dict], X_val, y_val):
+    @staticmethod
+    def ensure_all_classes_in_chunk(chunk, class_representatives):
+        """
+        Добавляет в чанк по одному примеру отсутствующих классов.
+        """
+        present_classes = set(np.unique(chunk['target']))
+        all_classes = set(class_representatives.keys())
+
+        missing_classes = all_classes - present_classes
+
+        if not missing_classes:
+            return chunk
+
+        X_extra = []
+        y_extra = []
+
+        for cls in missing_classes:
+            x_rep, y_rep = class_representatives[cls]
+            X_extra.append(x_rep)
+            y_extra.append(y_rep)
+
+        X_extra = np.stack(X_extra)
+        y_extra = np.array(y_extra)
+
+        chunk['feature'] = np.vstack([chunk['feature'], X_extra])
+        chunk['target'] = np.hstack([chunk['target'], y_extra])
+
+        return chunk
+
+    def train_partition_models(self, partitions: Dict[str, Dict], X_val, y_val, class_samples):
         """
         Обучает отдельные Fedot модели на каждой партиции
         """
@@ -125,11 +155,15 @@ class FedotSamplingEnsemble:
         best_validation_result, best_validation_result_not_updated = None, 0
         if 'metric' in self.fedot_config:
             validation_metric = self.fedot_config['metric']
+            if validation_metric == 'f1':
+                validation_metric = 'f1_weighted'
         else:
-            validation_metric = 'f1_macro' if self.problem == 'classification' else 'rmse'
+            validation_metric = 'f1_weighted' if self.problem == 'classification' else 'rmse'
         metric_is_better = get_metric_comparator(validation_metric)
         for partition_name, partition_data in partitions.items():
             print(f"Обучение модели для поднабора {partition_name}...")
+            if self.problem == 'classification' and class_samples:
+                partition_data = self.ensure_all_classes_in_chunk(partition_data, class_samples)
 
             try:
                 # Создаем Fedot модель
@@ -139,13 +173,16 @@ class FedotSamplingEnsemble:
                                            **self.fedot_config)
                 # Обучаем на поднаборе
                 fitted_fedot_model.fit(features=partition_data['feature'], target=partition_data['target'])
+                # with open(f"dumps/{partition_name}.pkl", "wb") as f:
+                #     pickle.dump(fitted_fedot_model, f)
+
                 # Инференс на валидационных данных
                 predict_labels, predict_proba = self._run_inference(fitted_fedot_model, X_val)
                 # Сохраняем модель и метрики
                 metrics = calculate_metrics(y_true=y_val,
                                             problem_type=self.problem,
-                                            y_labels=np.concatenate(predict_labels),
-                                            y_proba=np.concatenate(predict_proba, axis=0)
+                                            y_labels=predict_labels,
+                                            y_proba=predict_proba
                                             )
                 model_info = {
                     'name': partition_name,
@@ -163,6 +200,7 @@ class FedotSamplingEnsemble:
                 current_validation_result = calculate_metrics(
                     y_true=y_val, y_labels=predictions, y_proba=None, problem_type=self.problem
                 )[validation_metric]
+                print(f"Текущая валидационная метрика - {current_validation_result}")
                 validation_results.append(current_validation_result)
                 if best_validation_result is None or metric_is_better(current_validation_result, best_validation_result):
                     best_validation_result = current_validation_result
@@ -189,7 +227,7 @@ class FedotSamplingEnsemble:
         predictions = []
 
         for model_info in self.models:
-            pred = model_info['model'].predict(features)
+            pred = model_info['model'].predict(features.to_numpy() if isinstance(features, pd.DataFrame) else features)
             predictions.append(pred)
 
         # Различные стратегии ансамблирования
@@ -207,7 +245,7 @@ class FedotSamplingEnsemble:
 
         elif self.ensemble_method == 'weighted':
             # Взвешенное голосование на основе качества моделей
-            weights = [metrics.get('f1', 0.5) for metrics in self.partition_metrics.values()]
+            weights = [metrics.get('f1_weighted', 0.5) for metrics in self.partition_metrics.values()]
             weights = np.array(weights) / sum(weights)
 
             if self.problem == 'classification':
@@ -216,7 +254,7 @@ class FedotSamplingEnsemble:
                 for model_info in self.models:
                     # Получаем вероятности если доступно
                     try:
-                        proba = model_info['model'].predict_proba(features)
+                        proba = model_info['model'].predict_proba(features.to_numpy() if isinstance(features, pd.DataFrame) else features)
                         proba_predictions.append(proba)
                     except:
                         # Fallback to hard voting
@@ -230,3 +268,74 @@ class FedotSamplingEnsemble:
 
         else:
             raise ValueError(f"Неизвестный метод ансамблирования: {self.ensemble_method}")
+
+class FedotImplementation(FedotSamplingEnsemble):
+
+    def __init__(self,
+                 problem: str,
+                 fedot_config: Dict[str, Any] = None):
+
+        self.problem = problem
+        self.fedot_config = fedot_config or {
+            'timeout': 10,
+            'preset': 'best_quality',
+            'cv_folds': 3
+        }
+        self.bs_size = 1000
+        self.partitions = None
+        self.model = None
+
+    def train_model(self, partitions: Dict[str, Dict], X_val, y_val, class_samples, data_percent: float = 0.1):
+        task, init_assumption = self._define_fedot_setup()
+        if 'metric' in self.fedot_config:
+            validation_metric = self.fedot_config['metric']
+            if validation_metric == 'f1':
+                validation_metric = 'f1_weighted'
+        else:
+            validation_metric = 'f1_weighted' if self.problem == 'classification' else 'rmse'
+        metric_is_better = get_metric_comparator(validation_metric)
+
+        all_features = []
+        all_targets = []
+
+        rng = np.random.default_rng(42)  # для воспроизводимости
+
+        for partition_name, partition_data in partitions.items():
+            X = partition_data['feature']
+            y = partition_data['target']
+
+            n = len(X)
+            sample_size = int(n * data_percent)
+
+            indices = rng.choice(n, size=sample_size, replace=False)
+
+            all_features.append(X[indices])
+            all_targets.append(y[indices])
+
+        data = np.concatenate(all_features, axis=0)
+        target = np.concatenate(all_targets, axis=0)
+
+        self.model = Fedot(problem=self.problem,
+                                   task_params=task.task_params,
+                                   initial_assumption=init_assumption,
+                                   **self.fedot_config)
+        self.model.fit(features=data, target=target)
+
+        predict_labels, predict_proba = self._run_inference(self.model, X_val)
+        metrics = calculate_metrics(y_true=y_val,
+                                    problem_type=self.problem,
+                                    y_labels=predict_labels,
+                                    y_proba=None
+                                    )
+
+        validation_result = calculate_metrics(
+            y_true=y_val, y_labels=predict_labels, y_proba=predict_proba, problem_type=self.problem
+        )[validation_metric]
+        print(f"Валидационная метрика - {validation_result}")
+
+
+    def predict(self, features: pd.DataFrame) -> np.ndarray:
+        if not self.model:
+            raise ValueError("Модель не обучена. Сначала вызовите train_model()")
+
+        return self.model.predict(features)
