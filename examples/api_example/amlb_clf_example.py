@@ -14,7 +14,7 @@ from core.repository.constant_repo import AmlbExperimentDataset
 
 EXPERIMENT_REQUEST = """
 datasets: kddcup
-sampling: hierarchical_stratified(n_partitions=50)
+sampling: difficulty(n_partitions=100, chunks_percent=10)
 models: fedot(preset=best_quality)
 time_budget: 15
 tracking_uri: file:./mlruns

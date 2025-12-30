@@ -74,10 +74,8 @@ class DifficultyBasedSampler(BaseSampler, HierarchicalStratifiedMixin):
                 k = max(1, len(sorted_idx) // total_rows_needed)
 
                 # берём каждую k-ю строку из сортировки по сложности
-                sampled_idx = sorted_idx[::k]
-                sampled_idx = sampled_idx[:total_rows_needed]
-
-                sorted_idx = np.sort(sampled_idx)
+                sorted_idx = sorted_idx[::k]
+                sorted_idx = sorted_idx[:total_rows_needed]
 
                 self.n_partitions = chunks_to_keep
 
@@ -154,8 +152,11 @@ class DifficultyBasedSampler(BaseSampler, HierarchicalStratifiedMixin):
         return self.difficulty_scores_
 
     def get_partitions(self, data, target) -> Dict[Any, np.ndarray]:
-        partition = {cluster: dict(feature=data.iloc[idx],
-                                   target=target[idx]) for cluster, idx in self.partitions.items()}
+        partition = {
+            cluster: dict(feature=data[idx] if isinstance(data, np.ndarray) else data.to_numpy()[idx],
+                          target=target[idx] if isinstance(target, np.ndarray) else target.to_numpy()[idx])
+            for cluster, idx in self.partitions.items()
+        }
         return partition
 
 class UncertaintySampler(DifficultyBasedSampler):
