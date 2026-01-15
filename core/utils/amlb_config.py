@@ -27,9 +27,11 @@ class DatasetSpec:
 @dataclass
 class ExperimentConfig:
     datasets: List[DatasetSpec]
+    cv_folds: int
     fedot_config: Dict
     sampling_strategies: List[SamplingStrategySpec]
     automl_models: List[AutoMLModelSpec]
+    run_mode: str = 'chunks'
     time_budget_minutes: int = 10
     tracking_uri: str | None = None
     experiment_name: str = "sampling-zoo-amlb"
@@ -37,6 +39,8 @@ class ExperimentConfig:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "datasets": [dataset.__dict__ for dataset in self.datasets],
+            "cv_folds": self.cv_folds,
+            "run_mode": self.run_mode,
             "sampling_strategies": [strategy.__dict__ for strategy in self.sampling_strategies],
             "automl_models": [model.__dict__ for model in self.automl_models],
             "time_budget_minutes": self.time_budget_minutes,
@@ -48,8 +52,9 @@ class ExperimentConfig:
 class ExperimentConfigBuilder:
     """Простой парсер текстовых запросов в структуру конфигурации."""
 
-    def __init__(self, default_time_budget: int = 10):
+    def __init__(self, default_time_budget: int = 10, default_cv_folds=5):
         self.default_time_budget = default_time_budget
+        self.default_cv_folds = default_cv_folds
 
     def from_text(self, text: str, fedot_config: Dict) -> ExperimentConfig:
         sections = self._parse_sections(text)
@@ -60,10 +65,14 @@ class ExperimentConfigBuilder:
 
         time_budget = int(sections.get("time_budget", [self.default_time_budget])[0])
         tracking_uri = sections.get("tracking_uri", [None])[0]
+        cv_folds = int(sections.get("cv_folds", [self.default_cv_folds])[0])
+        run_mode = sections.get("run_mode", [None])[0]
         experiment_name = sections.get("experiment_name", ["sampling-zoo-amlb"])[0]
 
         return ExperimentConfig(
             datasets=datasets,
+            cv_folds=cv_folds,
+            run_mode=run_mode,
             sampling_strategies=sampling or [SamplingStrategySpec(name="hierarchical_stratified", params={"n_splits": 5})],
             automl_models=models or [AutoMLModelSpec(name="fedot")],
             time_budget_minutes=time_budget,
@@ -80,6 +89,8 @@ class ExperimentConfigBuilder:
             "models: fedot(preset=auto)\n"
             "time_budget: 20\n"
             "tracking_uri: file:./mlruns\n"
+            "cv_folds: 4\n"
+            "run_mode: chunks\n"
         )
 
     def _parse_sections(self, text: str) -> Dict[str, List[str]]:

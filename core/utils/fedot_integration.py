@@ -1,4 +1,7 @@
 # fedot_sampling_integration.py
+import pickle
+import os
+from scipy.stats import mode
 import pandas as pd
 import numpy as np
 from typing import List, Dict, Any, Optional, Callable
@@ -96,26 +99,40 @@ class FedotSamplingEnsemble:
             init_assumption = SupportingModels.fedot_clf_pipelines.value['lgbm'].build()
         elif self.problem == 'regression':
             task = Task(TaskTypesEnum.regression)
-            self.fedot_config['available_operations'] = AmlbExperimentDataset.FEDOT_MODELS_FOR_REG.value
-            init_assumption = SupportingModels.fedot_reg_pipelines.value['rfr'].build()
+            # self.fedot_config['available_operations'] = AmlbExperimentDataset.FEDOT_MODELS_FOR_REG.value
+            init_assumption = SupportingModels.fedot_reg_pipelines.value['lgbmreg'].build()
         else:
             raise ValueError("Problem type must be 'classification' or 'regression'")
         return task, init_assumption
 
-    def _run_inference(self, fitted_model: Callable, test_data: pd.DataFrame, batch_size: int = None):
-        return fitted_model.predict(test_data), None
-        # batch prediction
-        predict_labels, predict_proba = [], []
-        batch_size = batch_size if batch_size is not None else self.bs_size
-        batch_data = [test_data.iloc[i:i + self.bs_size] for i in list(range(0, len(test_data), batch_size))]
-        for batch in tqdm(batch_data):
-            labels = fitted_model.predict(batch)
-            predict_labels.append(labels)
+    def _run_inference(self, fitted_model: Callable, test_data: pd.DataFrame,
+                       calculation_mode: str = 'batch', batch_size: int = None):
+        if calculation_mode == 'batch':
+            predict_labels, predict_proba = [], []
+            batch_size = batch_size if batch_size is not None else self.bs_size
+            batch_data = [test_data.iloc[i:i + self.bs_size] for i in list(range(0, len(test_data), batch_size))]
+            for batch in tqdm(batch_data):
+                labels = fitted_model.predict(batch)
+                predict_labels.append(labels)
+                if self.problem == 'regression':
+                    predict_proba.append(labels)
+                else:
+                    predict_proba.append(fitted_model.predict_proba(batch))
+            return np.concatenate(predict_labels), np.concatenate(predict_proba)
+        elif calculation_mode == 'non-batch':
             if self.problem == 'regression':
-                predict_proba.append(labels)
+                labels = fitted_model.predict(test_data)
+                proba = labels
             else:
-                predict_proba.append(fitted_model.predict_proba(batch))
-        return predict_labels, predict_proba
+                # TODO predict_proba почему то возвращает массив (489838, 4) хотя классов 23
+                proba = fitted_model.predict_proba(test_data)
+                # proba = fitted_model.predict_proba(test_data)
+                # labels = proba.argmax(axis=1)
+                labels = fitted_model.predict(test_data)
+                proba = None
+            return labels, proba
+        else:
+            raise ValueError("Calculation mode must be 'batch' or 'non-batch'")
 
     @staticmethod
     def ensure_all_classes_in_chunk(chunk, class_representatives):
@@ -146,10 +163,19 @@ class FedotSamplingEnsemble:
 
         return chunk
 
-    def train_partition_models(self, partitions: Dict[str, Dict], X_val, y_val, class_samples):
+    def train_partition_models(self, X_train, y_train, X_val, y_val, class_samples, cv_fold):
         """
         Обучает отдельные Fedot модели на каждой партиции
         """
+        os.makedirs("dumps", exist_ok=True)
+        if 'load_filename' in self.partitioner_config:
+            with open(f"dumps/{self.partitioner_config['load_filename']}_{cv_fold}.pkl", "rb") as f:
+                partitions = pickle.load(f)
+        else:
+            partitions = self.prepare_data_partitions(X_train, y_train)
+            if 'save_filename' in self.partitioner_config:
+                with open(f"dumps/{self.partitioner_config['save_filename']}_{cv_fold}.pkl", "wb") as f:
+                    pickle.dump(partitions, f)
         task, init_assumption = self._define_fedot_setup()
         validation_results = []
         best_validation_result, best_validation_result_not_updated = None, 0
@@ -173,22 +199,23 @@ class FedotSamplingEnsemble:
                                            **self.fedot_config)
                 # Обучаем на поднаборе
                 fitted_fedot_model.fit(features=partition_data['feature'], target=partition_data['target'])
-                # with open(f"dumps/{partition_name}.pkl", "wb") as f:
-                #     pickle.dump(fitted_fedot_model, f)
+                with open(f"dumps/{partition_name}_{cv_fold}.pkl", "wb") as f:
+                    pickle.dump(fitted_fedot_model, f)
 
                 # Инференс на валидационных данных
-                predict_labels, predict_proba = self._run_inference(fitted_fedot_model, X_val)
+                predict_labels, predict_proba = self._run_inference(fitted_fedot_model, X_val, calculation_mode='non-batch')
                 # Сохраняем модель и метрики
                 metrics = calculate_metrics(y_true=y_val,
                                             problem_type=self.problem,
                                             y_labels=predict_labels,
-                                            y_proba=predict_proba
+                                            y_proba=None
                                             )
                 model_info = {
                     'name': partition_name,
                     'model': fitted_fedot_model,
                     'data_size': len(partition_data['feature']),
-                    'metrics': metrics
+                    'metrics': metrics,
+                    'val_predictions': predict_labels,
                 }
 
                 self.models.append(model_info)
@@ -196,7 +223,7 @@ class FedotSamplingEnsemble:
 
                 print(f"Модель {partition_name} обучена. Размер данных: {model_info['data_size']}")
 
-                predictions = self.ensemble_predict(X_val)
+                predictions = self.ensemble_predict(X_val, stage='validation')
                 current_validation_result = calculate_metrics(
                     y_true=y_val, y_labels=predictions, y_proba=None, problem_type=self.problem
                 )[validation_metric]
@@ -207,9 +234,9 @@ class FedotSamplingEnsemble:
                     best_validation_result_not_updated = 0
                 else:
                     best_validation_result_not_updated += 1
-                if metric_is_better(np.mean(validation_results[:-5]), current_validation_result):
+                if metric_is_better(np.mean(validation_results[:-10]), current_validation_result):
                     del self.models[-1]
-                if best_validation_result_not_updated >= 5:
+                if best_validation_result_not_updated >= 10:
                     break
 
 
@@ -217,7 +244,68 @@ class FedotSamplingEnsemble:
                 print(f"Ошибка при обучении модели {partition_name}: {str(e)}")
                 continue
 
-    def ensemble_predict(self, features: pd.DataFrame) -> np.ndarray:
+    def select_best_models_forward(
+            self,
+            X_val: pd.DataFrame,
+            y_val: np.ndarray,
+            metric_is_better: Callable,
+            validation_metric: str
+    ):
+        """
+        Forward selection моделей в ансамбле.
+        Оставляет в self.models только лучший набор.
+        """
+        validation_metric = validation_metric or self.validation_metric
+
+        n_models = len(self.models)
+        remaining = list(range(n_models))
+        selected = []
+
+        best_score = None
+
+        def evaluate(indices):
+            preds = []
+            for i in indices:
+                mi = self.models[i]
+                pred = mi['val_predictions']
+                preds.append(pred)
+
+            stacked = np.column_stack(preds)
+            final_pred, _ = mode(stacked, axis=1)
+
+            score = calculate_metrics(
+                y_true=y_val,
+                y_labels=final_pred.ravel(),
+                y_proba=None,
+                problem_type=self.problem
+            )[validation_metric]
+
+            return score
+
+        while remaining:
+            best_candidate = None
+            best_candidate_score = best_score
+
+            for i in remaining:
+                candidate = selected + [i]
+                score = evaluate(candidate)
+
+                if best_candidate_score is None or score > best_candidate_score:
+                    best_candidate = i
+                    best_candidate_score = score
+
+            if best_candidate is None:
+                break
+
+            selected.append(best_candidate)
+            remaining.remove(best_candidate)
+            best_score = best_candidate_score
+
+        self.models = [self.models[i] for i in selected]
+
+        return selected, best_score
+
+    def ensemble_predict(self, features: pd.DataFrame, stage: str = 'inference') -> np.ndarray:
         """
         Ансамблирование предсказаний всех моделей
         """
@@ -227,14 +315,16 @@ class FedotSamplingEnsemble:
         predictions = []
 
         for model_info in self.models:
-            pred = model_info['model'].predict(features.to_numpy() if isinstance(features, pd.DataFrame) else features)
+            if stage == 'validation':
+                pred = model_info['val_predictions']
+            elif stage == 'inference':
+                pred = model_info['model'].predict(features.to_numpy() if isinstance(features, pd.DataFrame) else features)
             predictions.append(pred)
 
         # Различные стратегии ансамблирования
         if self.ensemble_method == 'voting':
             # Для классификации - мажоритарное голосование
             if self.problem == 'classification':
-                from scipy.stats import mode
                 stacked_preds = np.column_stack(predictions)
                 final_pred, _ = mode(stacked_preds, axis=1)
                 return final_pred.ravel()
@@ -273,19 +363,25 @@ class FedotImplementation(FedotSamplingEnsemble):
 
     def __init__(self,
                  problem: str,
+                 partitioner_config: Dict[str, Any] = None,
                  fedot_config: Dict[str, Any] = None):
 
         self.problem = problem
+        self.partitioner_config = partitioner_config or {
+            'strategy': 'feature_clustering',
+            'n_clusters': 3,
+            'method': 'kmeans'
+        }
         self.fedot_config = fedot_config or {
             'timeout': 10,
             'preset': 'best_quality',
             'cv_folds': 3
         }
         self.bs_size = 1000
-        self.partitions = None
         self.model = None
 
-    def train_model(self, partitions: Dict[str, Dict], X_val, y_val, class_samples, data_percent: float = 0.1):
+    def train_model(self, X_train, y_train, X_val, y_val, class_samples, data_percent: float = 0.3):
+        partitions = self.prepare_data_partitions(X_train, y_train)
         task, init_assumption = self._define_fedot_setup()
         if 'metric' in self.fedot_config:
             validation_metric = self.fedot_config['metric']
@@ -316,18 +412,18 @@ class FedotImplementation(FedotSamplingEnsemble):
         target = np.concatenate(all_targets, axis=0)
 
         self.model = Fedot(problem=self.problem,
-                                   task_params=task.task_params,
-                                   initial_assumption=init_assumption,
-                                   **self.fedot_config)
+                           task_params=task.task_params,
+                           initial_assumption=init_assumption,
+                           **self.fedot_config)
         self.model.fit(features=data, target=target)
 
-        predict_labels, predict_proba = self._run_inference(self.model, X_val)
+        predict_labels, predict_proba = self._run_inference(self.model, X_val, calculation_mode='non-batch')
         metrics = calculate_metrics(y_true=y_val,
                                     problem_type=self.problem,
                                     y_labels=predict_labels,
                                     y_proba=None
                                     )
-
+        print(f"Валидационные метрики - {metrics}")
         validation_result = calculate_metrics(
             y_true=y_val, y_labels=predict_labels, y_proba=predict_proba, problem_type=self.problem
         )[validation_metric]

@@ -6,6 +6,7 @@ from sklearn.manifold import TSNE
 
 from .base_sampler import BaseSampler, HierarchicalStratifiedMixin
 from ..repository.model_repo import SupportingModels
+from ..utils.utils import safe_index
 
 CLUSTERING_MODELS = SupportingModels.clustering_models.value
 class FeatureBasedClusteringSampler(BaseSampler, HierarchicalStratifiedMixin):
@@ -18,7 +19,7 @@ class FeatureBasedClusteringSampler(BaseSampler, HierarchicalStratifiedMixin):
         BaseSampler.__init__(self, random_state=random_state)
         HierarchicalStratifiedMixin.__init__(
             self,
-            n_splits=n_partitions,
+            n_partitions=n_partitions,
             random_state=random_state,
             logger_name="FeatureBasedClusteringSampler",
         )
@@ -88,8 +89,8 @@ class FeatureBasedClusteringSampler(BaseSampler, HierarchicalStratifiedMixin):
         return numeric_data
 
     def get_partitions(self, data, target) -> Dict[Any, np.ndarray]:
-        partition = {cluster: dict(feature=data.iloc[idx],
-                                   target=target[idx]) for cluster, idx in self.partitions.items()}
+        partition = {cluster: dict(feature=safe_index(data, idx),
+                                   target=safe_index(target, idx)) for cluster, idx in self.partitions.items()}
         return partition
 
 

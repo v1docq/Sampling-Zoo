@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from typing import Dict, Tuple, Optional
 import numpy as np
+from sklearn.model_selection import KFold
 from fedot import Fedot
 from core.metrics.eval_metrics import calculate_metrics
 from core.repository.constant_repo import AmlbExperimentDataset
@@ -51,7 +52,7 @@ class SamplingRunner:
 
     def run_sampling_ensemble(
             self, X_train, y_train, X_val, y_val, X_test, y_test,
-            dataset_info: Dict, class_samples: Optional[Dict] = None
+            dataset_info: Dict, class_samples: Optional[Dict] = None, cv_fold: Optional[int] = None
     ) -> Tuple[Dict, FedotSamplingEnsemble]:
         sampling_config = {**AmlbExperimentDataset.SAMPLING_PRESET.value}
         strategy: SamplingStrategySpec = self.experiment_config.sampling_strategies[0]
@@ -65,31 +66,34 @@ class SamplingRunner:
             ensemble_method="voting",
         )
 
-        partitions = ensemble.prepare_data_partitions(X_train, y_train)
-        ensemble.train_partition_models(partitions, X_val, y_val, class_samples)
+        ensemble.train_partition_models(X_train, y_train, X_val, y_val, class_samples, cv_fold)
         predictions = ensemble.ensemble_predict(X_test)
 
-        metrics = calculate_metrics(y_test, predictions, dataset_info["type"])
-        metrics["training_time"] = ensemble.training_time
-        metrics["n_partitions"] = len(ensemble.models)
-        metrics["partition_metrics"] = ensemble.partition_metrics
+        metrics = calculate_metrics(y_test, predictions, None, dataset_info["type"])
+        print(f'Test metrics: {metrics}')
+
         return metrics, ensemble
 
     def run_single_fedot(
         self, X_train, y_train, X_val, y_val, X_test, y_test,
-        dataset_info: Dict, class_samples: Optional[Dict] = None
+        dataset_info: Dict, class_samples: Optional[Dict] = None, cv_fold: Optional[int] = None,
     ) -> Tuple[Dict, FedotSamplingEnsemble]:
+        sampling_config = {**AmlbExperimentDataset.SAMPLING_PRESET.value}
+        strategy: SamplingStrategySpec = self.experiment_config.sampling_strategies[0]
+        sampling_config.update(strategy.params)
+        sampling_config['strategy'] = strategy.name
 
         fedot = FedotImplementation(
             problem=dataset_info["type"],
             fedot_config=self.experiment_config.fedot_config,
+            partitioner_config=sampling_config,
         )
 
-        partitions = fedot.prepare_data_partitions(X_train, y_train)
-        fedot.train_model(partitions, X_val, y_val, class_samples)
+        fedot.train_model(X_train, y_train, X_val, y_val, class_samples)
         predictions = fedot.predict(X_test)
 
-        metrics = calculate_metrics(y_test, predictions, dataset_info["type"])
+        metrics = calculate_metrics(y_test, predictions, None, dataset_info["type"])
+        print(f'Test metrics: {metrics}')
 
         return metrics, fedot
 
@@ -177,21 +181,36 @@ class LargeScaleAutoMLExperiment:
         if X is None:
             return None
 
-        X_train, X_val, X_test, y_train, y_val, y_test = self.loader.prepare_train_val_test_balanced(
-            X,
-            y,
-            test_size=0.1,
-            val_size=0.1,
-            min_samples=20,
-            problem=dataset_info["type"]
-        )
-        class_samples = self.loader.select_one_sample_per_class(X_train, y_train) \
-            if dataset_info["type"] == "classification" else None
+        metrics = []
+        cv_folds_data = []
+        if self.config.cv_folds == 1:
+            X_train, X_val, X_test, y_train, y_val, y_test = self.loader.prepare_train_val_test_balanced(
+                X,
+                y,
+                test_size=0.1,
+                val_size=0.1,
+                min_samples=20,
+                problem=dataset_info["type"]
+            )
+            cv_folds_data.append((X_train, X_val, X_test, y_train, y_val, y_test))
+        else:
+            kf = KFold(n_splits=self.config.cv_folds, shuffle=True, random_state=42)
+            for train_idx, test_idx in kf.split(X):
+                X_train, X_test, y_train, y_test = X[train_idx], X[test_idx], y[train_idx], y[test_idx]
+
+                X_train, _, X_val, y_train, _, y_val = self.loader.prepare_train_val_test_balanced(
+                    X_train,
+                    y_train,
+                    test_size=0.2,
+                    val_size=0,
+                    min_samples=20,
+                    problem=dataset_info["type"]
+                )
+                cv_folds_data.append((X_train, X_val, X_test, y_train, y_val, y_test))
+
         dataset_result = {
             "dataset": dataset_info,
-            "train_size": len(X_train),
-            "val_size": len(X_val),
-            "test_size": len(X_test),
+            "cv_folds": self.config.cv_folds,
         }
 
         run_obj = self.tracker.start_run(
@@ -199,19 +218,39 @@ class LargeScaleAutoMLExperiment:
             params={"time_budget": self.config.time_budget_minutes},
         )
 
-        try:
-            metrics, ensemble_model = self.runner.run_sampling_ensemble(
-                X_train, y_train, X_val, y_val, X_test, y_test, dataset_info, class_samples
-            )
-            # metrics, model = self.runner.run_single_fedot(
-            #     X_train, y_train, X_val, y_val, X_test, y_test, dataset_info, class_samples
-            # )
-            dataset_result["fedot_sampling"] = metrics
-            self.tracker.log_metrics(metrics)
-            dataset_result["version"] = self.tracker.version_label(run_obj)
-        except Exception as exc:  # pragma: no cover - пример для ручного запуска
-            dataset_result["fedot_sampling"] = {"error": str(exc)}
-        finally:
-            self.tracker.end_run()
+        for current_fold, (X_train, X_val, X_test, y_train, y_val, y_test) in enumerate(cv_folds_data):
+            class_samples = self.loader.select_one_sample_per_class(X_train, y_train) \
+                if dataset_info["type"] == "classification" else None
 
+            try:
+                if self.config.run_mode == 'chunks':
+                    fold_metrics, ensemble = self.runner.run_sampling_ensemble(
+                        X_train, y_train, X_val, y_val, X_test, y_test, dataset_info, class_samples, current_fold
+                    )
+                    metrics.append(fold_metrics)
+                    fold_metrics["n_partitions"] = len(ensemble.models)
+                    fold_metrics["partition_metrics"] = ensemble.partition_metrics
+                    dataset_result[f"fedot_sampling_{current_fold}"] = fold_metrics
+                    print(f'------------------ fold {current_fold} --------------')
+                    print(fold_metrics)
+                elif self.config.run_mode == 'mixed_chunk':
+                    fold_metrics, model = self.runner.run_single_fedot(
+                        X_train, y_train, X_val, y_val, X_test, y_test, dataset_info, class_samples, current_fold
+                    )
+                    metrics.append(fold_metrics)
+                    dataset_result[f"fedot_sampling_{current_fold}"] = fold_metrics
+                    print(f'------------------ fold {current_fold} --------------')
+                    print(fold_metrics)
+                self.tracker.log_metrics(metrics)
+                dataset_result["version"] = self.tracker.version_label(run_obj)
+            except Exception as exc:  # pragma: no cover - пример для ручного запуска
+                dataset_result["fedot_sampling"] = {"error": str(exc)}
+            finally:
+                self.tracker.end_run()
+
+        final_metrics = {
+            k: sum(m[k] for m in metrics) / len(metrics)
+            for k in metrics[0].keys()
+        }
+        dataset_result[f"fedot_sampling"] = final_metrics
         return dataset_result

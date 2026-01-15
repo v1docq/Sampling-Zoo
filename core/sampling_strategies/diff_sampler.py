@@ -8,6 +8,7 @@ from sklearn.preprocessing import OneHotEncoder, LabelEncoder
 from typing import Dict, Any, Union, Callable
 from .base_sampler import BaseSampler, HierarchicalStratifiedMixin
 from ..repository.model_repo import SupportingModels
+from ..utils.utils import safe_index
 
 
 class DifficultyBasedSampler(BaseSampler, HierarchicalStratifiedMixin):
@@ -49,11 +50,9 @@ class DifficultyBasedSampler(BaseSampler, HierarchicalStratifiedMixin):
             self._select_model(problem=problem)
         # кодируем категориальные признаки, чтобы избежать ошибки модели
         data = self._encode_categorical(data)
-        # Получаем out-of-fold предсказания чтобы избежать переобучения
-        predictions = cross_val_predict(self.model, data, target, cv=5)
 
         # Вычисляем сложность примеров
-        self.difficulty_scores_ = self._compute_difficulty_scores(data, target, predictions, problem)
+        self.difficulty_scores_ = self._compute_difficulty_scores(data, target, problem)
 
         # Создаем разделы на основе сложности
         # Если классов 2 и получен difficulty_threshold, делим на 2 части по нему, иначе - на равные части
@@ -127,7 +126,7 @@ class DifficultyBasedSampler(BaseSampler, HierarchicalStratifiedMixin):
         """Определяет тип задачи (классификация или регрессия)"""
         return len(np.unique(target)) < 0.1 * len(target) or target.dtype == 'object'
 
-    def _compute_difficulty_scores(self, data, target: np.ndarray, predictions: np.ndarray, problem: str) -> np.ndarray:
+    def _compute_difficulty_scores(self, data, target: np.ndarray, problem: str) -> np.ndarray:
         """Вычисляет оценку сложности для каждого примера"""
         if problem == 'classification':
             # Для классификации: 1 - вероятность правильного класса
@@ -137,10 +136,12 @@ class DifficultyBasedSampler(BaseSampler, HierarchicalStratifiedMixin):
                 true_class_probs = proba_predictions[np.arange(len(target)), target]
                 return 1 - true_class_probs
             else:
+                predictions = cross_val_predict(self.model, data, target, cv=5)
                 # Используем accuracy-based метрику
                 correct_predictions = (predictions == target)
                 return 1 - correct_predictions.astype(float)
         elif problem == 'regression':
+            predictions = cross_val_predict(self.model, data, target, cv=5)
             # Для регрессии: нормализованная абсолютная ошибка
             errors = np.abs(predictions - target)
             return errors / (np.max(errors) + 1e-8)
@@ -153,8 +154,8 @@ class DifficultyBasedSampler(BaseSampler, HierarchicalStratifiedMixin):
 
     def get_partitions(self, data, target) -> Dict[Any, np.ndarray]:
         partition = {
-            cluster: dict(feature=data[idx] if isinstance(data, np.ndarray) else data.to_numpy()[idx],
-                          target=target[idx] if isinstance(target, np.ndarray) else target.to_numpy()[idx])
+            cluster: dict(feature=safe_index(data, idx),
+                          target=safe_index(target, idx))
             for cluster, idx in self.partitions.items()
         }
         return partition

@@ -13,16 +13,18 @@ from core.repository.constant_repo import AmlbExperimentDataset
 
 
 EXPERIMENT_REQUEST = """
-datasets: airlines
-sampling: difficulty(n_partitions=100, chunks_percent=100)
+datasets: year_prediction_msd
+cv_folds: 3
+run_mode: mixed_chunk
+sampling: feature_clustering(n_partitions=8, chunks_percent=70, save_filename=partitions_year)
 models: fedot(preset=best_quality)
-time_budget: 15
+time_budget: 1500
 tracking_uri: file:./mlruns
 """
 
 
 def run_from_request(request: str) -> None:
-    builder = ExperimentConfigBuilder(default_time_budget=10)
+    builder = ExperimentConfigBuilder(default_time_budget=1500)
     experiment_config: ExperimentConfig = builder.from_text(
         request,
         fedot_config=AmlbExperimentDataset.FEDOT_PRESET_REG.value
