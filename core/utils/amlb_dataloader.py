@@ -32,6 +32,7 @@ class AMLBDatasetLoader:
         try:
             if 'path' in dataset_info.keys():
                 df = pd.read_csv(dataset_info['path'])
+                # df = df.drop_duplicates()
                 y = df[dataset_info['target']]
                 del df[dataset_info['target']]
                 X = df
@@ -44,10 +45,13 @@ class AMLBDatasetLoader:
                 # Кодируем целевой признак для классификации
                 le = LabelEncoder()
                 y = le.fit_transform(y)
+            else:
+                y = y.to_numpy()
 
             # Обработка пропущенных значений
             if isinstance(X, pd.DataFrame):
                 X = X.fillna(X.mean(numeric_only=True))
+                X = X.to_numpy()
 
             print(f"Загружен датасет {dataset_info['name']}: {X.shape[0]} samples, {X.shape[1]} features")
 
@@ -71,9 +75,12 @@ class AMLBDatasetLoader:
             X_train, X_temp, y_train, y_temp = train_test_split(
                 X, y, test_size=test_size+val_size, random_state=random_state,
             )
-            X_val, X_test, y_val, y_test = train_test_split(
-                X_temp, y_temp, test_size=test_size / (test_size + val_size), random_state=random_state,
-            )
+            if val_size == 0:
+                X_val, X_test, y_val, y_test = None, X_temp, None, y_temp
+            else:
+                X_val, X_test, y_val, y_test = train_test_split(
+                    X_temp, y_temp, test_size=test_size / (test_size + val_size), random_state=random_state,
+                )
             return X_train, X_val, X_test, y_train, y_val, y_test
 
         classes, counts = np.unique(y, return_counts=True)
@@ -90,9 +97,13 @@ class AMLBDatasetLoader:
             X_common, y_common, test_size=test_size+val_size, random_state=random_state, stratify=y_common
         )
 
-        X_val, X_test, y_val, y_test = train_test_split(
-            X_temp, y_temp, test_size=test_size / (test_size + val_size), random_state=random_state, stratify=y_temp
-        )
+        if val_size == 0:
+            X_val, X_test, y_val, y_test = None, X_temp, None, y_temp
+        else:
+            X_val, X_test, y_val, y_test = train_test_split(
+                X_temp, y_temp, test_size=test_size / (test_size + val_size), random_state=random_state,
+                stratify=y_temp
+            )
 
         for cls in rare_classes:
             cls_indices = np.where(y_rare == cls)[0]

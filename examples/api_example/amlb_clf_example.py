@@ -13,16 +13,18 @@ from core.repository.constant_repo import AmlbExperimentDataset
 
 
 EXPERIMENT_REQUEST = """
-datasets: kddcup
-sampling: difficulty(n_partitions=100, chunks_percent=10)
+datasets: covtype-normalized
+cv_folds: 3
+run_mode: chunks
+sampling: difficulty(n_partitions=14, chunks_percent=50, save_filename=partitions_covtype)
 models: fedot(preset=best_quality)
-time_budget: 15
+time_budget: 1500
 tracking_uri: file:./mlruns
 """
 
 
 def run_from_request(request: str) -> None:
-    builder = ExperimentConfigBuilder(default_time_budget=10)
+    builder = ExperimentConfigBuilder(default_time_budget=1500)
     experiment_config: ExperimentConfig = builder.from_text(
         request,
         fedot_config=AmlbExperimentDataset.FEDOT_PRESET_CLF.value

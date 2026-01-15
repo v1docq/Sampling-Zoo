@@ -103,7 +103,12 @@ class AmlbExperimentDataset(Enum):
                            {'name': 'sf-police-incidents',
                             'type': 'classification',
                             'target': 'ViolentCrime',
-                            'path': './dataset/sf-police-incidents.csv'}]
+                            'path': './dataset/sf-police-incidents.csv'},
+                           {'name': 'year_prediction_msd',
+                            'type': 'regression',
+                            'target': 'year',
+                            'path': './dataset/year_prediction_msd.csv'}
+                           ]
     AMLB_EXPERIMENT_RESULTS = {
         'adult': {'accuracy': 0.85, 'f1_macro': 0.65},
         'covertype': {'accuracy': 0.70, 'f1_macro': 0.55},
@@ -112,30 +117,30 @@ class AmlbExperimentDataset(Enum):
         'california': {'rmse': 0.8, 'r2': 0.65}
     }
     FEDOT_BASELINE_PRESET = dict(timeout=10, preset='best_quality', cv_folds=3)
-    FEDOT_PRESET_CLF = {'timeout': 1,  # Меньше timeout для каждой модели
+    FEDOT_PRESET_CLF = {'timeout': 10,  # Меньше timeout для каждой модели
                         'preset': 'best_quality',
-                        'cv_folds': 2,
+                        'cv_folds': 4,
                         'logging_level': 20,
                         'with_tuning': False,
-                        'pop_size': 5,
-                        'num_of_generations': 10,
-                        'n_jobs': 1,
+                        'pop_size': 12,
+                        'num_of_generations': 15,
+                        'n_jobs': 15,
                         'metric': 'f1'
                         }
-    FEDOT_PRESET_REG = {'timeout': 1,
+    FEDOT_PRESET_REG = {'timeout': 15,
                         'preset': 'best_quality',
-                        'cv_folds': 2,
+                        'cv_folds': 4,
                         'logging_level': 20,
                         'with_tuning': False,
-                        'pop_size': 5,
-                        'num_of_generations': 10,
-                        'n_jobs': 1,
+                        'pop_size': 12,
+                        'num_of_generations': 15,
+                        'n_jobs': 15,
                         'metric': 'rmse'
                         }
     FEDOT_MODELS_FOR_CLF = [
-        # 'bernb',
+        'bernb',
         'catboost',
-        # 'dt',
+        'dt',
         'fast_ica',
         'isolation_forest_class',
         'knn',
@@ -144,8 +149,8 @@ class AmlbExperimentDataset(Enum):
         'mlp',
         'normalization',
         'pca',
-        # 'poly_features',
-        # 'qda',
+        'poly_features',
+        'qda',
         'resample',
         'rf',
         'scaling',
