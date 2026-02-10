@@ -8,6 +8,8 @@ from core.sampling_strategies.diff_sampler import DifficultyBasedSampler, Uncert
 from core.sampling_strategies.random_sampler import RandomSplitSampler
 from core.sampling_strategies.stratified_sampler import StratifiedSplitSampler, AdvancedStratifiedSampler
 from core.sampling_strategies.balance_sampler import StratifiedBalancedSplitSampler
+from core.sampling_strategies.spectral.spectral_leverage import SpectralLeverageSampler
+from core.sampling_strategies.spectral.tensor_energy import TensorEnergySampler
 
 class SamplingStrategyFactory:
     """
@@ -20,7 +22,7 @@ class SamplingStrategyFactory:
             'random': RandomSplitSampler,
             'random_split': RandomSplitSampler,
 
-            #Stratified Sampling
+            # Stratified Sampling
             'stratified': StratifiedSplitSampler,
             'advanced_stratified': AdvancedStratifiedSampler,
 
@@ -36,8 +38,12 @@ class SamplingStrategyFactory:
             'difficulty': DifficultyBasedSampler,
             'uncertainty': UncertaintySampler,
 
-            #Class balance stratagie
+            # Class balance strategies
             'balance': StratifiedBalancedSplitSampler,
+
+            # Spectral strategies
+            'spectral_leverage': SpectralLeverageSampler,
+            'tensor_energy': TensorEnergySampler
         }
 
     def create_strategy(self, strategy_type: str, **kwargs) -> BaseSampler:
@@ -94,6 +100,8 @@ class SamplingStrategyFactory:
             'stratified',
             'temporal',
             'temporal_split',
+            'spectral_leverage',
+            'tensor_energy',
             'tsne_clustering',
             'uncertainty',
         ])

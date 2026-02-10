@@ -2,7 +2,7 @@
 name = "sampling-zoo"
 version = "0.1.0"
 readme = "README.md"
-requires-python = "==3.10.3"
+#requires-python = "==3.10.3"
 dependencies = [
     "numpy>=1.21.0",
     "pandas>=1.3.0",
@@ -12,7 +12,5 @@ dependencies = [
     "imbalanced-learn>=0.8.0",
     "iterative-stratification>=0.1.9",
     "hdbscan>=0.8.29",
-    "fedot",
-    "setuptools",
-    "umap-learn",
+    "fedot>=0.7.5",
 ]

@@ -1,0 +1,31 @@
+Metadata-Version: 2.4
+Name: sampling-zoo
+Version: 0.1.0
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.21.0
+Requires-Dist: pandas>=1.3.0
+Requires-Dist: scikit-learn>=1.0.0
+Requires-Dist: scipy>=1.7.0
+Requires-Dist: tqdm>=4.62.0
+Requires-Dist: imbalanced-learn>=0.8.0
+Requires-Dist: iterative-stratification>=0.1.9
+Requires-Dist: hdbscan>=0.8.29
+Requires-Dist: fedot>=0.7.5
+
+# Sampling Strategies Framework
+
+Гибкий фреймворк для стратегий семплирования данных в задачах машинного обучения и глубокого обучения.
+
+## Особенности
+
+- **Универсальность**: Работа с временными рядами, табличными данными и гибридными наборами
+- **Гибкость**: Легко расширяемая архитектура с поддержкой пользовательских стратегий
+- **Производительность**: Оптимизированные реализации для больших наборов данных
+- **Интеграция**: Простой API для интеграции в существующие пайплайны
+
+## Установка
+
+```bash
+git clone https://github.com/your-username/sampling-strategies.git
+cd sampling-strategies
+pip install -e .
