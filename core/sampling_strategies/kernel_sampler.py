@@ -137,6 +137,76 @@ def mC_kernel_from_t_XA(
 
 
 @torch.no_grad()
+def avg_mDNF_kernel_from_t_XA(
+    t_XA: torch.Tensor,   # [N, m] integer counts of matching fields
+    d_max: int,
+    c_max: int,
+    F: int,
+    n_total: int,         # one-hot total fields
+):
+    """
+    avg.mDNF kernel:
+      average over d=1..d_max, c=1..c_max
+    """
+    device = t_XA.device
+
+    def binom(x, k):
+        x = x.float()
+        k = torch.tensor(float(k), device=device)
+        return torch.exp(
+            torch.lgamma(x + 1)
+            - torch.lgamma(k + 1)
+            - torch.lgamma(x - k + 1)
+        )
+
+    K_total = torch.zeros_like(t_XA, dtype=torch.float32)
+
+    for c in range(1, c_max + 1):
+        # mC(x,z)
+        K_c = mC_kernel_from_t_XA(t_XA, c=c, F=F)
+
+        # mC(x,x) = C(F,c)
+        K_xx = float(math.comb(F, c))
+
+        # общее число конъюнкций
+        Nc = math.comb(n_total, c)
+
+        for d in range(1, d_max + 1):
+            term1 = binom(torch.full_like(K_c, Nc), d)
+            term2 = binom(torch.full_like(K_c, Nc - K_xx), d)
+            term3 = term2  # symmetrical <x, x> and <z, z> = F
+            term4 = binom(Nc - K_xx - K_xx + K_c, d)
+
+            K_total += term1 - term2 - term3 + term4
+
+    return K_total / (d_max * c_max)
+
+
+
+def rbf_kernel(X: torch.Tensor, A: torch.Tensor, gamma: Optional[float] = None):
+    # X: (N, d)
+    # A: (M, d)
+    if gamma is None:
+        gamma = 1 / (50 * X.shape[1])
+
+    # ||X||^2 -> (N, 1)
+    X_norm = (X ** 2).sum(dim=1, keepdim=True)
+
+    # ||A||^2 -> (1, M)
+    A_norm = (A ** 2).sum(dim=1).unsqueeze(0)
+
+    # pairwise squared distances (N, M)
+    dist2 = X_norm + A_norm - 2 * X @ A.T
+
+    # RBF
+    K = torch.exp(-gamma * dist2)
+
+    print(f'non zero: {(K.abs() > 1e-8).sum().item()}, shape {K.shape}')
+
+    return K
+
+
+@torch.no_grad()
 def diag_normalize_K_XA(K_XA: torch.Tensor, K_AA_diag: torch.Tensor, K_XX_diag: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
     Diagonal normalization:
@@ -165,7 +235,7 @@ def diag_normalize_K_XA(K_XA: torch.Tensor, K_AA_diag: torch.Tensor, K_XX_diag: 
 def random_anchors(X_cat: torch.Tensor, m: int, generator: Optional[torch.Generator] = None) -> torch.Tensor:
     N = X_cat.shape[0]
     idx = torch.randperm(N, device=X_cat.device, generator=generator)[:m]
-    return X_cat[idx].clone()
+    return idx
 
 
 @torch.no_grad()
@@ -191,9 +261,10 @@ def farthest_point_anchors_hamming(
     C = X_cat[cand_idx]  # [pool, F]
 
     # init anchor = random candidate
-    a0 = C[torch.randint(low=0, high=pool, size=(1,), device=device, generator=g)]
-    A = [a0.squeeze(0)]
-    A_cat = torch.stack(A, dim=0)  # [1, F]
+    j0 = torch.randint(low=0, high=pool, size=(1,), device=device, generator=g).item()
+    selected_pool_idx = [j0]
+
+    A_cat = C[j0:j0+1]  # [1, F]
 
     # maintain min distance of candidates to selected anchors
     # compute matches count to anchors -> dist = F - matches
@@ -202,18 +273,22 @@ def farthest_point_anchors_hamming(
 
     for _ in range(1, m):
         # select candidate with max min_dist
-        j = torch.argmax(min_dist)
-        A.append(C[j].clone())
-        A_cat = torch.stack(A, dim=0)  # [k, F]
+        j = torch.argmax(min_dist).item()
+        selected_pool_idx.append(j)
 
-        # update min_dist with distance to new anchor
-        # compute matches between candidates and new anchor only
-        new_anchor = A_cat[-1:].contiguous()
-        t_new = match_count_matrix(C, new_anchor, chunk_size=chunk_size).to(torch.int32).squeeze(1)
+        new_anchor = C[j:j+1].contiguous()
+
+        t_new = match_count_matrix(C, new_anchor, chunk_size=chunk_size) \
+                    .to(torch.int32).squeeze(1)
+
         dist_new = (F - t_new).to(torch.float32)
         min_dist = torch.minimum(min_dist, dist_new)
 
-    return torch.stack(A, dim=0)  # [m, F]
+    # convert pool indices → original dataset indices
+    selected_pool_idx = torch.tensor(selected_pool_idx, device=device)
+    anchor_indices = cand_idx[selected_pool_idx]
+
+    return anchor_indices
 
 
 # -------------------------
@@ -333,7 +408,7 @@ def _normalize01(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
 def sample_top_or_prob(
     scores: torch.Tensor,
     k: int,
-    mode: str = "prob",  # "prob" or "topk"
+    mode: Literal["prob", "topk"] = "prob",  # "prob" or "topk"
     temperature: float = 1.0,
     clip_top_frac: float = 0.001,
     seed: int = 0,
@@ -378,6 +453,7 @@ class KernelSpec:
     kind: str  # "mdnf" | "match" | "mC"
     sigma: float = 1.0
     c: int = 2
+    d: int = 2
     weight: float = 1.0  # for mixing; we'll normalize anyway
 
 
@@ -388,18 +464,24 @@ class MultiKernelEncoder:
     def __init__(
         self,
         X_cat: torch.Tensor,          # [N, F]
+        X_num: torch.Tensor,
         A_cat: torch.Tensor,          # [m, F]
+        A_num: torch.Tensor,
         specs: List[KernelSpec],
         w_f: torch.Tensor,            # [F]
+        total_ohe_dim: Optional[int] = None,
         nystrom_ridge: float = 1e-3,
         chunk_size: int = 65536,
     ):
         self.X_cat = X_cat
+        self.X_num = X_num
         self.A_cat = A_cat
+        self.A_num = A_num
         self.specs = specs
         self.w_f = w_f
         self.nystrom_ridge = nystrom_ridge
         self.chunk_size = chunk_size
+        self.total_ohe_dim = total_ohe_dim
 
         self.device = X_cat.device
         self.N, self.F = X_cat.shape
@@ -437,6 +519,22 @@ class MultiKernelEncoder:
                 # K(x,x)=C(F,c)
                 K_xx = torch.tensor(float(math.comb(self.F, spec.c)) if self.F >= spec.c else 0.0, device=self.device).repeat(self.N)
                 K_AA = mC_kernel_from_t_XA(t_AA, c=spec.c, F=self.F)
+            elif spec.kind == "avg.mDNF":
+                # For field-wise representation, each sample matches itself on all F fields => t=F
+                # K(x,x)=C(F,c)
+                diag_result = 0
+                for c in range(1, spec.c + 1):
+                    for d in range(1, spec.d + 1):
+                        nc = math.comb(self.total_ohe_dim, c)
+                        mc_xx = math.comb(self.F, c)
+                        diag_result += math.comb(nc, d) - math.comb(nc - mc_xx, d)
+                diag_result = diag_result  / (spec.c * spec.d)
+                K_xx = torch.tensor(diag_result, device=self.device).repeat(self.N)
+                K_AA = avg_mDNF_kernel_from_t_XA(t_AA, d_max=spec.d, c_max=spec.c, F=self.F, n_total=self.total_ohe_dim)
+            elif spec.kind == "rbf":
+                # rbf(x, x) = 1
+                K_xx = torch.ones(self.X_num.shape[0], device=self.device, dtype=self.X_num.dtype)
+                K_AA = rbf_kernel(self.A_num, self.A_num)
             else:
                 raise ValueError(f"Unknown kernel kind: {spec.kind}")
 
@@ -463,7 +561,12 @@ class MultiKernelEncoder:
         elif spec.kind == "mC":
             # Use t_XA -> binomial
             t = match_count_matrix(Xb, self.A_cat, chunk_size=Xb.shape[0]).to(torch.int32)  # [B, m]
-            K = mC_kernel_from_t_XA(t, c=spec.c, F=self.F)
+            K = mC_kernel_from_t_XA(t,  c=spec.c, F=self.F)
+        elif spec.kind == "avg.mDNF":
+            t = match_count_matrix(Xb, self.A_cat, chunk_size=Xb.shape[0]).to(torch.int32)  # [B, m]
+            K = avg_mDNF_kernel_from_t_XA(t, d_max=spec.d, c_max=spec.c, F=self.F, n_total=self.total_ohe_dim)
+        elif spec.kind == "rbf":
+            K = rbf_kernel(Xb, self.A_num)
         else:
             raise ValueError(spec.kind)
 
@@ -476,17 +579,25 @@ class MultiKernelEncoder:
         return K
 
     @torch.no_grad()
-    def phi_chunks(self, X_cat_custom: Optional[torch.Tensor] = None, chunk_size: Optional[int] = None):
+    def phi_chunks(
+        self,
+        X_cat_custom: Optional[torch.Tensor] = None,
+        X_num_custom: Optional[torch.Tensor] = None,
+        chunk_size: Optional[int] = None
+    ):
         if X_cat_custom is None:
             X_cat_custom = self.X_cat
+        if X_num_custom is None:
+            X_num_custom = self.X_num
         N = X_cat_custom.shape[0]
         cs = chunk_size or self.chunk_size
         for start in range(0, N, cs):
             end = min(N, start + cs)
             Xb = X_cat_custom[start:end]
+            Xb_num = X_num_custom[start:end] if X_num_custom is not None else None
             feats = []
             for spec in self.specs:
-                Kb = self._K_XA(spec, Xb)  # [B, m]
+                Kb = self._K_XA(spec, Xb) if spec.kind != 'rbf' else self._K_XA(spec, Xb_num) # [B, m]
                 # Nyström whitening
                 invsqrt = self._KAA_invsqrt[spec.name]  # [m, m]
                 Phi_b = (Kb.to(torch.float32) @ invsqrt) * spec.weight
@@ -512,10 +623,16 @@ class MultiKernelEncoder:
         return Phi_cov
 
     @torch.no_grad()
-    def get_custom_embeddings(self, X_cat_custom: torch.Tensor, device, chunk_size: Optional[int] = None):
+    def get_custom_embeddings(
+        self,
+        X_cat_custom: torch.Tensor,
+        device,
+        X_num_custom: Optional[torch.Tensor] = None,
+        chunk_size: Optional[int] = None
+    ):
         Phi = torch.empty((X_cat_custom.shape[0], self.d), device=device, dtype=torch.float32)
 
-        for start, end, Phi_b in self.phi_chunks(X_cat_custom=X_cat_custom, chunk_size=chunk_size):
+        for start, end, Phi_b in self.phi_chunks(X_cat_custom=X_cat_custom, X_num_custom=X_num_custom, chunk_size=chunk_size):
             Phi[start:end] = Phi_b.to(torch.float32)
 
         return Phi
@@ -545,6 +662,7 @@ class KernelSampler:
         random_state: int = 42,
         anchors: int = 512,
         anchor_mode: Literal['farthest', 'random'] = "farthest",
+        total_ohe_dim: Optional[int] = None,
         w_f: Optional[torch.Tensor] = None,
         chunk_size: int = 65536,
         leverage_ridge: float = 1e-2,
@@ -559,6 +677,7 @@ class KernelSampler:
         self.random_state = random_state
         self.anchors = anchors
         self.anchor_mode = anchor_mode
+        self.total_ohe_dim = total_ohe_dim
         self.w_f = w_f
         self.chunk_size = chunk_size
         self.leverage_ridge = leverage_ridge
@@ -592,31 +711,49 @@ class KernelSampler:
         self,
         X_cat: torch.Tensor,
         device,
+        X_num: Optional[torch.Tensor] = None,
         chunk_size=65536,
     ) -> torch.Tensor:
-        return self.encoder.get_custom_embeddings(X_cat_custom=X_cat, device=device, chunk_size=chunk_size)
+        return self.encoder.get_custom_embeddings(
+            X_cat_custom=X_cat,  X_num_custom=X_num, device=device, chunk_size=chunk_size
+        )
 
-    def fit_sample(self, X_cat: torch.Tensor, y: Optional[torch.Tensor] = None):
+    def fit_sample(
+        self,
+        X_cat: torch.Tensor,
+        X_num: Optional[torch.Tensor] = None,
+        y: Optional[torch.Tensor] = None,
+        precomputed_anchors: tuple[torch.Tensor, torch.Tensor] = None,
+        sample_mode: Literal["topk", "prob"] = "prob"
+    ):
         device = X_cat.device
         N, F = X_cat.shape
         if self.w_f is None:
             self.w_f = torch.ones((F,), device=device, dtype=torch.float32)
 
-        if self.anchor_mode == "random":
+        if precomputed_anchors is not None:
+            A_cat, A_num = precomputed_anchors
+        elif self.anchor_mode == "random":
             g = torch.Generator(device=device)
             g.manual_seed(self.random_state)
-            A_cat = random_anchors(X_cat, m=self.anchors, generator=g)
+            A_idx = random_anchors(X_cat, m=self.anchors, generator=g)
+            A_cat = X_cat[A_idx].clone()
+            A_num = X_num[A_idx].clone() if X_num is not None else None
         elif self.anchor_mode == "farthest":
-            A_cat = farthest_point_anchors_hamming(
-                X_cat, m=self.anchors, candidate_pool=min(20000, N), seed=self.random_state,
+            A_idx = farthest_point_anchors_hamming(
+                X_cat, m=self.anchors, candidate_pool=N, seed=self.random_state,
                 chunk_size=min(self.chunk_size, 32768)
             )
+            A_cat = X_cat[A_idx].clone()
+            A_num = X_num[A_idx].clone() if X_num is not None else None
         else:
             raise ValueError("anchor_mode must be random or farthest")
 
         specs: List[KernelSpec] = [KernelSpec(**kernel) for kernel in self.kernels]
-        self.encoder = MultiKernelEncoder(X_cat=X_cat, A_cat=A_cat, specs=specs, w_f=self.w_f,
-                                          nystrom_ridge=1e-3, chunk_size=self.chunk_size)
+        self.encoder = MultiKernelEncoder(
+            X_cat=X_cat, X_num=X_num, A_cat=A_cat, A_num=A_num, specs=specs, w_f=self.w_f,
+            total_ohe_dim=self.total_ohe_dim, nystrom_ridge=1e-3, chunk_size=self.chunk_size
+        )
 
         score_components = [
             (self.energy_score, energy_scores_streaming, (self.encoder, self.chunk_size)),
@@ -640,14 +777,14 @@ class KernelSampler:
             raise ValueError("At least one score weight must be specified")
 
         if not self.use_hard_mode:
-            idx = sample_top_or_prob(score, k=self.sample_size, mode="prob", temperature=1.0, seed=self.random_state)
+            idx = sample_top_or_prob(score, k=self.sample_size, mode=sample_mode, temperature=0.5, seed=self.random_state)
             return idx, A_cat, self.encoder.get_train_embeddings(idx, device, chunk_size=self.chunk_size)
 
         if self.use_hard_mode:
             if self.hard_mode_config is None or y is None:
                 raise ValueError("hard_mode_config and y must be specified in hard mode")
             sample_size_cov = int(round(self.sample_size * self.hard_mode_config.coverage_frac))
-            idx_cov = sample_top_or_prob(score, k=sample_size_cov, mode="prob", temperature=1.0, seed=self.random_state)
+            idx_cov = sample_top_or_prob(score, k=sample_size_cov, mode=sample_mode, temperature=0.5, seed=self.random_state)
 
             # Stage 2: hard/uncertainty refinement
             sample_size_hard = self.sample_size - sample_size_cov
@@ -686,7 +823,7 @@ class KernelSampler:
             mask[idx_cov] = False
             hard_score = torch.clamp(hard_score, min=0.0) * mask.to(torch.float32)
 
-            idx_hard = sample_top_or_prob(hard_score, k=sample_size_hard, mode="prob", temperature=1.0, seed=self.random_state + 2,
+            idx_hard = sample_top_or_prob(hard_score, k=sample_size_hard, mode=sample_mode, temperature=0.5, seed=self.random_state + 2,
                                           clip_top_frac=self.hard_mode_config.hard_clip_top_frac)
 
             idx = torch.unique(torch.cat([idx_cov, idx_hard], dim=0))[:self.sample_size]
