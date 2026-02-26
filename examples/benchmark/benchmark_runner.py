@@ -10,8 +10,8 @@ from scipy import sparse
 from sklearn.base import ClassifierMixin, clone
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
 
-from examples.benchmark.benchmark_datasets import DatasetBundle
-from examples.benchmark.benchmark_logging import BenchmarkLogger, build_sample_stats
+from benchmark_datasets import DatasetBundle
+from benchmark_logging import BenchmarkLogger, build_sample_stats
 
 
 @dataclass

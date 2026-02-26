@@ -1,3 +1,5 @@
+from typing import Union
+
 import numpy as np
 import pandas as pd
 from .base_sampler import SpectralSamplerBase
@@ -7,10 +9,10 @@ class SpectralLeverageSampler(SpectralSamplerBase):
     def __init__(
         self,
         sample_size: int,
-        approx_rank: int | float = 1.0,
-        random_state: int | None = None,
+        approx_rank: Union[int, float] = 1.0,
+        random_state: Union[int, None] = None,
         return_weights: bool = False,
-        backend_config: dict | None = None,
+        backend_config: Union[dict, None] = None,
     ):
         super().__init__(
             sample_size=sample_size,
@@ -20,7 +22,7 @@ class SpectralLeverageSampler(SpectralSamplerBase):
             backend_config=backend_config,
         )
 
-    def fit(self, X: np.ndarray | pd.DataFrame | None = None) -> "SpectralLeverageSampler":
+    def fit(self, X = None) -> "SpectralLeverageSampler":
         """Обучает семплер на данных X (и y, если предоставлено)"""
     
         # Преобразуем данные в numpy array, если это необходимо
