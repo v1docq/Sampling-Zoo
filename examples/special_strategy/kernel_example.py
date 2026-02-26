@@ -1,13 +1,10 @@
 import pandas as pd
-import pandas as pd
 import numpy as np
 from sklearn.metrics import roc_auc_score, f1_score
-from sklearn.model_selection import train_test_split
 import lightgbm as lgb
 from core.sampling_strategies.kernel_sampler import KernelSampler
 import torch
 from itertools import product
-from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from pytorch_tabnet.tab_model import TabNetClassifier
 
