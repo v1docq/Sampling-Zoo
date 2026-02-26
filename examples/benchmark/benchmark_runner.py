@@ -5,23 +5,28 @@ from time import perf_counter
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
 import numpy as np
+import pandas as pd
+from scipy import sparse
 from sklearn.base import ClassifierMixin, clone
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
 
-from examples.special_strategy.benchmark_logging import BenchmarkLogger, build_sample_stats
+from examples.benchmark.benchmark_datasets import DatasetBundle
+from examples.benchmark.benchmark_logging import BenchmarkLogger, build_sample_stats
 
 
 @dataclass
-class DatasetBundle:
-    name: str
-    x_train: np.ndarray
-    y_train: np.ndarray
-    x_test: np.ndarray
-    y_test: np.ndarray
+class StrategyOutput:
+    sample_indices: Sequence[int]
+    strategy_params: Optional[Mapping[str, Any]] = None
+    sample_scores: Optional[Sequence[float]] = None
+    cluster_labels: Optional[Sequence[Any]] = None
+    cell_ids: Optional[Sequence[Any]] = None
+    simplex_ids: Optional[Sequence[Any]] = None
+    extra: Optional[Mapping[str, Any]] = None
 
 
 class SpecialStrategyBenchmarkRunner:
-    """Runner for benchmark of sampling strategies with structured artifact logging."""
+    """Benchmark runner for sampling strategies with consistent artifact logging."""
 
     def __init__(self, logger: Optional[BenchmarkLogger] = None) -> None:
         self.logger = logger or BenchmarkLogger()
@@ -30,12 +35,27 @@ class SpecialStrategyBenchmarkRunner:
     def run(
         self,
         datasets: Iterable[DatasetBundle],
-        strategies: Mapping[str, Callable[[np.ndarray, np.ndarray], Mapping[str, Any]]],
+        strategies: Mapping[str, Callable[[DatasetBundle], Mapping[str, Any]]],
         base_model: ClassifierMixin,
     ) -> List[Dict[str, Any]]:
+        self.run_records = []
         for dataset in datasets:
+            x_train_dense = _to_dense(dataset.X_train_processed)
+            x_test_dense = _to_dense(dataset.X_test_processed)
+            y_train = dataset.y_train.to_numpy()
+            y_test = dataset.y_test.to_numpy()
+
             for strategy_name, strategy_fn in strategies.items():
-                run_payload = self._run_single_strategy(dataset, strategy_name, strategy_fn, base_model)
+                run_payload = self._run_single_strategy(
+                    dataset=dataset,
+                    strategy_name=strategy_name,
+                    strategy_fn=strategy_fn,
+                    base_model=base_model,
+                    x_train_dense=x_train_dense,
+                    y_train=y_train,
+                    x_test_dense=x_test_dense,
+                    y_test=y_test,
+                )
                 self.run_records.append(run_payload)
 
         self.logger.create_markdown_report(self.run_records)
@@ -45,16 +65,20 @@ class SpecialStrategyBenchmarkRunner:
         self,
         dataset: DatasetBundle,
         strategy_name: str,
-        strategy_fn: Callable[[np.ndarray, np.ndarray], Mapping[str, Any]],
+        strategy_fn: Callable[[DatasetBundle], Mapping[str, Any]],
         base_model: ClassifierMixin,
+        x_train_dense: np.ndarray,
+        y_train: np.ndarray,
+        x_test_dense: np.ndarray,
+        y_test: np.ndarray,
     ) -> Dict[str, Any]:
         sample_started = perf_counter()
-        strategy_output = dict(strategy_fn(dataset.x_train, dataset.y_train))
+        strategy_output = dict(strategy_fn(dataset))
         sample_time = perf_counter() - sample_started
 
-        sampled_indices = _resolve_sample_indices(strategy_output, len(dataset.x_train))
-        x_sampled = dataset.x_train[sampled_indices]
-        y_sampled = dataset.y_train[sampled_indices]
+        sampled_indices = _resolve_sample_indices(strategy_output, len(y_train))
+        x_sampled = x_train_dense[sampled_indices]
+        y_sampled = y_train[sampled_indices]
 
         fit_started = perf_counter()
         model = clone(base_model)
@@ -62,28 +86,30 @@ class SpecialStrategyBenchmarkRunner:
         fit_time = perf_counter() - fit_started
 
         infer_started = perf_counter()
-        y_pred = model.predict(dataset.x_test)
-        y_proba = model.predict_proba(dataset.x_test) if hasattr(model, "predict_proba") else None
+        y_pred = model.predict(x_test_dense)
+        y_proba = model.predict_proba(x_test_dense) if hasattr(model, "predict_proba") else None
         inference_time = perf_counter() - infer_started
 
-        model_metrics = _collect_metrics(dataset.y_test, y_pred, y_proba)
+        model_metrics = _collect_metrics(y_test, y_pred, y_proba)
         sample_stats = build_sample_stats(
             y_sampled=y_sampled,
-            total_train_size=len(dataset.y_train),
+            total_train_size=len(y_train),
             cluster_labels=_from_output(strategy_output, "cluster_labels", sampled_indices),
             cell_ids=_from_output(strategy_output, "cell_ids", sampled_indices),
             simplex_ids=_from_output(strategy_output, "simplex_ids", sampled_indices),
         )
 
-        strategy_params = strategy_output.get("strategy_params", {})
         payload = self.logger.log_strategy_run(
             dataset_name=dataset.name,
             strategy_name=strategy_name,
-            strategy_params=strategy_params,
+            strategy_params=strategy_output.get("strategy_params", {}),
             model_metrics=model_metrics,
             timings={"fit": fit_time, "sample": sample_time, "inference": inference_time},
             sample_stats=sample_stats,
-            extra={"sample_indices_path": str(self.logger.save_sample_dump(dataset.name, strategy_name, sampled_indices))},
+            extra={
+                "sample_indices_path": str(self.logger.save_sample_dump(dataset.name, strategy_name, sampled_indices)),
+                **(strategy_output.get("extra", {}) or {}),
+            },
         )
 
         score_values = _resolve_score_values(strategy_output, sampled_indices)
@@ -95,20 +121,20 @@ class SpecialStrategyBenchmarkRunner:
         return payload
 
 
+def _to_dense(matrix: np.ndarray | sparse.spmatrix) -> np.ndarray:
+    return matrix.toarray() if sparse.issparse(matrix) else np.asarray(matrix)
+
+
 def _resolve_sample_indices(strategy_output: Mapping[str, Any], train_size: int) -> np.ndarray:
-    if "sample_indices" in strategy_output:
-        return np.asarray(strategy_output["sample_indices"], dtype=int)
+    sample_indices = np.asarray(strategy_output.get("sample_indices", []), dtype=int)
+    if sample_indices.size == 0:
+        raise ValueError("Strategy output must include non-empty 'sample_indices'.")
 
-    if "mask" in strategy_output:
-        mask = np.asarray(strategy_output["mask"], dtype=bool)
-        return np.where(mask)[0]
-
-    if "sampled_x" in strategy_output:
-        sampled_x = np.asarray(strategy_output["sampled_x"])
-        if sampled_x.shape[0] == train_size:
-            return np.arange(train_size)
-
-    raise ValueError("Strategy output must include either 'sample_indices' or 'mask'.")
+    sample_indices = np.unique(sample_indices)
+    sample_indices = sample_indices[(sample_indices >= 0) & (sample_indices < train_size)]
+    if sample_indices.size == 0:
+        raise ValueError("All sample indices are out of valid train range.")
+    return sample_indices
 
 
 def _resolve_score_values(strategy_output: Mapping[str, Any], sampled_indices: Sequence[int]) -> Optional[np.ndarray]:
