@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 from scipy import sparse
 from sklearn.compose import ColumnTransformer
-from sklearn.datasets import make_classification
+from sklearn.datasets import fetch_openml, make_classification
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
@@ -248,11 +248,52 @@ def _load_mixed_hard(seed: int) -> DatasetBundle:
     )
 
 
+def _load_amlb_openml(name: str, openml_name: str, seed: int, max_rows: int = 25000) -> DatasetBundle:
+    dataset = fetch_openml(name=openml_name, as_frame=True, parser='auto')
+    frame = dataset.frame.copy()
+    target_name = dataset.target.name if hasattr(dataset.target, 'name') and dataset.target.name else dataset.target_names[0]
+
+    y_raw = frame[target_name]
+    X = frame.drop(columns=[target_name])
+
+    valid = y_raw.notna()
+    X = X.loc[valid].reset_index(drop=True)
+    y_raw = y_raw.loc[valid].reset_index(drop=True)
+
+    y_codes = pd.Series(y_raw.astype('category').cat.codes, name='target')
+    valid_class = y_codes >= 0
+    X = X.loc[valid_class].reset_index(drop=True)
+    y_codes = y_codes.loc[valid_class].reset_index(drop=True)
+
+    if len(X) > max_rows:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(np.arange(len(X)), size=max_rows, replace=False)
+        X = X.iloc[idx].reset_index(drop=True)
+        y_codes = y_codes.iloc[idx].reset_index(drop=True)
+
+    numeric_columns = X.select_dtypes(include=['number', 'bool']).columns.tolist()
+    categorical_columns = [col for col in X.columns if col not in numeric_columns]
+    for col in categorical_columns:
+        X[col] = X[col].astype('string')
+
+    return _build_bundle(
+        name=name,
+        seed=seed,
+        X=X,
+        y=y_codes,
+        numeric_columns=numeric_columns,
+        categorical_columns=categorical_columns,
+        test_size=0.2,
+    )
+
+
 def load_dataset(name: str, seed: int) -> DatasetBundle:
     loaders: dict[str, Callable[[int], DatasetBundle]] = {
         'high_cardinality_categorical': _load_high_cardinality_categorical,
         'large_numeric': _load_large_numeric,
         'mixed_hard': _load_mixed_hard,
+        'amlb_adult': lambda current_seed: _load_amlb_openml('amlb_adult', 'adult', current_seed),
+        'amlb_covertype': lambda current_seed: _load_amlb_openml('amlb_covertype', 'covertype', current_seed),
     }
 
     normalized_name = name.strip().lower()

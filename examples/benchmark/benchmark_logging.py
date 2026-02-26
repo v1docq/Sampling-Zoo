@@ -10,6 +10,22 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 import numpy as np
 
 
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _json_ready(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    return value
+
+
 @dataclass
 class ArtifactPaths:
     root: Path
@@ -59,13 +75,13 @@ class BenchmarkLogger:
             "timestamp_utc": datetime.utcnow().isoformat(timespec="seconds"),
             "dataset": dataset_name,
             "strategy": strategy_name,
-            "strategy_params": dict(strategy_params),
-            "model_metrics": dict(model_metrics),
-            "timings_sec": dict(timings),
-            "sample_stats": dict(sample_stats),
+            "strategy_params": _json_ready(dict(strategy_params)),
+            "model_metrics": _json_ready(dict(model_metrics)),
+            "timings_sec": _json_ready(dict(timings)),
+            "sample_stats": _json_ready(dict(sample_stats)),
         }
         if extra:
-            payload["extra"] = dict(extra)
+            payload["extra"] = _json_ready(dict(extra))
 
         with self.jsonl_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
