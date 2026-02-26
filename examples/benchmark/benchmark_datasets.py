@@ -164,10 +164,10 @@ def _load_high_cardinality_categorical(seed: int) -> DatasetBundle:
 
 def _load_large_numeric(seed: int) -> DatasetBundle:
     X_values, y_values = make_classification(
-        n_samples=50000,
-        n_features=220,
-        n_informative=85,
-        n_redundant=40,
+        n_samples=18000,
+        n_features=120,
+        n_informative=45,
+        n_redundant=25,
         n_repeated=0,
         n_classes=2,
         n_clusters_per_class=2,
