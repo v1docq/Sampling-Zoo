@@ -22,9 +22,9 @@ from core.sampling_strategies.random_sampler import RandomSplitSampler
 from core.sampling_strategies.spectral.spectral_leverage import SpectralLeverageSampler
 from core.sampling_strategies.spectral.tensor_energy import TensorEnergySampler
 from core.sampling_strategies.voronoi_sampler import VoronoiSampler
-from examples.benchmark.benchmark_datasets import DatasetBundle, load_dataset
-from examples.benchmark.benchmark_logging import BenchmarkLogger
-from examples.benchmark.benchmark_runner import SpecialStrategyBenchmarkRunner
+from benchmark_datasets import DatasetBundle, load_dataset
+from benchmark_logging import BenchmarkLogger
+from benchmark_runner import SpecialStrategyBenchmarkRunner
 
 
 def _to_dense(matrix: np.ndarray | sparse.spmatrix) -> np.ndarray:
@@ -153,7 +153,7 @@ def make_strategies(seed: int = 42) -> Dict[str, Any]:
         "spectral_leverage": spectral_leverage_strategy,
         "tensor_energy": tensor_energy_strategy,
         "voronoi": voronoi_strategy,
-        "hdbscan": hdbscan_strategy,
+        #"hdbscan": hdbscan_strategy,
         "delaunay": delaunay_strategy,
         "random": random_strategy,
     }

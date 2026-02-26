@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Union, Optional
 
 import numpy as np
 from ..base_sampler import BaseSampler
@@ -7,12 +7,12 @@ from ..base_sampler import BaseSampler
 
 class SpectralSamplerBase(BaseSampler):
     def __init__(
-        self,
-        sample_size: int,
-        approx_rank: int | float  = 1.0,
-        random_state: int | None = None,
-        return_weights: bool = False,
-        backend_config: dict | None = None,
+            self,
+            sample_size: int,
+            approx_rank: Union[int, float] = 1.0,
+            random_state: Union[int, None] = None,
+            return_weights: bool = False,
+            backend_config: Union[dict, None] = None,
     ):
         self.sample_size = sample_size
         self.approx_rank = approx_rank
@@ -21,10 +21,10 @@ class SpectralSamplerBase(BaseSampler):
         self.backend_config = backend_config
 
     @abstractmethod
-    def fit(self, X: np.ndarray, y: np.ndarray | None = None) -> "SpectralSamplerBase":
+    def fit(self, X: np.ndarray, y = None) -> "SpectralSamplerBase":
         """Обучает семплер на данных X (и y, если предоставлено)"""
         pass
-    
+
     @abstractmethod
     def build_spectral_representation(self, X):
         """Строит спектральное представление данных X - аппроксимацию пространства на основе первых approx_rank собственных векторов."""
@@ -34,7 +34,7 @@ class SpectralSamplerBase(BaseSampler):
     def compute_sampling_scores(self):
         """Вычисляет оценки для семплирования на основе спектрального представления."""
         pass
-    
+
     @abstractmethod
     def sample_indices(self, replace: bool = False) -> List[int]:
         """
@@ -50,4 +50,3 @@ class SpectralSamplerBase(BaseSampler):
         Разделяет данные на разделы и возвращает индексы для каждого раздела.  
         """
         pass
-

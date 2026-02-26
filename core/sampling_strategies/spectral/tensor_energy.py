@@ -28,9 +28,9 @@ class TensorEnergySampler(SpectralSamplerBase):
         sample_size: int,
         modes: List[int], # Список мод, по которым проводится семплирование
         approx_rank: Union[int, float, List[Union[int, float]]] = 1.0, # Может быть общим или списком для каждой моды
-        random_state: int | None = None,
+        random_state: Union[int, None] = None,
         return_weights: bool = False,
-        backend_config: dict | None = None,
+        backend_config: Union[dict, None] = None,
     ):
         super().__init__(sample_size, approx_rank, random_state, return_weights, backend_config)
         self.modes = modes
@@ -53,7 +53,7 @@ class TensorEnergySampler(SpectralSamplerBase):
         self.sampled_indices_ = None # Результат семплирования
         self.weights_ = None         # Веса
 
-    def fit(self, X: np.ndarray | pd.DataFrame | None = None) -> "TensorEnergySampler":
+    def fit(self, X = None) -> "TensorEnergySampler":
         """
         Выполняет полный цикл подготовки: построение спектрального представления и вычисление scores.
         """
