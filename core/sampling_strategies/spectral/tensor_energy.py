@@ -4,7 +4,17 @@ from .backend.matrix_backend import RandomizedSVDBackend
 from .base_sampler import SpectralSamplerBase
 import numpy as np
 import pandas as pd
-import tensorly as tl
+try:
+    import tensorly as tl
+except Exception:  # pragma: no cover - optional dependency
+    tl = None
+
+
+def _unfold_tensor(x: np.ndarray, mode: int) -> np.ndarray:
+    if tl is not None:
+        return tl.unfold(x, mode)
+    moved = np.moveaxis(x, mode, 0)
+    return moved.reshape(moved.shape[0], -1)
 
 class TensorEnergySampler(SpectralSamplerBase):
     """
@@ -64,7 +74,7 @@ class TensorEnergySampler(SpectralSamplerBase):
         Для каждой целевой моды разворачивает тензор и вычисляет SVD для получения левых сингулярных векторов U.
         """
         for i, mode in enumerate(self.modes):
-            X_unfolded = tl.unfold(X, mode)
+            X_unfolded = _unfold_tensor(X, mode)
             rank = self.ranks_per_mode[i]
             U, _, _ = self.backend.compute_basis(X_unfolded, rank=rank)
             self.factor_matrices[mode] = U

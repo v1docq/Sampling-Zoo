@@ -1,8 +1,12 @@
 import numpy as np
 import pandas as pd
-import hdbscan
+try:
+    import hdbscan
+except Exception:  # pragma: no cover - optional dependency
+    hdbscan = None
 from typing import Dict, Any, Union
 from collections import defaultdict
+from sklearn.cluster import KMeans
 
 from .base_sampler import BaseSampler
 # from ..repository.model_repo import SupportingModels
@@ -28,7 +32,8 @@ class HDBScanSampler(BaseSampler):
         
         self.min_cluster_size = min_cluster_size
         self.random_state = random_state
-        self.clusterer = hdbscan.HDBSCAN(min_cluster_size, prediction_data=True)
+        self.clusterer = hdbscan.HDBSCAN(min_cluster_size, prediction_data=True) if hdbscan is not None else None
+        self._dbscan_fallback = hdbscan is None
         self.partitions = {}
         self.prob_threshold = prob_threshold
         self.one_cluster = one_cluster
@@ -41,8 +46,24 @@ class HDBScanSampler(BaseSampler):
         # Преобразуем данные в numpy array, если это необходимо
         X = X.values if isinstance(X, pd.DataFrame) else np.asarray(X)
 
-        self.clusterer.fit(X)
         temp_partitions = defaultdict(list)
+
+        if self._dbscan_fallback:
+            # Fallback for environments without hdbscan package.
+            # Use KMeans to provide partitioning-compatible behavior with linear runtime.
+            n_clusters = max(2, min(20, X.shape[0] // max(1, self.min_cluster_size)))
+            self.clusterer = KMeans(n_clusters=n_clusters, random_state=self.random_state, n_init="auto")
+            labels = self.clusterer.fit_predict(X)
+            for i, label in enumerate(labels):
+                temp_partitions[int(label)].append(i)
+
+            self.partitions = {
+                f"cluster_{label}": np.array(indices)
+                for label, indices in temp_partitions.items()
+            }
+            return self
+
+        self.clusterer.fit(X)
 
         membership_vectors = hdbscan.all_points_membership_vectors(self.clusterer)
         
@@ -92,6 +113,12 @@ class HDBScanSampler(BaseSampler):
         
         # Защита от подачи одномерного массива (одной точки)
         X_values = np.atleast_2d(X_values)
+
+        if self._dbscan_fallback:
+            labels = self.clusterer.predict(X_values)
+            if self.one_cluster:
+                return labels
+            return [np.array([int(label)]) for label in labels]
 
         prob_matrix = hdbscan.membership_vector(self.clusterer, X_values)
 

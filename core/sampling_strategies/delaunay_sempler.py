@@ -8,7 +8,10 @@ from scipy.spatial.distance import cdist
 
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
-import umap
+try:
+    import umap
+except Exception:  # pragma: no cover - optional dependency
+    umap = None
 
 from .base_sampler import BaseSampler
 # from ..repository.model_repo import SupportingModels
@@ -68,6 +71,11 @@ class DelaunaySampler(BaseSampler):
                 self.reducer = PCA(n_components=self.dim_reduction_target, 
                                    random_state=self.random_state)
             elif self.dim_reduction_method == 'umap':
+                if umap is None:
+                    raise ImportError(
+                        "umap-learn is not installed. "
+                        "Use dim_reduction_method='pca' or install umap-learn."
+                    )
                 self.reducer = umap.UMAP(n_components=self.dim_reduction_target, 
                                          random_state=self.random_state)
             else:
