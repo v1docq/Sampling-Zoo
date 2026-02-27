@@ -248,8 +248,19 @@ def _load_mixed_hard(seed: int) -> DatasetBundle:
     )
 
 
-def _load_amlb_openml(name: str, openml_name: str, seed: int, max_rows: int = 25000) -> DatasetBundle:
-    dataset = fetch_openml(name=openml_name, as_frame=True, parser='auto')
+def _load_amlb_openml(
+    name: str,
+    openml_name: str | None,
+    seed: int,
+    max_rows: int = 25000,
+    data_id: int | None = None,
+) -> DatasetBundle:
+    if data_id is not None:
+        dataset = fetch_openml(data_id=data_id, as_frame=True, parser='auto')
+    elif openml_name is not None:
+        dataset = fetch_openml(name=openml_name, as_frame=True, parser='auto')
+    else:
+        raise ValueError('Either openml_name or data_id should be provided for AMLB loader.')
     frame = dataset.frame.copy()
     target_name = dataset.target.name if hasattr(dataset.target, 'name') and dataset.target.name else dataset.target_names[0]
 
@@ -294,6 +305,10 @@ def load_dataset(name: str, seed: int) -> DatasetBundle:
         'mixed_hard': _load_mixed_hard,
         'amlb_adult': lambda current_seed: _load_amlb_openml('amlb_adult', 'adult', current_seed),
         'amlb_covertype': lambda current_seed: _load_amlb_openml('amlb_covertype', 'covertype', current_seed),
+        'amlb_optdigits': lambda current_seed: _load_amlb_openml('amlb_optdigits', 'optdigits', current_seed),
+        'amlb_vehicle': lambda current_seed: _load_amlb_openml('amlb_vehicle', 'vehicle', current_seed),
+        'amlb_mfeat_factors': lambda current_seed: _load_amlb_openml('amlb_mfeat_factors', 'mfeat-factors', current_seed),
+        'amlb_segment': lambda current_seed: _load_amlb_openml('amlb_segment', 'segment', current_seed),
     }
 
     normalized_name = name.strip().lower()

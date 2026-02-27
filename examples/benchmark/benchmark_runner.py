@@ -5,10 +5,10 @@ from time import perf_counter
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
 import numpy as np
-import pandas as pd
 from scipy import sparse
 from sklearn.base import ClassifierMixin, clone
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
+from tqdm.auto import tqdm
 
 from benchmark_datasets import DatasetBundle
 from benchmark_logging import BenchmarkLogger, build_sample_stats
@@ -28,8 +28,15 @@ class StrategyOutput:
 class SpecialStrategyBenchmarkRunner:
     """Benchmark runner for sampling strategies with consistent artifact logging."""
 
-    def __init__(self, logger: Optional[BenchmarkLogger] = None) -> None:
+    def __init__(
+        self,
+        logger: Optional[BenchmarkLogger] = None,
+        enable_diagnostic_plots: bool = False,
+        show_progress: bool = True,
+    ) -> None:
         self.logger = logger or BenchmarkLogger()
+        self.enable_diagnostic_plots = enable_diagnostic_plots
+        self.show_progress = show_progress
         self.run_records: List[Dict[str, Any]] = []
 
     def run(
@@ -39,13 +46,28 @@ class SpecialStrategyBenchmarkRunner:
         base_model: ClassifierMixin,
     ) -> List[Dict[str, Any]]:
         self.run_records = []
-        for dataset in datasets:
+        datasets_seq = list(datasets)
+
+        dataset_iter = tqdm(
+            datasets_seq,
+            disable=not self.show_progress,
+            desc="Datasets",
+            leave=False,
+        )
+        for dataset in dataset_iter:
             x_train_dense = _to_dense(dataset.X_train_processed)
             x_test_dense = _to_dense(dataset.X_test_processed)
             y_train = dataset.y_train.to_numpy()
             y_test = dataset.y_test.to_numpy()
 
-            for strategy_name, strategy_fn in strategies.items():
+            strategy_iter = tqdm(
+                strategies.items(),
+                total=len(strategies),
+                disable=not self.show_progress,
+                desc=f"Strategies ({dataset.name})",
+                leave=False,
+            )
+            for strategy_name, strategy_fn in strategy_iter:
                 run_payload = self._run_single_strategy(
                     dataset=dataset,
                     strategy_name=strategy_name,
@@ -90,7 +112,7 @@ class SpecialStrategyBenchmarkRunner:
         y_proba = model.predict_proba(x_test_dense) if hasattr(model, "predict_proba") else None
         inference_time = perf_counter() - infer_started
 
-        model_metrics = _collect_metrics(y_test, y_pred, y_proba)
+        model_metrics = _collect_metrics(y_test, y_pred, y_proba, getattr(model, "classes_", None))
         sample_stats = build_sample_stats(
             y_sampled=y_sampled,
             total_train_size=len(y_train),
@@ -112,12 +134,13 @@ class SpecialStrategyBenchmarkRunner:
             },
         )
 
-        score_values = _resolve_score_values(strategy_output, sampled_indices)
-        if score_values is not None:
-            self.logger.save_probability_distribution_plot(score_values, dataset.name, strategy_name)
+        if self.enable_diagnostic_plots:
+            score_values = _resolve_score_values(strategy_output, sampled_indices)
+            if score_values is not None:
+                self.logger.save_probability_distribution_plot(score_values, dataset.name, strategy_name)
 
-        self.logger.save_class_coverage_plot(sample_stats["class_distribution"], dataset.name, strategy_name)
-        self.logger.save_2d_projection_plot(x_sampled, y_sampled, dataset.name, strategy_name, method="pca")
+            self.logger.save_class_coverage_plot(sample_stats["class_distribution"], dataset.name, strategy_name)
+            self.logger.save_2d_projection_plot(x_sampled, y_sampled, dataset.name, strategy_name, method="pca")
         return payload
 
 
@@ -166,7 +189,12 @@ def _from_output(strategy_output: Mapping[str, Any], key: str, sampled_indices: 
     return None
 
 
-def _collect_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_proba: Optional[np.ndarray]) -> Dict[str, float]:
+def _collect_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_proba: Optional[np.ndarray],
+    model_classes: Optional[Sequence[Any]] = None,
+) -> Dict[str, float]:
     metrics = {
         "accuracy": float(accuracy_score(y_true, y_pred)),
         "f1_macro": float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
@@ -179,10 +207,52 @@ def _collect_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_proba: Optional[n
         metrics["roc_auc"] = float("nan")
         return metrics
 
-    classes_count = len(np.unique(y_true))
-    if classes_count == 2:
-        metrics["roc_auc"] = float(roc_auc_score(y_true, y_proba[:, 1]))
-    else:
-        metrics["roc_auc"] = float(roc_auc_score(y_true, y_proba, multi_class="ovr", average="macro"))
+    classes_true = np.unique(y_true)
+    try:
+        if len(classes_true) == 2:
+            if y_proba.ndim == 2 and y_proba.shape[1] > 1:
+                if model_classes is not None:
+                    classes_arr = np.asarray(model_classes)
+                    positive_class = classes_true[-1]
+                    pos_idx = np.where(classes_arr == positive_class)[0]
+                    if pos_idx.size == 1:
+                        metrics["roc_auc"] = float(roc_auc_score(y_true, y_proba[:, int(pos_idx[0])]))
+                    else:
+                        metrics["roc_auc"] = float("nan")
+                else:
+                    metrics["roc_auc"] = float(roc_auc_score(y_true, y_proba[:, -1]))
+            else:
+                metrics["roc_auc"] = float("nan")
+            return metrics
+
+        if model_classes is None:
+            metrics["roc_auc"] = float("nan")
+            return metrics
+
+        classes_arr = np.asarray(model_classes)
+        missing_classes = [cls for cls in classes_true.tolist() if cls not in set(classes_arr.tolist())]
+        if missing_classes:
+            metrics["roc_auc"] = float("nan")
+            return metrics
+
+        target_classes = np.sort(classes_true)
+        target_indices = [int(np.where(classes_arr == cls)[0][0]) for cls in target_classes]
+        y_proba_selected = y_proba[:, target_indices]
+
+        row_sums = y_proba_selected.sum(axis=1, keepdims=True)
+        safe_row_sums = np.where(row_sums > 0, row_sums, 1.0)
+        y_proba_selected = y_proba_selected / safe_row_sums
+
+        metrics["roc_auc"] = float(
+            roc_auc_score(
+                y_true,
+                y_proba_selected,
+                labels=target_classes,
+                multi_class="ovr",
+                average="macro",
+            )
+        )
+    except ValueError:
+        metrics["roc_auc"] = float("nan")
 
     return metrics
