@@ -25,6 +25,8 @@ if str(ROOT_DIR) not in sys.path:
 from benchmark_datasets import DatasetBundle, load_dataset
 from benchmark_logging import BenchmarkLogger
 from benchmark_runner import SpecialStrategyBenchmarkRunner
+from benchmark_viz import plot_metrics_vs_budget, plot_informative_overlap, plot_final_summary_table, \
+    plot_optimal_strategy_overview
 
 DEFAULT_BUDGET_RATIOS: tuple[float, ...] = (0.01, 0.05, 0.10, 0.20)
 
@@ -97,9 +99,9 @@ class BudgetPolicy:
 
     @staticmethod
     def _normalize_scores(
-        raw_scores: Sequence[float] | None,
-        informative_indices: np.ndarray,
-        train_size: int,
+            raw_scores: Sequence[float] | None,
+            informative_indices: np.ndarray,
+            train_size: int,
     ) -> np.ndarray | None:
         if raw_scores is None:
             return None
@@ -114,9 +116,9 @@ class BudgetPolicy:
 
     @staticmethod
     def _select_top_k_by_importance(
-        informative_indices: np.ndarray,
-        informative_scores: np.ndarray | None,
-        budget_size: int,
+            informative_indices: np.ndarray,
+            informative_scores: np.ndarray | None,
+            budget_size: int,
     ) -> np.ndarray:
         if informative_indices.size <= budget_size:
             return informative_indices
@@ -126,11 +128,11 @@ class BudgetPolicy:
         return informative_indices[ranked_positions[:budget_size]]
 
     def apply(
-        self,
-        informative_indices: Sequence[int],
-        informative_scores: Sequence[float] | None,
-        train_size: int,
-        budget_ratio: float,
+            self,
+            informative_indices: Sequence[int],
+            informative_scores: Sequence[float] | None,
+            train_size: int,
+            budget_ratio: float,
     ) -> dict[str, Any]:
         informative = np.unique(np.asarray(informative_indices, dtype=int))
         informative = informative[(informative >= 0) & (informative < train_size)]
@@ -180,9 +182,9 @@ class StrategySuiteFactory:
         return strategy_name
 
     def _with_budget_variants(
-        self,
-        strategy_name: str,
-        strategy_fn: Callable[[DatasetBundle], Mapping[str, Any]],
+            self,
+            strategy_name: str,
+            strategy_fn: Callable[[DatasetBundle], Mapping[str, Any]],
     ) -> dict[str, Callable[[DatasetBundle], dict[str, Any]]]:
         def _runner(bundle: DatasetBundle, budget_ratio: float) -> dict[str, Any]:
             result = dict(strategy_fn(bundle))
@@ -249,7 +251,8 @@ class DatasetCatalog:
     def __init__(self, category_profiles: Mapping[str, Sequence[str]]) -> None:
         self.category_profiles = category_profiles
 
-    def resolve_names(self, full_benchmark: bool, include_amlb: bool, amlb_categories: Sequence[str] | None) -> list[str]:
+    def resolve_names(self, full_benchmark: bool, include_amlb: bool, amlb_categories: Sequence[str] | None) -> list[
+        str]:
         dataset_names = ["mixed_hard"]
         if full_benchmark:
             dataset_names = ["high_cardinality_categorical", "large_numeric", "mixed_hard"]
@@ -280,7 +283,8 @@ class BenchmarkReportBuilder:
         enriched = df.copy()
         enriched["strategy_base"] = enriched["strategy"].map(StrategySuiteFactory.strategy_base_name)
         enriched["budget_ratio"] = pd.to_numeric(enriched.get("strategy_params.budget_ratio"), errors="coerce")
-        enriched["budget_ratio"] = enriched["budget_ratio"].fillna(pd.to_numeric(enriched.get("extra.budget_ratio"), errors="coerce"))
+        enriched["budget_ratio"] = enriched["budget_ratio"].fillna(
+            pd.to_numeric(enriched.get("extra.budget_ratio"), errors="coerce"))
         enriched["budget_percent"] = (enriched["budget_ratio"] * 100.0).round(2)
         enriched["model"] = enriched["strategy"].str.rsplit("__", n=1).str[-1]
         return enriched
@@ -290,7 +294,8 @@ class BenchmarkReportBuilder:
         df = self._with_enriched_dimensions(df)
 
         df.to_csv(output_dir / "benchmark_runs.csv", index=False)
-        (output_dir / "benchmark_runs.json").write_text(df.to_json(orient="records", force_ascii=False, indent=2), encoding="utf-8")
+        (output_dir / "benchmark_runs.json").write_text(df.to_json(orient="records", force_ascii=False, indent=2),
+                                                        encoding="utf-8")
 
         summary = (
             df.groupby(["dataset", "model", "strategy_base", "budget_percent"], as_index=False)
@@ -466,15 +471,7 @@ class BenchmarkReportBuilder:
         return set()
 
     def plot_informative_overlap(self, df: pd.DataFrame, output_dir: Path) -> None:
-        records = []
-        for _, row in df.iterrows():
-            records.append(
-                {
-                    "dataset": row.get("dataset"),
-                    "strategy_base": row.get("strategy_base"),
-                    "informative_indices": self._parse_index_collection(row.get("extra.informative_indices")),
-                }
-            )
+        plot_informative_overlap(df, output_dir)
 
         overlap_df = pd.DataFrame(records)
         overlap_df = overlap_df[overlap_df["strategy_base"] != "full_dataset"]
@@ -689,36 +686,7 @@ class BenchmarkReportBuilder:
         plt.close(fig)
 
     def plot_final_summary_table(self, df: pd.DataFrame, output_dir: Path) -> None:
-        summary = (
-            df.sort_values(["dataset", "model", "strategy_base", "budget_percent"]).groupby(["dataset", "model", "strategy_base"], as_index=False).tail(1)
-        )
-        if summary.empty:
-            return
-
-        columns = [
-            "dataset",
-            "model",
-            "strategy_base",
-            "budget_percent",
-            "model_metrics.f1_macro",
-            "model_metrics.roc_auc",
-            "timings_sec.fit",
-            "timings_sec.sample",
-        ]
-        table = summary[columns].copy().sort_values(["dataset", "model", "model_metrics.f1_macro"], ascending=[True, True, False])
-        table.columns = ["dataset", "model", "strategy", "budget_%", "f1_macro", "roc_auc", "fit_sec", "sample_sec"]
-        table = table.round({"budget_%": 2, "f1_macro": 4, "roc_auc": 4, "fit_sec": 3, "sample_sec": 3})
-
-        fig, ax = plt.subplots(figsize=(14, max(4, 0.35 * len(table) + 1)))
-        ax.axis("off")
-        rendered = ax.table(cellText=table.values, colLabels=table.columns, loc="center")
-        rendered.auto_set_font_size(False)
-        rendered.set_fontsize(8)
-        rendered.scale(1.0, 1.25)
-        ax.set_title("Final benchmark summary")
-        fig.tight_layout()
-        fig.savefig(output_dir / "final_summary_table.png", dpi=170)
-        plt.close(fig)
+        plot_final_summary_table(df, output_dir)
 
 
 class BenchmarkOrchestrator:
@@ -738,7 +706,8 @@ class BenchmarkOrchestrator:
             include_amlb=self.config.include_amlb,
             amlb_categories=self.config.amlb_categories,
         )
-        datasets = self.dataset_catalog.load(dataset_names, seed=self.config.seed, show_progress=self.config.show_progress)
+        datasets = self.dataset_catalog.load(dataset_names, seed=self.config.seed,
+                                             show_progress=self.config.show_progress)
         if not datasets:
             raise RuntimeError("No datasets available for benchmark run.")
 
@@ -746,7 +715,8 @@ class BenchmarkOrchestrator:
         model_pool = make_model_pool(seed=self.config.seed)
 
         run_records: list[dict[str, Any]] = []
-        model_iter = tqdm(model_pool.items(), total=len(model_pool), desc="Models", disable=not self.config.show_progress)
+        model_iter = tqdm(model_pool.items(), total=len(model_pool), desc="Models",
+                          disable=not self.config.show_progress)
         for model_name, model in model_iter:
             runner = SpecialStrategyBenchmarkRunner(
                 logger=logger,
@@ -774,7 +744,8 @@ class BenchmarkOrchestrator:
             "records": len(run_records),
             "enable_diagnostic_plots": self.config.enable_diagnostic_plots,
         }
-        (logger.paths.root / "run_meta.json").write_text(json.dumps(run_meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        (logger.paths.root / "run_meta.json").write_text(json.dumps(run_meta, ensure_ascii=False, indent=2),
+                                                         encoding="utf-8")
 
         print(f"Benchmark completed. Artifacts: {logger.paths.root}")
         return logger.paths.root
@@ -782,11 +753,11 @@ class BenchmarkOrchestrator:
 
 # Backward-compatible wrappers used in tests and by external code.
 def _apply_budget_policy(
-    informative_indices: Sequence[int],
-    informative_scores: Sequence[float] | None,
-    train_size: int,
-    budget_ratio: float,
-    seed: int,
+        informative_indices: Sequence[int],
+        informative_scores: Sequence[float] | None,
+        train_size: int,
+        budget_ratio: float,
+        seed: int,
 ) -> dict[str, Any]:
     return BudgetPolicy(seed=seed).apply(
         informative_indices=informative_indices,
@@ -824,4 +795,4 @@ def main(
 
 
 if __name__ == "__main__":
-    main()
+    run_bench_pipeline()

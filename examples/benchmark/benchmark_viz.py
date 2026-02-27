@@ -248,12 +248,21 @@ def plot_informative_overlap(df: pd.DataFrame, output_dir: Path) -> None:
 
 
 def plot_optimal_strategy_overview(df: pd.DataFrame, output_dir: Path) -> None:
+<<<<<<< codex/update-experiment-result-visualization-module-8mok9m
     metrics = ["model_metrics.f1_macro", "model_metrics.roc_auc", "timings_sec.fit"]
+=======
+    metrics = ["model_metrics.f1_macro", "model_metrics.roc_auc", "timings_sec.fit", "sample_stats.sample_size"]
+>>>>>>> working
     metric_labels = {
         "model_metrics.f1_macro": "F1 macro",
         "model_metrics.roc_auc": "ROC-AUC",
         "timings_sec.fit": "Training time (sec)",
+<<<<<<< codex/update-experiment-result-visualization-module-8mok9m
             }
+=======
+        "sample_stats.sample_size": "Sample size",
+    }
+>>>>>>> working
     higher_is_better = {
         "model_metrics.f1_macro": True,
         "model_metrics.roc_auc": True,
@@ -328,6 +337,7 @@ def plot_optimal_strategy_overview(df: pd.DataFrame, output_dir: Path) -> None:
     plt.close(fig)
 
 
+<<<<<<< codex/update-experiment-result-visualization-module-8mok9m
 def plot_time_reinvestment_scenario(df: pd.DataFrame, output_dir: Path) -> None:
     quality_metric = "model_metrics.f1_macro"
     filtered = df[df["budget_percent"].notna()].copy()
@@ -420,6 +430,8 @@ def plot_time_reinvestment_scenario(df: pd.DataFrame, output_dir: Path) -> None:
     plt.close(fig)
 
 
+=======
+>>>>>>> working
 def plot_final_summary_table(df: pd.DataFrame, output_dir: Path) -> None:
     summary = (
         df.sort_values(["dataset", "model", "strategy_base", "budget_percent"]).groupby(["dataset", "model", "strategy_base"], as_index=False).tail(1)
