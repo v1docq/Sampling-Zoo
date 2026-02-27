@@ -47,13 +47,12 @@ def build_summary_tables(run_records: Iterable[Mapping[str, Any]], output_dir: P
 
 
 def plot_metrics_vs_budget(df: pd.DataFrame, output_dir: Path) -> None:
-    metrics = ["model_metrics.f1_macro", "model_metrics.roc_auc", "timings_sec.fit", "sample_stats.sample_size"]
+    metrics = ["model_metrics.f1_macro", "model_metrics.roc_auc", "timings_sec.fit"]
     labels = {
         "model_metrics.f1_macro": "F1 macro",
         "model_metrics.roc_auc": "ROC-AUC",
         "timings_sec.fit": "Training time (sec)",
-        "sample_stats.sample_size": "Sample size",
-    }
+            }
 
     filtered = df[df["budget_percent"].notna()].copy()
     full_baseline_mask = filtered["strategy_base"].fillna("").str.startswith("full_dataset")
@@ -249,13 +248,21 @@ def plot_informative_overlap(df: pd.DataFrame, output_dir: Path) -> None:
 
 
 def plot_optimal_strategy_overview(df: pd.DataFrame, output_dir: Path) -> None:
+<<<<<<< codex/update-experiment-result-visualization-module-8mok9m
+    metrics = ["model_metrics.f1_macro", "model_metrics.roc_auc", "timings_sec.fit"]
+=======
     metrics = ["model_metrics.f1_macro", "model_metrics.roc_auc", "timings_sec.fit", "sample_stats.sample_size"]
+>>>>>>> working
     metric_labels = {
         "model_metrics.f1_macro": "F1 macro",
         "model_metrics.roc_auc": "ROC-AUC",
         "timings_sec.fit": "Training time (sec)",
+<<<<<<< codex/update-experiment-result-visualization-module-8mok9m
+            }
+=======
         "sample_stats.sample_size": "Sample size",
     }
+>>>>>>> working
     higher_is_better = {
         "model_metrics.f1_macro": True,
         "model_metrics.roc_auc": True,
@@ -330,6 +337,101 @@ def plot_optimal_strategy_overview(df: pd.DataFrame, output_dir: Path) -> None:
     plt.close(fig)
 
 
+<<<<<<< codex/update-experiment-result-visualization-module-8mok9m
+def plot_time_reinvestment_scenario(df: pd.DataFrame, output_dir: Path) -> None:
+    quality_metric = "model_metrics.f1_macro"
+    filtered = df[df["budget_percent"].notna()].copy()
+    filtered[quality_metric] = pd.to_numeric(filtered.get(quality_metric), errors="coerce")
+    filtered["timings_sec.fit"] = pd.to_numeric(filtered.get("timings_sec.fit"), errors="coerce")
+    filtered = filtered[filtered["dataset"].notna()]
+    if filtered.empty:
+        return
+
+    rows: list[dict[str, Any]] = []
+    for dataset_name in sorted(filtered["dataset"].unique()):
+        ds = filtered[filtered["dataset"] == dataset_name]
+        baseline = ds[ds["strategy_base"].fillna("").str.startswith("full_dataset")]
+        candidates = ds[~ds["strategy_base"].fillna("").str.startswith("full_dataset")]
+        if baseline.empty or candidates.empty:
+            continue
+
+        baseline_quality = float(pd.to_numeric(baseline[quality_metric], errors="coerce").mean())
+        baseline_fit = float(pd.to_numeric(baseline["timings_sec.fit"], errors="coerce").mean())
+        if not np.isfinite(baseline_quality) or not np.isfinite(baseline_fit) or baseline_fit <= 0:
+            continue
+
+        grouped = (
+            candidates.groupby(["strategy_base", "budget_percent"], as_index=False)
+            .agg(
+                quality=(quality_metric, "mean"),
+                fit_sec=("timings_sec.fit", "mean"),
+            )
+            .dropna(subset=["quality", "fit_sec"])
+        )
+        for _, row in grouped.iterrows():
+            fit_sec = float(row["fit_sec"])
+            quality = float(row["quality"])
+            if fit_sec <= 0:
+                continue
+
+            time_gain = max(0.0, baseline_fit - fit_sec)
+            reinvest_multiplier = time_gain / fit_sec
+            quality_gap = baseline_quality - quality
+            recovered_share = 1.0 - np.exp(-reinvest_multiplier) if quality_gap > 0 else 0.0
+            quality_after = quality + max(0.0, quality_gap) * recovered_share
+            quality_after = min(quality_after, baseline_quality)
+
+            rows.append(
+                {
+                    "dataset": dataset_name,
+                    "strategy": row["strategy_base"],
+                    "budget_percent": float(row["budget_percent"]),
+                    "baseline_quality": baseline_quality,
+                    "sampled_quality": quality,
+                    "quality_after_reinvest": quality_after,
+                    "quality_gap": quality_gap,
+                    "recovered_share": recovered_share,
+                    "baseline_fit_sec": baseline_fit,
+                    "sampled_fit_sec": fit_sec,
+                    "time_gain_sec": time_gain,
+                    "additional_fit_equivalents": reinvest_multiplier,
+                }
+            )
+
+    scenario_df = pd.DataFrame(rows)
+    if scenario_df.empty:
+        return
+
+    scenario_df.to_csv(output_dir / "time_reinvestment_scenario.csv", index=False)
+    summary = (
+        scenario_df.groupby("dataset", as_index=False)
+        .agg(
+            sampled_quality=("sampled_quality", "max"),
+            quality_after_reinvest=("quality_after_reinvest", "max"),
+            baseline_quality=("baseline_quality", "mean"),
+        )
+        .sort_values("dataset")
+    )
+
+    x = np.arange(len(summary))
+    width = 0.26
+    fig, ax = plt.subplots(figsize=(max(11, len(summary) * 0.55), 5.2))
+    ax.bar(x - width, summary["sampled_quality"], width=width, label="best sampled", alpha=0.9)
+    ax.bar(x, summary["quality_after_reinvest"], width=width, label="hypothetical after reinvest", alpha=0.9)
+    ax.bar(x + width, summary["baseline_quality"], width=width, label="full-dataset baseline", alpha=0.9)
+    ax.set_xticks(x)
+    ax.set_xticklabels(summary["dataset"], rotation=35, ha="right")
+    ax.set_title("Time-reinvestment scenario: can tuning time compensate quality drop?")
+    ax.set_ylabel("F1 macro")
+    ax.grid(alpha=0.25, axis="y")
+    ax.legend(loc="best", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(output_dir / "time_reinvestment_scenario.png", dpi=160)
+    plt.close(fig)
+
+
+=======
+>>>>>>> working
 def plot_final_summary_table(df: pd.DataFrame, output_dir: Path) -> None:
     summary = (
         df.sort_values(["dataset", "model", "strategy_base", "budget_percent"]).groupby(["dataset", "model", "strategy_base"], as_index=False).tail(1)
