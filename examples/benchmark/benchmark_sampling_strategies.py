@@ -5,7 +5,7 @@ from typing import Any, Dict
 import sys
 import numpy as np
 
-from bechmark_models import _search_params, _sample_from_partitions
+from bechmark_models import _search_params, _sample_from_partitions, _to_dense
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
@@ -18,7 +18,7 @@ from core.sampling_strategies.spectral.spectral_leverage import SpectralLeverage
 from core.sampling_strategies.spectral.tensor_energy import TensorEnergySampler
 from core.sampling_strategies.voronoi_sampler import VoronoiSampler
 from benchmark_datasets import DatasetBundle
-from benchmark_runner import  _to_dense
+
 
 try:
     from lightgbm import LGBMClassifier

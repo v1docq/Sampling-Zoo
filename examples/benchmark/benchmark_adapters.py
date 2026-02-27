@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import traceback
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -207,7 +207,6 @@ def build_default_adapters(strategies: Mapping[str, Any]) -> Dict[str, StrategyA
 
     return adapters
 
-
 def _get_n_samples(X: Any) -> int:
     if isinstance(X, (pd.DataFrame, pd.Series)):
         return int(X.shape[0])
@@ -256,3 +255,41 @@ def _normalize_labels(raw_labels: Any, n_samples: int) -> np.ndarray:
         return labels
 
     return labels
+def _strategy_base_name(strategy_name: str) -> str:
+    budget_suffix = "__budget_"
+    if budget_suffix in strategy_name:
+        return strategy_name.split(budget_suffix, 1)[0]
+    return strategy_name
+
+
+def _select_top_k_by_importance(
+    informative_indices: np.ndarray,
+    informative_scores: np.ndarray | None,
+    budget_size: int,
+) -> np.ndarray:
+    if informative_indices.size <= budget_size:
+        return informative_indices
+
+    if informative_scores is None:
+        return informative_indices[:budget_size]
+
+    ranked_positions = np.argsort(-informative_scores, kind="mergesort")
+    return informative_indices[ranked_positions[:budget_size]]
+
+
+def _normalize_scores(
+    raw_scores: Sequence[float] | None,
+    informative_indices: np.ndarray,
+    train_size: int,
+) -> np.ndarray | None:
+    if raw_scores is None:
+        return None
+
+    scores = np.asarray(raw_scores, dtype=float).reshape(-1)
+    if scores.shape[0] == informative_indices.shape[0]:
+        return scores
+
+    if scores.shape[0] == train_size:
+        return scores[informative_indices]
+
+    return None

@@ -5,6 +5,7 @@ from time import perf_counter
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
 import numpy as np
+import pandas as pd
 from scipy import sparse
 from sklearn.base import ClassifierMixin, clone
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
@@ -12,6 +13,10 @@ from tqdm.auto import tqdm
 
 from benchmark_datasets import DatasetBundle
 from benchmark_logging import BenchmarkLogger, build_sample_stats
+from benchmark_adapters import _normalize_scores,_select_top_k_by_importance,_strategy_base_name
+from benchmar_repo import AMLB_CATEGORY_PROFILES
+from benchmark_sampling_strategies import make_strategies
+from bechmark_models import _to_dense
 
 
 @dataclass
@@ -144,9 +149,6 @@ class SpecialStrategyBenchmarkRunner:
         return payload
 
 
-def _to_dense(matrix: np.ndarray | sparse.spmatrix) -> np.ndarray:
-    return matrix.toarray() if sparse.issparse(matrix) else np.asarray(matrix)
-
 
 def _resolve_sample_indices(strategy_output: Mapping[str, Any], train_size: int) -> np.ndarray:
     sample_indices = np.asarray(strategy_output.get("sample_indices", []), dtype=int)
@@ -256,3 +258,147 @@ def _collect_metrics(
         metrics["roc_auc"] = float("nan")
 
     return metrics
+
+def _apply_budget_policy(
+    informative_indices: Sequence[int],
+    informative_scores: Sequence[float] | None,
+    train_size: int,
+    budget_ratio: float,
+    seed: int,
+) -> dict[str, Any]:
+    informative = np.unique(np.asarray(informative_indices, dtype=int))
+    informative = informative[(informative >= 0) & (informative < train_size)]
+    if informative.size == 0:
+        raise ValueError("Sampling strategy returned no informative indices.")
+
+    budget_size = max(1, int(round(train_size * budget_ratio)))
+    budget_size = min(budget_size, train_size)
+
+    normalized_scores = _normalize_scores(informative_scores, informative, train_size)
+
+    selected = _select_top_k_by_importance(informative, normalized_scores, budget_size)
+    action = "truncate_to_top_k" if informative.size > budget_size else "keep_informative"
+
+    if selected.size < budget_size:
+        rng = np.random.default_rng(seed)
+        remaining = np.setdiff1d(np.arange(train_size, dtype=int), selected, assume_unique=False)
+        needed = min(budget_size - selected.size, remaining.size)
+        if needed > 0:
+            filled = rng.choice(remaining, size=needed, replace=False)
+            selected = np.concatenate([selected, filled])
+            action = "top_up_with_raw_samples"
+
+    selected = np.unique(selected)
+    if selected.size > budget_size:
+        selected = selected[:budget_size]
+
+    return {
+        "sample_indices": selected,
+        "budget_size": int(budget_size),
+        "budget_ratio": float(budget_ratio),
+        "informative_size": int(informative.size),
+        "policy_action": action,
+    }
+
+
+def with_budget_variants(
+    strategy_name: str,
+    strategy_fn,
+    budget_ratios: Sequence[float],
+    seed: int,
+):
+    def _runner(bundle: DatasetBundle, budget_ratio: float) -> dict[str, Any]:
+        result = dict(strategy_fn(bundle))
+        raw_indices = np.asarray(result.get("sample_indices", []), dtype=int)
+        raw_scores = result.get("sample_scores")
+
+        budgeted = _apply_budget_policy(
+            informative_indices=raw_indices,
+            informative_scores=raw_scores,
+            train_size=bundle.y_train.shape[0],
+            budget_ratio=budget_ratio,
+            seed=seed,
+        )
+
+        result["sample_indices"] = budgeted["sample_indices"]
+        result["strategy_params"] = {
+            **(result.get("strategy_params") or {}),
+            "budget_ratio": budgeted["budget_ratio"],
+            "budget_size": budgeted["budget_size"],
+            "informative_size": budgeted["informative_size"],
+            "budget_policy_action": budgeted["policy_action"],
+        }
+
+        result["extra"] = {
+            **(result.get("extra") or {}),
+            "informative_indices": np.unique(raw_indices).tolist(),
+            "budget_ratio": budgeted["budget_ratio"],
+            "budget_size": budgeted["budget_size"],
+        }
+        return result
+
+    wrapped = {}
+    for ratio in budget_ratios:
+        ratio_tag = f"{int(round(ratio * 100)):02d}"
+
+        def _factory(bundle: DatasetBundle, current_ratio: float = ratio):
+            return _runner(bundle, current_ratio)
+
+        wrapped[f"{strategy_name}__budget_{ratio_tag}"] = _factory
+    return wrapped
+
+
+def make_benchmark_strategies(seed: int, budget_ratios: Sequence[float]) -> dict[str, Any]:
+    strategy_pool = make_strategies(seed=seed)
+    wrapped: dict[str, Any] = {}
+    for strategy_name, strategy_fn in strategy_pool.items():
+        wrapped.update(with_budget_variants(strategy_name, strategy_fn, budget_ratios, seed))
+
+    def full_dataset_strategy(bundle: DatasetBundle) -> dict[str, Any]:
+        full_indices = np.arange(bundle.y_train.shape[0], dtype=int)
+        return {
+            "sample_indices": full_indices,
+            "strategy_params": {
+                "budget_ratio": 1.0,
+                "budget_size": int(full_indices.size),
+                "informative_size": int(full_indices.size),
+                "budget_policy_action": "full_dataset_baseline",
+            },
+            "extra": {"informative_indices": full_indices.tolist(), "budget_ratio": 1.0},
+        }
+
+    wrapped["full_dataset"] = full_dataset_strategy
+    return wrapped
+
+
+def _with_enriched_dimensions(df: pd.DataFrame) -> pd.DataFrame:
+    enriched = df.copy()
+    enriched["strategy_base"] = enriched["strategy"].map(_strategy_base_name)
+    enriched["budget_ratio"] = pd.to_numeric(enriched.get("strategy_params.budget_ratio"), errors="coerce")
+    enriched["budget_ratio"] = enriched["budget_ratio"].fillna(pd.to_numeric(enriched.get("extra.budget_ratio"), errors="coerce"))
+    enriched["budget_percent"] = (enriched["budget_ratio"] * 100.0).round(2)
+    enriched["model"] = enriched["strategy"].str.rsplit("__", n=1).str[-1]
+    return enriched
+
+
+def resolve_datasets(full_benchmark: bool, include_amlb: bool, amlb_categories: Sequence[str] | None) -> list[str]:
+    dataset_names = ["mixed_hard"]
+    if full_benchmark:
+        dataset_names = ["high_cardinality_categorical", "large_numeric", "mixed_hard"]
+
+    if include_amlb:
+        dataset_names.extend(["amlb_adult", "amlb_covertype"])
+
+    for category in amlb_categories or []:
+        datasets_for_category = AMLB_CATEGORY_PROFILES.get(category)
+        if not datasets_for_category:
+            raise ValueError(f"Unknown AMLB category: {category}. Available: {sorted(AMLB_CATEGORY_PROFILES)}")
+        dataset_names.extend(datasets_for_category)
+
+    unique_names = []
+    seen = set()
+    for name in dataset_names:
+        if name not in seen:
+            seen.add(name)
+            unique_names.append(name)
+    return unique_names
