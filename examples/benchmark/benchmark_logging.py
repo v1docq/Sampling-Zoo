@@ -8,6 +8,9 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 import numpy as np
+import matplotlib
+
+matplotlib.use("Agg")
 
 
 def _json_ready(value: Any) -> Any:
