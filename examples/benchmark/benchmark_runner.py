@@ -112,7 +112,7 @@ class SpecialStrategyBenchmarkRunner:
         y_proba = model.predict_proba(x_test_dense) if hasattr(model, "predict_proba") else None
         inference_time = perf_counter() - infer_started
 
-        model_metrics = _collect_metrics(y_test, y_pred, y_proba)
+        model_metrics = _collect_metrics(y_test, y_pred, y_proba, getattr(model, "classes_", None))
         sample_stats = build_sample_stats(
             y_sampled=y_sampled,
             total_train_size=len(y_train),
@@ -189,7 +189,12 @@ def _from_output(strategy_output: Mapping[str, Any], key: str, sampled_indices: 
     return None
 
 
-def _collect_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_proba: Optional[np.ndarray]) -> Dict[str, float]:
+def _collect_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_proba: Optional[np.ndarray],
+    model_classes: Optional[Sequence[Any]] = None,
+) -> Dict[str, float]:
     metrics = {
         "accuracy": float(accuracy_score(y_true, y_pred)),
         "f1_macro": float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
@@ -202,10 +207,52 @@ def _collect_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_proba: Optional[n
         metrics["roc_auc"] = float("nan")
         return metrics
 
-    classes_count = len(np.unique(y_true))
-    if classes_count == 2:
-        metrics["roc_auc"] = float(roc_auc_score(y_true, y_proba[:, 1]))
-    else:
-        metrics["roc_auc"] = float(roc_auc_score(y_true, y_proba, multi_class="ovr", average="macro"))
+    classes_true = np.unique(y_true)
+    try:
+        if len(classes_true) == 2:
+            if y_proba.ndim == 2 and y_proba.shape[1] > 1:
+                if model_classes is not None:
+                    classes_arr = np.asarray(model_classes)
+                    positive_class = classes_true[-1]
+                    pos_idx = np.where(classes_arr == positive_class)[0]
+                    if pos_idx.size == 1:
+                        metrics["roc_auc"] = float(roc_auc_score(y_true, y_proba[:, int(pos_idx[0])]))
+                    else:
+                        metrics["roc_auc"] = float("nan")
+                else:
+                    metrics["roc_auc"] = float(roc_auc_score(y_true, y_proba[:, -1]))
+            else:
+                metrics["roc_auc"] = float("nan")
+            return metrics
+
+        if model_classes is None:
+            metrics["roc_auc"] = float("nan")
+            return metrics
+
+        classes_arr = np.asarray(model_classes)
+        missing_classes = [cls for cls in classes_true.tolist() if cls not in set(classes_arr.tolist())]
+        if missing_classes:
+            metrics["roc_auc"] = float("nan")
+            return metrics
+
+        target_classes = np.sort(classes_true)
+        target_indices = [int(np.where(classes_arr == cls)[0][0]) for cls in target_classes]
+        y_proba_selected = y_proba[:, target_indices]
+
+        row_sums = y_proba_selected.sum(axis=1, keepdims=True)
+        safe_row_sums = np.where(row_sums > 0, row_sums, 1.0)
+        y_proba_selected = y_proba_selected / safe_row_sums
+
+        metrics["roc_auc"] = float(
+            roc_auc_score(
+                y_true,
+                y_proba_selected,
+                labels=target_classes,
+                multi_class="ovr",
+                average="macro",
+            )
+        )
+    except ValueError:
+        metrics["roc_auc"] = float("nan")
 
     return metrics
