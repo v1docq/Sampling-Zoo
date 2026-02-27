@@ -33,6 +33,9 @@ except Exception:  # pragma: no cover - optional
     torch = None
 
 def make_strategies(seed: int = 42) -> Dict[str, Any]:
+    def _bounded_sample_size(n_rows: int, target_ratio: float = 0.2, min_target: int = 500) -> int:
+        target = max(min_target, int(target_ratio * n_rows))
+        return max(1, min(n_rows, target))
     def spectral_leverage_strategy(bundle: DatasetBundle) -> Dict[str, Any]:
         x = _to_dense(bundle.X_train_processed)
         y = bundle.y_train.to_numpy()
@@ -40,7 +43,7 @@ def make_strategies(seed: int = 42) -> Dict[str, Any]:
         grid = [{"approx_rank": r} for r in (16, 32)]
 
         def _factory(params: Dict[str, Any]):
-            sample_size = max(500, int(0.2 * x.shape[0]))
+            sample_size = _bounded_sample_size(x.shape[0])
             sampler = SpectralLeverageSampler(sample_size=sample_size, approx_rank=params["approx_rank"], random_state=seed, return_weights=True)
             sampler.fit(x)
             sampled = sampler.sample_indices(replace=False)
@@ -78,7 +81,7 @@ def make_strategies(seed: int = 42) -> Dict[str, Any]:
 
         def _factory(params: Dict[str, Any]):
             sampler = TensorEnergySampler(
-                sample_size=max(500, int(0.2 * n_samples)),
+                sample_size=_bounded_sample_size(x.shape[0]),
                 modes=[0, 1],
                 approx_rank=[params["rank_a"], params["rank_b"]],
                 random_state=seed,
@@ -94,7 +97,7 @@ def make_strategies(seed: int = 42) -> Dict[str, Any]:
         sample_indices, extra = _factory(search.best_params)
 
         sampler = TensorEnergySampler(
-            sample_size=max(500, int(0.2 * n_samples)),
+            sample_size=_bounded_sample_size(x.shape[0]),
             modes=[0, 1],
             approx_rank=[search.best_params["rank_a"], search.best_params["rank_b"]],
             random_state=seed,
