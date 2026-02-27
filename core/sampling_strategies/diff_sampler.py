@@ -34,8 +34,7 @@ class DifficultyBasedSampler(BaseSampler, HierarchicalStratifiedMixin):
         self.difficulty_scores_ = None
         self.n_partitions = n_partitions
 
-    def fit(self, data: Union[np.ndarray, pd.DataFrame], target: np.ndarray,
-            problem: str = None, model=None, chunks_percent: int = 100, **kwargs) -> 'DifficultyBasedSampler':
+    def fit(self, data, target, problem=None, model=None, chunks_percent=100, **kwargs):
         """
         Args:
             data: Признаки
@@ -54,34 +53,131 @@ class DifficultyBasedSampler(BaseSampler, HierarchicalStratifiedMixin):
         # Вычисляем сложность примеров
         self.difficulty_scores_ = self._compute_difficulty_scores(data, target, problem)
 
-        # Создаем разделы на основе сложности
-        # Если классов 2 и получен difficulty_threshold, делим на 2 части по нему, иначе - на равные части
-        if self.n_partitions == 2 and self.difficulty_threshold is not None:
-            hard_indices = np.where(self.difficulty_scores_ > self.difficulty_threshold)[0]
-            easy_indices = np.where(self.difficulty_scores_ <= self.difficulty_threshold)[0]
+        sorted_idx = np.argsort(self.difficulty_scores_)
 
-            self.partitions = {'hard': hard_indices, 'easy': easy_indices}
-        else:
-            sorted_idx = np.argsort(self.difficulty_scores_)
+        if chunks_percent < 100:
+            chunks_to_keep = math.ceil(self.n_partitions * chunks_percent / 100)
 
-            if chunks_percent < 100:
-                chunks_to_keep = math.ceil(self.n_partitions * chunks_percent / 100)
+            rows_per_chunk = len(sorted_idx) // self.n_partitions
+            total_rows_needed = chunks_to_keep * rows_per_chunk
+            k = max(1, len(sorted_idx) // total_rows_needed)
 
-                rows_per_chunk = len(sorted_idx) // self.n_partitions
-                total_rows_needed = chunks_to_keep * rows_per_chunk
+            # берём каждую k-ю строку из сортировки по сложности
+            sorted_idx = sorted_idx[::k]
+            sorted_idx = sorted_idx[-total_rows_needed:]
 
-                k = max(1, len(sorted_idx) // total_rows_needed)
+            self.n_partitions = chunks_to_keep
 
-                # берём каждую k-ю строку из сортировки по сложности
-                sorted_idx = sorted_idx[::k]
-                sorted_idx = sorted_idx[:total_rows_needed]
+        rows_per_chunk = len(sorted_idx) // self.n_partitions
 
-                self.n_partitions = chunks_to_keep
+        classes = np.unique(target)
+        class_indices = {
+            c: sorted_idx[target[sorted_idx] == c] for c in classes
+        }
+        class_counts = {
+            c: len(class_indices[c]) for c in classes
+        }
+        min_per_class = {c: max(1, int(0.2 * rows_per_chunk * class_counts[c] / len(sorted_idx))) for c in classes}
 
-            split = np.array_split(sorted_idx, self.n_partitions)
-            self.partitions = {f'chunk_{i}': indices for i, indices in enumerate(split)}
+        used_indices = set()
+        ptr = 0
+        partitions = {}
 
+        for i in range(self.n_partitions):
+            chunk_idx = []
+            while len(chunk_idx) < rows_per_chunk and ptr < len(sorted_idx):
+                idx = sorted_idx[ptr]
+                ptr += 1
+                if idx not in used_indices:
+                    chunk_idx.append(idx)
+            if len(chunk_idx) < rows_per_chunk // 2:
+                break
+
+            chunk_idx = np.array(chunk_idx)
+
+            chunk_classes = target[chunk_idx]
+            counts = dict(zip(*np.unique(chunk_classes, return_counts=True)))
+
+            additions = []
+
+            for c in classes:
+                if counts.get(c, 0) >= min_per_class[c]:
+                    continue
+
+                need = min_per_class[c] - counts.get(c, 0)
+                pool = class_indices[c]
+
+                pool = pool[~np.isin(pool, list(used_indices))]
+
+                if len(pool) == 0:
+                    continue
+
+                if i < self.n_partitions // 2:
+                    pool = pool[:need]
+                else:
+                    pool = pool[-need:]
+
+                additions.extend(pool.tolist())
+
+            chunk_idx = np.concatenate([chunk_idx, np.array(additions, dtype=np.int64)])
+            used_indices.update(chunk_idx.tolist())
+
+            partitions[f'chunk_{i}'] = chunk_idx
+
+        partitions = self.rebalance_partitions(partitions, target, min_per_class)
+        self.partitions = partitions
         return self
+
+    def rebalance_partitions(self, partitions, target, min_per_class):
+        partitions_classes_count = {}
+
+        for name, idx in partitions.items():
+            classes, counts = np.unique(target[idx], return_counts=True)
+            partitions_classes_count[name] = dict(zip(classes.tolist(), counts.tolist()))
+
+        chunk_names = list(partitions.keys())
+        n_chunks = len(chunk_names)
+
+        class_to_indices = {}
+        for c in min_per_class:
+            idx = np.where(target == c)[0]
+            class_to_indices[c] = idx[np.argsort(self.difficulty_scores_[idx])]
+
+        for c, min_req in min_per_class.items():
+            surplus_pools = {}
+
+            for i, name in enumerate(chunk_names):
+                count = partitions_classes_count[name].get(c, 0)
+                if count > min_req:
+                    idx = partitions[name]
+                    cls_idx = idx[target[idx] == c]
+                    surplus = count - min_req
+                    surplus_pools[i] = cls_idx[-surplus:]
+
+            for i in range(n_chunks - 1, -1, -1):
+                name = chunk_names[i]
+                cur_count = partitions_classes_count[name].get(c, 0)
+                need = max(0, min_req - cur_count)
+
+                if need == 0:
+                    continue
+
+                for j in range(i - 1, -1, -1):
+                    if need == 0:
+                        break
+                    if j not in surplus_pools or need == 0:
+                        continue
+
+                    pool = surplus_pools[j]
+                    take = min(len(pool), need)
+
+                    moved = pool[-take:]
+                    surplus_pools[j] = pool[:-take]
+                    need -= take
+
+                    partitions[name] = np.concatenate([partitions[name], moved])
+                    partitions[f'chunk_{j}'] = np.setdiff1d(partitions[f'chunk_{j}'], moved, assume_unique=True)
+        return partitions
 
     def _select_model(self, problem: str):
         if self.model is None:
