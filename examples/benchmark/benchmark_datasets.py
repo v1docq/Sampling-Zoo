@@ -248,6 +248,30 @@ def _load_mixed_hard(seed: int) -> DatasetBundle:
     )
 
 
+
+AMLB_OPENML_DATASETS: dict[str, str] = {
+    'amlb_adult': 'adult',
+    'amlb_covertype': 'covertype',
+    'amlb_optdigits': 'optdigits',
+    'amlb_vehicle': 'vehicle',
+    'amlb_mfeat_factors': 'mfeat-factors',
+    'amlb_segment': 'segment',
+    'amlb_credit_g': 'credit-g',
+    'amlb_kr_vs_kp': 'kr-vs-kp',
+    'amlb_sick': 'sick',
+    'amlb_spambase': 'spambase',
+    'amlb_letter': 'letter',
+    'amlb_satimage': 'satimage',
+    'amlb_waveform': 'waveform-5000',
+    'amlb_phoneme': 'phoneme',
+    'amlb_page_blocks': 'page-blocks',
+    'amlb_ionosphere': 'ionosphere',
+    'amlb_banknote_authentication': 'banknote-authentication',
+    'amlb_wine_quality_red': 'wine-quality-red',
+    'amlb_wine_quality_white': 'wine-quality-white',
+    'amlb_magic_telescope': 'magic-telescope',
+}
+
 def _load_amlb_openml(
     name: str,
     openml_name: str | None,
@@ -303,13 +327,13 @@ def load_dataset(name: str, seed: int) -> DatasetBundle:
         'high_cardinality_categorical': _load_high_cardinality_categorical,
         'large_numeric': _load_large_numeric,
         'mixed_hard': _load_mixed_hard,
-        'amlb_adult': lambda current_seed: _load_amlb_openml('amlb_adult', 'adult', current_seed),
-        'amlb_covertype': lambda current_seed: _load_amlb_openml('amlb_covertype', 'covertype', current_seed),
-        'amlb_optdigits': lambda current_seed: _load_amlb_openml('amlb_optdigits', 'optdigits', current_seed),
-        'amlb_vehicle': lambda current_seed: _load_amlb_openml('amlb_vehicle', 'vehicle', current_seed),
-        'amlb_mfeat_factors': lambda current_seed: _load_amlb_openml('amlb_mfeat_factors', 'mfeat-factors', current_seed),
-        'amlb_segment': lambda current_seed: _load_amlb_openml('amlb_segment', 'segment', current_seed),
     }
+    for profile_name, openml_name in AMLB_OPENML_DATASETS.items():
+        loaders[profile_name] = lambda current_seed, current_profile=profile_name, current_openml=openml_name: _load_amlb_openml(
+            current_profile,
+            current_openml,
+            current_seed,
+        )
 
     normalized_name = name.strip().lower()
     if normalized_name not in loaders:
