@@ -99,6 +99,11 @@ class SpecialStrategyBenchmarkRunner:
             simplex_ids=_from_output(strategy_output, "simplex_ids", sampled_indices),
         )
 
+        informative_indices = np.asarray(
+            (strategy_output.get("extra", {}) or {}).get("informative_indices", sampled_indices),
+            dtype=int,
+        )
+
         payload = self.logger.log_strategy_run(
             dataset_name=dataset.name,
             strategy_name=strategy_name,
@@ -108,6 +113,7 @@ class SpecialStrategyBenchmarkRunner:
             sample_stats=sample_stats,
             extra={
                 "sample_indices_path": str(self.logger.save_sample_dump(dataset.name, strategy_name, sampled_indices)),
+                "informative_indices_path": str(self.logger.save_sample_dump(dataset.name, f"{strategy_name}__informative", informative_indices)),
                 **(strategy_output.get("extra", {}) or {}),
             },
         )

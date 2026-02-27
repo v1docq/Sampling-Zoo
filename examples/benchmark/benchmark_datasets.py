@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from inspect import signature
-from typing import Callable
+from typing import Callable, Sequence
 
 import numpy as np
 import pandas as pd
@@ -39,10 +39,18 @@ class DatasetBundle:
     metadata: DatasetMetadata
 
 
+AMLB_CATEGORY_MAP: dict[str, list[str]] = {
+    "default": ["amlb_adult"],
+    "small_samples_many_classes": ["amlb_anneal", "amlb_car", "amlb_abalone"],
+    "medium_samples_many_classes": ["amlb_optdigits", "amlb_letter"],
+    "large_samples_many_classes": ["amlb_covertype"],
+}
+
+
 def _make_one_hot_encoder() -> OneHotEncoder:
-    if 'sparse_output' in signature(OneHotEncoder).parameters:
-        return OneHotEncoder(handle_unknown='ignore', sparse_output=True)
-    return OneHotEncoder(handle_unknown='ignore', sparse=True)
+    if "sparse_output" in signature(OneHotEncoder).parameters:
+        return OneHotEncoder(handle_unknown="ignore", sparse_output=True)
+    return OneHotEncoder(handle_unknown="ignore", sparse=True)
 
 
 def _make_preprocessor(
@@ -51,12 +59,12 @@ def _make_preprocessor(
 ) -> ColumnTransformer:
     return ColumnTransformer(
         transformers=[
-            ('numeric', Pipeline([('scale', StandardScaler())]), numeric_columns),
+            ("numeric", Pipeline([("scale", StandardScaler())]), numeric_columns),
             (
-                'categorical',
+                "categorical",
                 Pipeline([
                     (
-                        'encode',
+                        "encode",
                         _make_one_hot_encoder(),
                     )
                 ]),
@@ -98,9 +106,7 @@ def _build_bundle(
         n_test=len(X_test),
         n_categorical=len(categorical_columns),
         n_numeric=len(numeric_columns),
-        categorical_cardinality={
-            column: int(X[column].nunique()) for column in categorical_columns
-        },
+        categorical_cardinality={column: int(X[column].nunique()) for column in categorical_columns},
     )
 
     return DatasetBundle(
@@ -121,8 +127,8 @@ def _load_high_cardinality_categorical(seed: int) -> DatasetBundle:
     rng = np.random.default_rng(seed)
     n_samples = 12000
 
-    numeric_columns = [f'num_{idx}' for idx in range(6)]
-    categorical_columns = [f'cat_{idx}' for idx in range(8)]
+    numeric_columns = [f"num_{idx}" for idx in range(6)]
+    categorical_columns = [f"cat_{idx}" for idx in range(8)]
 
     X_numeric = rng.normal(0.0, 1.0, size=(n_samples, len(numeric_columns)))
 
@@ -133,8 +139,8 @@ def _load_high_cardinality_categorical(seed: int) -> DatasetBundle:
     for column, cardinality in zip(categorical_columns, cardinalities):
         values = rng.integers(0, cardinality, size=n_samples)
         categorical_data[column] = pd.Series(
-            [f'{column}_value_{val}' for val in values],
-            dtype='string',
+            [f"{column}_value_{val}" for val in values],
+            dtype="string",
         )
         category_signal += (values % 7) / 6.0
 
@@ -143,16 +149,16 @@ def _load_high_cardinality_categorical(seed: int) -> DatasetBundle:
         X[column] = categorical_data[column]
 
     linear_signal = (
-        0.9 * X['num_0']
-        - 0.7 * X['num_1']
-        + 0.6 * X['num_2']
+        0.9 * X["num_0"]
+        - 0.7 * X["num_1"]
+        + 0.6 * X["num_2"]
         + 0.2 * category_signal
         + rng.normal(0.0, 0.35, n_samples)
     )
-    y = pd.Series((linear_signal > np.quantile(linear_signal, 0.52)).astype(int), name='target')
+    y = pd.Series((linear_signal > np.quantile(linear_signal, 0.52)).astype(int), name="target")
 
     return _build_bundle(
-        name='high_cardinality_categorical',
+        name="high_cardinality_categorical",
         seed=seed,
         X=X,
         y=y,
@@ -176,12 +182,12 @@ def _load_large_numeric(seed: int) -> DatasetBundle:
         random_state=seed,
     )
 
-    numeric_columns = [f'num_{idx}' for idx in range(X_values.shape[1])]
+    numeric_columns = [f"num_{idx}" for idx in range(X_values.shape[1])]
     X = pd.DataFrame(X_values, columns=numeric_columns)
-    y = pd.Series(y_values, name='target')
+    y = pd.Series(y_values, name="target")
 
     return _build_bundle(
-        name='large_numeric',
+        name="large_numeric",
         seed=seed,
         X=X,
         y=y,
@@ -207,38 +213,25 @@ def _load_mixed_hard(seed: int) -> DatasetBundle:
         random_state=seed,
     )
 
-    numeric_columns = [f'num_{idx}' for idx in range(X_numeric.shape[1])]
-    categorical_columns = ['cat_small', 'cat_medium', 'cat_rare', 'cat_noise']
+    numeric_columns = [f"num_{idx}" for idx in range(X_numeric.shape[1])]
+    categorical_columns = ["cat_small", "cat_medium", "cat_rare", "cat_noise"]
 
     X = pd.DataFrame(X_numeric, columns=numeric_columns)
-    y = pd.Series(y_values, name='target')
+    y = pd.Series(y_values, name="target")
 
-    X['cat_small'] = pd.Series(
-        [f's_{value}' for value in rng.integers(0, 5, size=len(X))],
-        dtype='string',
-    )
-    X['cat_medium'] = pd.Series(
-        [f'm_{value}' for value in rng.integers(0, 30, size=len(X))],
-        dtype='string',
-    )
+    X["cat_small"] = pd.Series([f"s_{value}" for value in rng.integers(0, 5, size=len(X))], dtype="string")
+    X["cat_medium"] = pd.Series([f"m_{value}" for value in rng.integers(0, 30, size=len(X))], dtype="string")
 
     rare_probability = np.where(y.values == 1, 0.22, 0.05)
-    X['cat_rare'] = pd.Series(
-        np.where(
-            rng.uniform(size=len(X)) < rare_probability,
-            'rare',
-            'common',
-        ),
-        dtype='string',
+    X["cat_rare"] = pd.Series(
+        np.where(rng.uniform(size=len(X)) < rare_probability, "rare", "common"),
+        dtype="string",
     )
 
-    X['cat_noise'] = pd.Series(
-        [f'n_{value}' for value in rng.integers(0, 200, size=len(X))],
-        dtype='string',
-    )
+    X["cat_noise"] = pd.Series([f"n_{value}" for value in rng.integers(0, 200, size=len(X))], dtype="string")
 
     return _build_bundle(
-        name='mixed_hard',
+        name="mixed_hard",
         seed=seed,
         X=X,
         y=y,
@@ -249,9 +242,9 @@ def _load_mixed_hard(seed: int) -> DatasetBundle:
 
 
 def _load_amlb_openml(name: str, openml_name: str, seed: int, max_rows: int = 25000) -> DatasetBundle:
-    dataset = fetch_openml(name=openml_name, as_frame=True, parser='auto')
+    dataset = fetch_openml(name=openml_name, as_frame=True, parser="auto")
     frame = dataset.frame.copy()
-    target_name = dataset.target.name if hasattr(dataset.target, 'name') and dataset.target.name else dataset.target_names[0]
+    target_name = dataset.target.name if hasattr(dataset.target, "name") and dataset.target.name else dataset.target_names[0]
 
     y_raw = frame[target_name]
     X = frame.drop(columns=[target_name])
@@ -260,7 +253,7 @@ def _load_amlb_openml(name: str, openml_name: str, seed: int, max_rows: int = 25
     X = X.loc[valid].reset_index(drop=True)
     y_raw = y_raw.loc[valid].reset_index(drop=True)
 
-    y_codes = pd.Series(y_raw.astype('category').cat.codes, name='target')
+    y_codes = pd.Series(y_raw.astype("category").cat.codes, name="target")
     valid_class = y_codes >= 0
     X = X.loc[valid_class].reset_index(drop=True)
     y_codes = y_codes.loc[valid_class].reset_index(drop=True)
@@ -271,10 +264,10 @@ def _load_amlb_openml(name: str, openml_name: str, seed: int, max_rows: int = 25
         X = X.iloc[idx].reset_index(drop=True)
         y_codes = y_codes.iloc[idx].reset_index(drop=True)
 
-    numeric_columns = X.select_dtypes(include=['number', 'bool']).columns.tolist()
+    numeric_columns = X.select_dtypes(include=["number", "bool"]).columns.tolist()
     categorical_columns = [col for col in X.columns if col not in numeric_columns]
     for col in categorical_columns:
-        X[col] = X[col].astype('string')
+        X[col] = X[col].astype("string")
 
     return _build_bundle(
         name=name,
@@ -289,18 +282,39 @@ def _load_amlb_openml(name: str, openml_name: str, seed: int, max_rows: int = 25
 
 def load_dataset(name: str, seed: int) -> DatasetBundle:
     loaders: dict[str, Callable[[int], DatasetBundle]] = {
-        'high_cardinality_categorical': _load_high_cardinality_categorical,
-        'large_numeric': _load_large_numeric,
-        'mixed_hard': _load_mixed_hard,
-        'amlb_adult': lambda current_seed: _load_amlb_openml('amlb_adult', 'adult', current_seed),
-        'amlb_covertype': lambda current_seed: _load_amlb_openml('amlb_covertype', 'covertype', current_seed),
+        "high_cardinality_categorical": _load_high_cardinality_categorical,
+        "large_numeric": _load_large_numeric,
+        "mixed_hard": _load_mixed_hard,
+        "amlb_adult": lambda current_seed: _load_amlb_openml("amlb_adult", "adult", current_seed),
+        "amlb_covertype": lambda current_seed: _load_amlb_openml("amlb_covertype", "covertype", current_seed),
+        "amlb_anneal": lambda current_seed: _load_amlb_openml("amlb_anneal", "anneal", current_seed),
+        "amlb_car": lambda current_seed: _load_amlb_openml("amlb_car", "car", current_seed),
+        "amlb_abalone": lambda current_seed: _load_amlb_openml("amlb_abalone", "abalone", current_seed),
+        "amlb_optdigits": lambda current_seed: _load_amlb_openml("amlb_optdigits", "optdigits", current_seed),
+        "amlb_letter": lambda current_seed: _load_amlb_openml("amlb_letter", "letter", current_seed),
     }
 
     normalized_name = name.strip().lower()
     if normalized_name not in loaders:
-        available = ', '.join(sorted(loaders))
-        raise ValueError(
-            f'Unknown dataset profile: {name}. Available profiles: {available}'
-        )
+        available = ", ".join(sorted(loaders))
+        raise ValueError(f"Unknown dataset profile: {name}. Available profiles: {available}")
 
     return loaders[normalized_name](seed)
+
+
+def resolve_dataset_names(
+    dataset_names: Sequence[str],
+    include_amlb: bool,
+    amlb_categories: Sequence[str] = ("default",),
+) -> list[str]:
+    resolved = [name.strip().lower() for name in dataset_names if name and name.strip()]
+
+    if include_amlb:
+        for category in amlb_categories:
+            key = category.strip().lower()
+            if key not in AMLB_CATEGORY_MAP:
+                available = ", ".join(sorted(AMLB_CATEGORY_MAP))
+                raise ValueError(f"Unknown AMLB category: {category}. Available categories: {available}")
+            resolved.extend(AMLB_CATEGORY_MAP[key])
+
+    return sorted(set(resolved))
