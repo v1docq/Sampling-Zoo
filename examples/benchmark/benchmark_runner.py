@@ -5,10 +5,10 @@ from time import perf_counter
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
 import numpy as np
-import pandas as pd
 from scipy import sparse
 from sklearn.base import ClassifierMixin, clone
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
+from tqdm.auto import tqdm
 
 from benchmark_datasets import DatasetBundle
 from benchmark_logging import BenchmarkLogger, build_sample_stats
@@ -28,8 +28,15 @@ class StrategyOutput:
 class SpecialStrategyBenchmarkRunner:
     """Benchmark runner for sampling strategies with consistent artifact logging."""
 
-    def __init__(self, logger: Optional[BenchmarkLogger] = None) -> None:
+    def __init__(
+        self,
+        logger: Optional[BenchmarkLogger] = None,
+        enable_diagnostic_plots: bool = False,
+        show_progress: bool = True,
+    ) -> None:
         self.logger = logger or BenchmarkLogger()
+        self.enable_diagnostic_plots = enable_diagnostic_plots
+        self.show_progress = show_progress
         self.run_records: List[Dict[str, Any]] = []
 
     def run(
@@ -39,13 +46,28 @@ class SpecialStrategyBenchmarkRunner:
         base_model: ClassifierMixin,
     ) -> List[Dict[str, Any]]:
         self.run_records = []
-        for dataset in datasets:
+        datasets_seq = list(datasets)
+
+        dataset_iter = tqdm(
+            datasets_seq,
+            disable=not self.show_progress,
+            desc="Datasets",
+            leave=False,
+        )
+        for dataset in dataset_iter:
             x_train_dense = _to_dense(dataset.X_train_processed)
             x_test_dense = _to_dense(dataset.X_test_processed)
             y_train = dataset.y_train.to_numpy()
             y_test = dataset.y_test.to_numpy()
 
-            for strategy_name, strategy_fn in strategies.items():
+            strategy_iter = tqdm(
+                strategies.items(),
+                total=len(strategies),
+                disable=not self.show_progress,
+                desc=f"Strategies ({dataset.name})",
+                leave=False,
+            )
+            for strategy_name, strategy_fn in strategy_iter:
                 run_payload = self._run_single_strategy(
                     dataset=dataset,
                     strategy_name=strategy_name,
@@ -112,12 +134,13 @@ class SpecialStrategyBenchmarkRunner:
             },
         )
 
-        score_values = _resolve_score_values(strategy_output, sampled_indices)
-        if score_values is not None:
-            self.logger.save_probability_distribution_plot(score_values, dataset.name, strategy_name)
+        if self.enable_diagnostic_plots:
+            score_values = _resolve_score_values(strategy_output, sampled_indices)
+            if score_values is not None:
+                self.logger.save_probability_distribution_plot(score_values, dataset.name, strategy_name)
 
-        self.logger.save_class_coverage_plot(sample_stats["class_distribution"], dataset.name, strategy_name)
-        self.logger.save_2d_projection_plot(x_sampled, y_sampled, dataset.name, strategy_name, method="pca")
+            self.logger.save_class_coverage_plot(sample_stats["class_distribution"], dataset.name, strategy_name)
+            self.logger.save_2d_projection_plot(x_sampled, y_sampled, dataset.name, strategy_name, method="pca")
         return payload
 
 

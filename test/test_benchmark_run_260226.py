@@ -13,6 +13,7 @@ MODULE_PATH = Path(__file__).resolve().parents[1] / "examples" / "benchmark" / "
 spec = importlib.util.spec_from_file_location("run_260226", MODULE_PATH)
 run_module = importlib.util.module_from_spec(spec)
 assert spec and spec.loader
+sys.modules["run_260226"] = run_module
 spec.loader.exec_module(run_module)
 
 
@@ -60,3 +61,13 @@ def test_resolve_datasets_includes_amlb_categories_without_duplicates() -> None:
     assert "amlb_adult" in datasets
     assert "amlb_optdigits" in datasets
     assert len(datasets) == len(np.unique(datasets))
+
+
+def test_default_config_disables_diagnostic_plots() -> None:
+    config = run_module.BenchmarkRunConfig()
+    assert config.enable_diagnostic_plots is False
+
+
+def test_matplotlib_backend_is_agg_for_non_interactive_runs() -> None:
+    backend = run_module.matplotlib.get_backend().lower()
+    assert "agg" in backend
