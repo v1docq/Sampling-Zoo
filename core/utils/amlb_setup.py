@@ -13,7 +13,7 @@ from core.repository.constant_repo import AmlbExperimentDataset
 from core.utils.amlb_config import ModelSpec, ExperimentConfig, ExperimentConfigBuilder, SamplingStrategySpec
 from core.utils.amlb_dataloader import AMLBDatasetLoader
 from core.utils.amlb_tracking import ExperimentTracker
-from core.utils.fedot_integration import SamplingEnsemble, SingleModelImplementation
+from core.utils.sampling_ensemble import SamplingEnsemble, SingleModelImplementation
 
 __all__ = [
     "ExperimentConfig",
