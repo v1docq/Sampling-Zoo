@@ -13,7 +13,8 @@ class SamplingStrategySpec:
 
 
 @dataclass
-class AutoMLModelSpec:
+class ModelSpec:
+    """Спецификация ML модели для использования в эксперименте"""
     name: str
     params: Dict[str, Any] = field(default_factory=dict)
 
@@ -28,9 +29,9 @@ class DatasetSpec:
 class ExperimentConfig:
     datasets: List[DatasetSpec]
     cv_folds: int
-    fedot_config: Dict
+    model_config: Dict
     sampling_strategies: List[SamplingStrategySpec]
-    automl_models: List[AutoMLModelSpec]
+    models: List[ModelSpec]
     run_mode: str = 'chunks'
     time_budget_minutes: int = 10
     tracking_uri: str | None = None
@@ -42,7 +43,7 @@ class ExperimentConfig:
             "cv_folds": self.cv_folds,
             "run_mode": self.run_mode,
             "sampling_strategies": [strategy.__dict__ for strategy in self.sampling_strategies],
-            "automl_models": [model.__dict__ for model in self.automl_models],
+            "models": [model.__dict__ for model in self.models],
             "time_budget_minutes": self.time_budget_minutes,
             "tracking_uri": self.tracking_uri,
             "experiment_name": self.experiment_name,
@@ -56,12 +57,12 @@ class ExperimentConfigBuilder:
         self.default_time_budget = default_time_budget
         self.default_cv_folds = default_cv_folds
 
-    def from_text(self, text: str, fedot_config: Dict) -> ExperimentConfig:
+    def from_text(self, text: str, model_config: Dict) -> ExperimentConfig:
         sections = self._parse_sections(text)
 
         datasets = [DatasetSpec(name=item.strip()) for item in sections.get("datasets", []) if item.strip()]
         sampling = [self._parse_named_entity(SamplingStrategySpec, item) for item in sections.get("sampling", [])]
-        models = [self._parse_named_entity(AutoMLModelSpec, item) for item in sections.get("models", [])]
+        models = [self._parse_named_entity(ModelSpec, item) for item in sections.get("models", [])]
 
         time_budget = int(sections.get("time_budget", [self.default_time_budget])[0])
         tracking_uri = sections.get("tracking_uri", [None])[0]
@@ -74,11 +75,11 @@ class ExperimentConfigBuilder:
             cv_folds=cv_folds,
             run_mode=run_mode,
             sampling_strategies=sampling or [SamplingStrategySpec(name="hierarchical_stratified", params={"n_splits": 5})],
-            automl_models=models or [AutoMLModelSpec(name="fedot")],
+            models=models or [ModelSpec(name="lgbm", params={"n_estimators": 100, "n_jobs": -1})],
             time_budget_minutes=time_budget,
             tracking_uri=tracking_uri,
             experiment_name=experiment_name,
-            fedot_config=fedot_config
+            model_config=model_config
         )
 
     @staticmethod
@@ -86,7 +87,7 @@ class ExperimentConfigBuilder:
         return (
             "datasets: kddcup, airline\n"
             "sampling: hierarchical_stratified(n_splits=5)\n"
-            "models: fedot(preset=auto)\n"
+            "models: lgbm(n_estimators=100, learning_rate=0.1, n_jobs=-1)\n"
             "time_budget: 20\n"
             "tracking_uri: file:./mlruns\n"
             "cv_folds: 4\n"
@@ -154,8 +155,16 @@ class ExperimentConfigBuilder:
 
     @staticmethod
     def _coerce_value(raw: str) -> Any:
-        if raw.isdigit():
-            return int(raw)
+        """Конвертирует строковое значение в соответствующий тип данных"""
+        # Попытка конвертировать в int
+        try:
+            # Проверяем, что это целое число (без точки)
+            if '.' not in raw:
+                return int(raw)
+        except ValueError:
+            pass
+
+        # Попытка конвертировать в float
         try:
             return float(raw)
         except ValueError:

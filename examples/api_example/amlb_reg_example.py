@@ -1,4 +1,14 @@
-"""Запуск LargeScaleAutoMLExperiment через текстовый конфиг."""
+"""
+Запуск LargeScaleAutoMLExperiment через текстовый конфиг (регрессия).
+
+Доступные модели:
+- lgbm: LightGBM (параметры: n_estimators, learning_rate, n_jobs и др.)
+- random_forest: Random Forest (параметры: n_estimators, max_depth, n_jobs и др.)
+
+Пример использования разных моделей:
+- models: lgbm(n_estimators=100, learning_rate=0.1, n_jobs=-1)
+- models: random_forest(n_estimators=200, max_depth=20, n_jobs=-1)
+"""
 
 from __future__ import annotations
 import pathlib
@@ -17,7 +27,7 @@ datasets: year_prediction_msd
 cv_folds: 3
 run_mode: mixed_chunk
 sampling: feature_clustering(n_partitions=8, chunks_percent=70, save_filename=partitions_year)
-models: fedot(preset=best_quality)
+models: lgbm(n_estimators=100, learning_rate=0.1, n_jobs=-1)
 time_budget: 1500
 tracking_uri: file:./mlruns
 """
@@ -25,9 +35,10 @@ tracking_uri: file:./mlruns
 
 def run_from_request(request: str) -> None:
     builder = ExperimentConfigBuilder(default_time_budget=1500)
+    model_config = {'metric': 'rmse'}
     experiment_config: ExperimentConfig = builder.from_text(
         request,
-        fedot_config=AmlbExperimentDataset.FEDOT_PRESET_REG.value
+        model_config=model_config
     )
 
     print("Конфигурация эксперимента:")

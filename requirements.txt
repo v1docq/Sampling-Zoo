@@ -6,6 +6,5 @@ tqdm>=4.62.0
 imbalanced-learn>=0.8.0
 iterative-stratification>=0.1.9
 hdbscan>=0.8.29
-fedot>=0.7.5
 tensorly>=0.5.0
 mlflow>=2.14.0

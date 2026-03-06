@@ -116,54 +116,6 @@ class AmlbExperimentDataset(Enum):
         'boston': {'rmse': 4.5, 'r2': 0.75},
         'california': {'rmse': 0.8, 'r2': 0.65}
     }
-    FEDOT_BASELINE_PRESET = dict(timeout=10, preset='best_quality', cv_folds=3)
-    FEDOT_PRESET_CLF = {'timeout': 10,  # Меньше timeout для каждой модели
-                        'preset': 'best_quality',
-                        'cv_folds': 4,
-                        'logging_level': 20,
-                        'with_tuning': False,
-                        'pop_size': 12,
-                        'num_of_generations': 15,
-                        'n_jobs': 15,
-                        'metric': 'f1'
-                        }
-    FEDOT_PRESET_REG = {'timeout': 15,
-                        'preset': 'best_quality',
-                        'cv_folds': 4,
-                        'logging_level': 20,
-                        'with_tuning': False,
-                        'pop_size': 12,
-                        'num_of_generations': 15,
-                        'n_jobs': 15,
-                        'metric': 'rmse'
-                        }
-    FEDOT_MODELS_FOR_CLF = [
-        'bernb',
-        'catboost',
-        'dt',
-        'fast_ica',
-        'isolation_forest_class',
-        'knn',
-        'lgbm',
-        'logit',
-        'mlp',
-        'normalization',
-        'pca',
-        'poly_features',
-        'qda',
-        'resample',
-        'rf',
-        'scaling',
-        'xgboost'
-    ]
-    FEDOT_MODELS_FOR_REG = [
-        'ridge',
-        'rfr',
-        'lgbmreg',
-        'treg',
-        'knnreg',
-        'scaling'
-    ]
     SAMPLING_PRESET = {'strategy': 'stratified',
                        "n_partitions": 3,
                        "chunks_percent": 100

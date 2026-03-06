@@ -1,33 +1,29 @@
-# fedot_sampling_integration.py
+# model_integration.py
 import pickle
 import os
 from scipy.stats import mode
 import pandas as pd
 import numpy as np
-from typing import List, Dict, Any, Optional, Callable
-from fedot.api.main import Fedot
-from fedot.core.data.data import InputData
-from fedot.core.data.data_split import train_test_data_setup
-from fedot.core.repository.tasks import Task, TaskTypesEnum
+from typing import List, Dict, Any, Optional, Callable, Union
 from lightgbm import LGBMRegressor, LGBMClassifier
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from tqdm import tqdm
 
 from core.api.api_main import SamplingStrategyFactory
 from core.metrics.eval_metrics import calculate_metrics, get_metric_comparator
-from core.repository.constant_repo import AmlbExperimentDataset
-from core.repository.model_repo import SamplingModels, SupportingModels
 
 
-class FedotSamplingEnsemble:
+class SamplingEnsemble:
     """
-    Интеграция Sampling-Zoo с Fedot для работы с большими датасетами
+    Интеграция Sampling-Zoo с ML моделями для работы с большими датасетами
     через интеллектуальное семплирование и ансамблирование
     """
 
     def __init__(self,
                  problem: str,
                  partitioner_config: Dict[str, Any] = None,
-                 fedot_config: Dict[str, Any] = None,
+                 model_class: Optional[Callable] = None,
+                 model_params: Dict[str, Any] = None,
                  ensemble_method: str = 'voting'):
 
         self.problem = problem
@@ -36,11 +32,18 @@ class FedotSamplingEnsemble:
             'n_clusters': 3,
             'method': 'kmeans'
         }
-        self.fedot_config = fedot_config or {
-            'timeout': 10,
-            'preset': 'best_quality',
-            'cv_folds': 3
-        }
+
+        # Автоматический выбор модели если не указана
+        if model_class is None:
+            if problem == 'classification':
+                model_class = LGBMClassifier
+            elif problem == 'regression':
+                model_class = LGBMRegressor
+            else:
+                raise ValueError("Problem type must be 'classification' or 'regression'")
+
+        self.model_class = model_class
+        self.model_params = model_params or {}
         self.ensemble_method = ensemble_method
         self.bs_size = 1000
         self.partitions = None
@@ -91,19 +94,9 @@ class FedotSamplingEnsemble:
         except ImportError:
             raise ImportError("Sampling-Zoo не установлен. Установите его из https://github.com/v1docq/Sampling-Zoo")
 
-    def _define_fedot_setup(self):
-        # Определяем тип задачи для Fedot
-        if self.problem == 'classification':
-            task = Task(TaskTypesEnum.classification)
-            self.fedot_config['available_operations'] = AmlbExperimentDataset.FEDOT_MODELS_FOR_CLF.value
-            init_assumption = SupportingModels.fedot_clf_pipelines.value['lgbm'].build()
-        elif self.problem == 'regression':
-            task = Task(TaskTypesEnum.regression)
-            # self.fedot_config['available_operations'] = AmlbExperimentDataset.FEDOT_MODELS_FOR_REG.value
-            init_assumption = SupportingModels.fedot_reg_pipelines.value['lgbmreg'].build()
-        else:
-            raise ValueError("Problem type must be 'classification' or 'regression'")
-        return task, init_assumption
+    def _create_model_instance(self):
+        """Создает экземпляр модели с заданными параметрами"""
+        return self.model_class(**self.model_params)
 
     def _run_inference(self, fitted_model: Callable, test_data: pd.DataFrame,
                        calculation_mode: str = 'batch', batch_size: int = None):
@@ -163,9 +156,10 @@ class FedotSamplingEnsemble:
 
         return chunk
 
-    def train_partition_models(self, X_train, y_train, X_val, y_val, class_samples, cv_fold):
+    def train_partition_models(self, X_train, y_train, X_val, y_val, class_samples, cv_fold,
+                              validation_metric: str = None):
         """
-        Обучает отдельные Fedot модели на каждой партиции
+        Обучает отдельные ML модели на каждой партиции
         """
         os.makedirs("dumps", exist_ok=True)
         if 'load_filename' in self.partitioner_config:
@@ -176,34 +170,35 @@ class FedotSamplingEnsemble:
             if 'save_filename' in self.partitioner_config:
                 with open(f"dumps/{self.partitioner_config['save_filename']}_{cv_fold}.pkl", "wb") as f:
                     pickle.dump(partitions, f)
-        task, init_assumption = self._define_fedot_setup()
+
         validation_results = []
         best_validation_result, best_validation_result_not_updated = None, 0
-        if 'metric' in self.fedot_config:
-            validation_metric = self.fedot_config['metric']
-            if validation_metric == 'f1':
-                validation_metric = 'f1_weighted'
-        else:
+
+        if validation_metric is None:
             validation_metric = 'f1_weighted' if self.problem == 'classification' else 'rmse'
+        elif validation_metric == 'f1':
+            validation_metric = 'f1_weighted'
+
         metric_is_better = get_metric_comparator(validation_metric)
+
         for partition_name, partition_data in partitions.items():
             print(f"Обучение модели для поднабора {partition_name}...")
             if self.problem == 'classification' and class_samples:
                 partition_data = self.ensure_all_classes_in_chunk(partition_data, class_samples)
 
             try:
-                # Создаем Fedot модель
-                fitted_fedot_model = Fedot(problem=self.problem,
-                                           task_params=task.task_params,
-                                           initial_assumption=init_assumption,
-                                           **self.fedot_config)
+                # Создаем экземпляр модели
+                model = self._create_model_instance()
+
                 # Обучаем на поднаборе
-                fitted_fedot_model.fit(features=partition_data['feature'], target=partition_data['target'])
+                model.fit(partition_data['feature'], partition_data['target'])
+
                 with open(f"dumps/{partition_name}_{cv_fold}.pkl", "wb") as f:
-                    pickle.dump(fitted_fedot_model, f)
+                    pickle.dump(model, f)
 
                 # Инференс на валидационных данных
-                predict_labels, predict_proba = self._run_inference(fitted_fedot_model, X_val, calculation_mode='non-batch')
+                predict_labels, predict_proba = self._run_inference(model, X_val, calculation_mode='non-batch')
+
                 # Сохраняем модель и метрики
                 metrics = calculate_metrics(y_true=y_val,
                                             problem_type=self.problem,
@@ -212,7 +207,7 @@ class FedotSamplingEnsemble:
                                             )
                 model_info = {
                     'name': partition_name,
-                    'model': fitted_fedot_model,
+                    'model': model,
                     'data_size': len(partition_data['feature']),
                     'metrics': metrics,
                     'val_predictions': predict_labels,
@@ -229,16 +224,18 @@ class FedotSamplingEnsemble:
                 )[validation_metric]
                 print(f"Текущая валидационная метрика - {current_validation_result}")
                 validation_results.append(current_validation_result)
+
                 if best_validation_result is None or metric_is_better(current_validation_result, best_validation_result):
                     best_validation_result = current_validation_result
                     best_validation_result_not_updated = 0
                 else:
                     best_validation_result_not_updated += 1
+
                 if metric_is_better(np.mean(validation_results[:-10]), current_validation_result):
                     del self.models[-1]
+
                 if best_validation_result_not_updated >= 10:
                     break
-
 
             except Exception as e:
                 print(f"Ошибка при обучении модели {partition_name}: {str(e)}")
@@ -359,36 +356,41 @@ class FedotSamplingEnsemble:
         else:
             raise ValueError(f"Неизвестный метод ансамблирования: {self.ensemble_method}")
 
-class FedotImplementation(FedotSamplingEnsemble):
+class SingleModelImplementation(SamplingEnsemble):
+    """
+    Класс для обучения одной модели на поддатасете, созданном из партиций
+    """
 
     def __init__(self,
                  problem: str,
                  partitioner_config: Dict[str, Any] = None,
-                 fedot_config: Dict[str, Any] = None):
+                 model_class: Optional[Callable] = None,
+                 model_params: Dict[str, Any] = None):
 
-        self.problem = problem
-        self.partitioner_config = partitioner_config or {
-            'strategy': 'feature_clustering',
-            'n_clusters': 3,
-            'method': 'kmeans'
-        }
-        self.fedot_config = fedot_config or {
-            'timeout': 10,
-            'preset': 'best_quality',
-            'cv_folds': 3
-        }
-        self.bs_size = 1000
+        super().__init__(problem, partitioner_config, model_class, model_params)
         self.model = None
 
-    def train_model(self, X_train, y_train, X_val, y_val, class_samples, data_percent: float = 0.3):
+    def train_model(self, X_train, y_train, X_val, y_val, class_samples=None,
+                   data_percent: float = 0.3, validation_metric: str = None):
+        """
+        Обучает одну модель на подвыборке из партиций
+
+        Args:
+            X_train: обучающие признаки
+            y_train: обучающие метки
+            X_val: валидационные признаки
+            y_val: валидационные метки
+            class_samples: представители классов (для классификации)
+            data_percent: процент данных для выборки из каждой партиции
+            validation_metric: метрика для валидации
+        """
         partitions = self.prepare_data_partitions(X_train, y_train)
-        task, init_assumption = self._define_fedot_setup()
-        if 'metric' in self.fedot_config:
-            validation_metric = self.fedot_config['metric']
-            if validation_metric == 'f1':
-                validation_metric = 'f1_weighted'
-        else:
+
+        if validation_metric is None:
             validation_metric = 'f1_weighted' if self.problem == 'classification' else 'rmse'
+        elif validation_metric == 'f1':
+            validation_metric = 'f1_weighted'
+
         metric_is_better = get_metric_comparator(validation_metric)
 
         all_features = []
@@ -411,12 +413,11 @@ class FedotImplementation(FedotSamplingEnsemble):
         data = np.concatenate(all_features, axis=0)
         target = np.concatenate(all_targets, axis=0)
 
-        self.model = Fedot(problem=self.problem,
-                           task_params=task.task_params,
-                           initial_assumption=init_assumption,
-                           **self.fedot_config)
-        self.model.fit(features=data, target=target)
+        # Создаем и обучаем модель
+        self.model = self._create_model_instance()
+        self.model.fit(data, target)
 
+        # Валидация
         predict_labels, predict_proba = self._run_inference(self.model, X_val, calculation_mode='non-batch')
         metrics = calculate_metrics(y_true=y_val,
                                     problem_type=self.problem,
@@ -424,13 +425,11 @@ class FedotImplementation(FedotSamplingEnsemble):
                                     y_proba=None
                                     )
         print(f"Валидационные метрики - {metrics}")
-        validation_result = calculate_metrics(
-            y_true=y_val, y_labels=predict_labels, y_proba=predict_proba, problem_type=self.problem
-        )[validation_metric]
-        print(f"Валидационная метрика - {validation_result}")
-
+        validation_result = metrics[validation_metric]
+        print(f"Валидационная метрика ({validation_metric}) - {validation_result}")
 
     def predict(self, features: pd.DataFrame) -> np.ndarray:
+        """Предсказание на новых данных"""
         if not self.model:
             raise ValueError("Модель не обучена. Сначала вызовите train_model()")
 
