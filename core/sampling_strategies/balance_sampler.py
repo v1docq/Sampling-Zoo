@@ -1,8 +1,9 @@
 import numpy as np
 import pandas as pd
-from typing import Dict, Any, Union
+from typing import Dict, Union, Optional
 from sklearn.model_selection import StratifiedKFold
 from .base_sampler import BaseSampler, HierarchicalStratifiedMixin
+from ..utils.utils import to_dataframe, to_series
 from ..repository.model_repo import SamplingModels
 
 
@@ -30,21 +31,21 @@ class StratifiedBalancedSplitSampler(BaseSampler, HierarchicalStratifiedMixin):
         self.balancer_kwargs = balancer_kwargs if balancer_kwargs is not None else {}
         self.partitions = {}
 
-    def fit(self, data: pd.DataFrame, target: Union[pd.Series, np.ndarray]):
+    def fit(self, data: Union[np.ndarray, pd.DataFrame], target: Union[pd.Series, np.ndarray]):
         """Выполняет разбиение и балансировку."""
 
-        # Определяем, является ли задача классификацией
-        if len(np.unique(target)) < 0.1 * len(target) or target.dtype == 'object':
-            print("Warning: Stratified balancing is intended for classification tasks.")
+        data_df = to_dataframe(data)
+        target_series = to_series(target, index=data_df.index)
 
-        if isinstance(target, np.ndarray):
-            target = pd.Series(target, index=data.index)
+        # Определяем, является ли задача классификацией
+        if target_series.nunique() < 0.1 * len(target_series) or target_series.dtype == 'object':
+            print("Warning: Stratified balancing is intended for classification tasks.")
 
         skf = StratifiedKFold(n_splits=self.n_partitions, shuffle=True, random_state=self.random_state)
 
-        for i, (_, part_idx) in enumerate(skf.split(data, target)):
-            data_chunk = data.iloc[part_idx]
-            target_chunk = target.iloc[part_idx]
+        for i, (_, part_idx) in enumerate(skf.split(data_df, target_series)):
+            data_chunk = data_df.iloc[part_idx]
+            target_chunk = target_series.iloc[part_idx]
 
             if self.balance_method_name:
                 balancer_class = self.BALANCERS[self.balance_method_name]
@@ -70,6 +71,10 @@ class StratifiedBalancedSplitSampler(BaseSampler, HierarchicalStratifiedMixin):
 
         return self
 
-    def get_partitions(self) -> Dict[str, tuple[pd.DataFrame, pd.Series]]:
+    def get_partitions(
+        self,
+        data: Optional[Union[np.ndarray, pd.DataFrame]] = None,
+        target: Optional[Union[np.ndarray, pd.Series]] = None,
+    ) -> Dict[str, tuple[pd.DataFrame, pd.Series]]:
         """Возвращает словарь с чанками, к которым применялся метод балансировки."""
-        return self.partitions
+        return self._get_partitions_default(data=data, target=target)

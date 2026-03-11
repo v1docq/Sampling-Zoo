@@ -1,11 +1,13 @@
 from abc import ABC, abstractmethod
 import logging
 from collections import Counter
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Union, Optional
 
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import StratifiedShuffleSplit
+
+from ..utils.utils import safe_index
 
 
 class BaseSampler(ABC):
@@ -15,10 +17,15 @@ class BaseSampler(ABC):
 
     def __init__(self, random_state: int = 42, **kwargs):
         self.random_state = random_state
-        self.partitions_ = None
+        self.partitions = None
 
     @abstractmethod
-    def fit(self, data: Union[np.ndarray, pd.DataFrame], **kwargs) -> 'BaseSampler':
+    def fit(
+        self,
+        data: Union[np.ndarray, pd.DataFrame],
+        target: Optional[Union[np.ndarray, pd.Series]] = None,
+        **kwargs,
+    ) -> 'BaseSampler':
         """
         Обучение семплера на данных
 
@@ -32,7 +39,11 @@ class BaseSampler(ABC):
         pass
 
     @abstractmethod
-    def get_partitions(self) -> Dict[Any, np.ndarray]:
+    def get_partitions(
+        self,
+        data: Optional[Union[np.ndarray, pd.DataFrame]] = None,
+        target: Optional[Union[np.ndarray, pd.Series]] = None,
+    ) -> Dict[Any, Any]:
         """
         Возвращает индексы разделов
 
@@ -51,16 +62,15 @@ class BaseSampler(ABC):
         Returns:
             Dict с разделенными данными
         """
-        partitions_indices = self.get_partitions()
-        result = {}
+        partitions = self.get_partitions(data=data)
+        if not partitions:
+            return {}
 
-        for partition_name, indices in partitions_indices.items():
-            if isinstance(data, pd.DataFrame):
-                result[partition_name] = data.iloc[indices]
-            else:
-                result[partition_name] = data[indices]
+        sample_value = next(iter(partitions.values()))
+        if isinstance(sample_value, dict) and 'feature' in sample_value:
+            return {name: chunk['feature'] for name, chunk in partitions.items()}
 
-        return result
+        return partitions
 
     def fit_transform(self, data: Union[np.ndarray, pd.DataFrame], **kwargs) -> Dict[
         Any, Union[np.ndarray, pd.DataFrame]]:
@@ -72,6 +82,42 @@ class BaseSampler(ABC):
 
     def check_partitions(self, partitions, data):
         pass
+
+    @staticmethod
+    def _partitions_contain_data(partitions: Dict[Any, Any]) -> bool:
+        if not isinstance(partitions, dict) or not partitions:
+            return False
+        sample = next(iter(partitions.values()))
+        return isinstance(sample, dict) and ('feature' in sample or 'target' in sample)
+
+    def _build_feature_target_partitions(
+        self,
+        data: Union[np.ndarray, pd.DataFrame],
+        target: Optional[Union[np.ndarray, pd.Series]] = None,
+    ) -> Dict[Any, Dict[str, Any]]:
+        result = {}
+        for partition_name, indices in self.partitions.items():
+            chunk = {'feature': safe_index(data, indices)}
+            if target is not None:
+                chunk['target'] = safe_index(target, indices)
+            result[partition_name] = chunk
+        return result
+
+    def _get_partitions_default(
+        self,
+        data: Optional[Union[np.ndarray, pd.DataFrame]] = None,
+        target: Optional[Union[np.ndarray, pd.Series]] = None,
+    ) -> Dict[Any, Any]:
+        if self.partitions is None:
+            raise ValueError("Sampler not fitted. Call fit() first.")
+
+        if self._partitions_contain_data(self.partitions):
+            return self.partitions
+
+        if data is None:
+            return self.partitions
+
+        return self._build_feature_target_partitions(data, target)
 
 
 class HierarchicalStratifiedMixin:

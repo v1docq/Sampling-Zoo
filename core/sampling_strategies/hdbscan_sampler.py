@@ -4,12 +4,12 @@ try:
     import hdbscan
 except Exception:  # pragma: no cover - optional dependency
     hdbscan = None
-from typing import Dict, Any, Union
+from typing import Dict, Any, Union, Optional
 from collections import defaultdict
 from sklearn.cluster import KMeans
 
 from .base_sampler import BaseSampler
-# from ..repository.model_repo import SupportingModels
+from ..utils.utils import to_numpy
 
 class HDBScanSampler(BaseSampler):
     """
@@ -29,7 +29,7 @@ class HDBScanSampler(BaseSampler):
                  all_points = True, 
                  random_state: int = 42
                  ):
-        
+        BaseSampler.__init__(self, random_state=random_state)
         self.min_cluster_size = min_cluster_size
         self.random_state = random_state
         self.clusterer = hdbscan.HDBSCAN(min_cluster_size, prediction_data=True) if hdbscan is not None else None
@@ -41,10 +41,10 @@ class HDBScanSampler(BaseSampler):
         if one_cluster == False and prob_threshold == None:
             raise ValueError("Для режима one_cluster=False необходимо задать prob_threshold")
 
-    def fit(self, X: pd.DataFrame, y: pd.Series):
+    def fit(self, X: Union[np.ndarray, pd.DataFrame], target: Optional[Union[np.ndarray, pd.Series]] = None):
         
         # Преобразуем данные в numpy array, если это необходимо
-        X = X.values if isinstance(X, pd.DataFrame) else np.asarray(X)
+        X = to_numpy(X)
 
         temp_partitions = defaultdict(list)
 
@@ -95,7 +95,7 @@ class HDBScanSampler(BaseSampler):
         
         return self
     
-    def predict_partitions(self, X: pd.DataFrame or np.ndarray):
+    def predict_partitions(self, X: Union[np.ndarray, pd.DataFrame]):
         """
         Определяет принадлежность новых точек к кластерам.
 
@@ -109,7 +109,7 @@ class HDBScanSampler(BaseSampler):
                 List[np.ndarray] длиной N_samples, где каждый элемент — массив ID кластеров.
         """
 
-        X_values = X.values if isinstance(X, pd.DataFrame) else np.asarray(X)
+        X_values = to_numpy(X)
         
         # Защита от подачи одномерного массива (одной точки)
         X_values = np.atleast_2d(X_values)
@@ -142,7 +142,9 @@ class HDBScanSampler(BaseSampler):
             
             return result
 
-    def get_partitions(self, data, target) -> Dict[Any, np.ndarray]:
-        partition = {cluster: dict(feature=data.iloc[idx],
-                                   target=target[idx]) for cluster, idx in self.partitions.items()}
-        return partition
+    def get_partitions(
+        self,
+        data: Union[np.ndarray, pd.DataFrame],
+        target: Union[np.ndarray, pd.Series],
+    ) -> Dict[Any, np.ndarray]:
+        return self._get_partitions_default(data=data, target=target)

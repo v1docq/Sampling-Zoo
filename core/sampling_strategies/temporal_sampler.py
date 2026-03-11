@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from typing import Dict, Any, Union
+from typing import Dict, Any
 from .base_sampler import BaseSampler, HierarchicalStratifiedMixin
 
 
@@ -13,7 +13,7 @@ class TemporalSplitSampler(BaseSampler, HierarchicalStratifiedMixin):
         BaseSampler.__init__(self, random_state=random_state)
         HierarchicalStratifiedMixin.__init__(
             self,
-            n_splits=n_splits,
+            n_partitions=n_splits,
             random_state=random_state,
             logger_name="TemporalSplitSampler",
         )
@@ -31,8 +31,8 @@ class TemporalSplitSampler(BaseSampler, HierarchicalStratifiedMixin):
                            'sliding_window': self._sliding_window_split,
                            'seasonal': self._seasonal_split}
 
-    def fit(self, data: pd.DataFrame, time_column: str = 'timestamp', series_id_column: str = 'series_id',
-            **kwargs) -> 'TemporalSplitSampler':
+    def fit(self, data: pd.DataFrame, time_column: str = 'timestamp',
+            series_id_column: str = 'series_id', **kwargs) -> 'TemporalSplitSampler':
         """
         Args:
             data: DataFrame с временными рядами
@@ -85,7 +85,7 @@ class TemporalSplitSampler(BaseSampler, HierarchicalStratifiedMixin):
         season_val = {season:data[data['seasonal_component'] == season].index.values for season in seasonal_values}
         return season_val
 
-    def get_partitions(self, data) -> Dict[Any, np.ndarray]:
+    def get_partitions(self, data: pd.DataFrame) -> Dict[Any, np.ndarray]:
         unique_series = data[self.series_id_column].unique()
         partition = {series_id: {k: data.iloc[self.partitions[series_id][k]] for k in self.partitions[series_id]}
                      for series_id in unique_series}

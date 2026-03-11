@@ -1,9 +1,10 @@
 import numpy as np
 import pandas as pd
-from typing import Dict, Any, Union
+from typing import Dict, Any, Union, Optional
 
 
 from .base_sampler import BaseSampler, HierarchicalStratifiedMixin
+from ..utils.utils import to_dataframe
 
 
 class RandomSplitSampler(BaseSampler, HierarchicalStratifiedMixin):
@@ -14,20 +15,25 @@ class RandomSplitSampler(BaseSampler, HierarchicalStratifiedMixin):
         BaseSampler.__init__(self, random_state=random_state)
         HierarchicalStratifiedMixin.__init__(
             self,
-            n_splits=n_partitions,
+            n_partitions=n_partitions,
             random_state=random_state,
             logger_name="RandomSplitSampler",
         )
         self.n_partitions = n_partitions
         self.partitions = {}
 
-    def fit(self, data: pd.DataFrame, target: np.ndarray = None):
+    def fit(
+        self,
+        data: Union[np.ndarray, pd.DataFrame],
+        target: Optional[Union[pd.Series, np.ndarray]] = None,
+    ):
         """
         Args:
             data: Матрица признаков или сырые данные
             target: Целевая переменная (опционально)
         """
-        indices = np.arange(len(data))
+        data_df = to_dataframe(data)
+        indices = np.arange(len(data_df))
         rng = np.random.default_rng(self.random_state)
         rng.shuffle(indices)
         partitions = np.array_split(indices, self.n_partitions)
@@ -37,7 +43,9 @@ class RandomSplitSampler(BaseSampler, HierarchicalStratifiedMixin):
 
         return self
 
-    def get_partitions(self, data, target) -> Dict[Any, np.ndarray]:
-        partition = {cluster: dict(feature=data.iloc[idx],
-                                   target=target[idx]) for cluster, idx in self.partitions.items()}
-        return partition
+    def get_partitions(
+        self,
+        data: Union[np.ndarray, pd.DataFrame],
+        target: Union[np.ndarray, pd.Series],
+    ) -> Dict[Any, np.ndarray]:
+        return self._get_partitions_default(data=data, target=target)

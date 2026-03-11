@@ -1,12 +1,13 @@
 import numpy as np
 import pandas as pd
-from typing import Dict, Any, Union
+from typing import Dict, Any, Union, Optional
 
 from sklearn.manifold import TSNE
+from sklearn.cluster import KMeans
 
 from .base_sampler import BaseSampler, HierarchicalStratifiedMixin
 from ..repository.model_repo import SupportingModels
-from ..utils.utils import safe_index
+from ..utils.utils import to_dataframe, to_numpy
 
 CLUSTERING_MODELS = SupportingModels.clustering_models.value
 class FeatureBasedClusteringSampler(BaseSampler, HierarchicalStratifiedMixin):
@@ -33,22 +34,23 @@ class FeatureBasedClusteringSampler(BaseSampler, HierarchicalStratifiedMixin):
         self.clustering_params = kwargs
 
     def fit(self, data: Union[np.ndarray, pd.DataFrame],
-            target: np.ndarray = None, **kwargs) -> 'FeatureBasedClusteringSampler':
+            target: Optional[Union[pd.Series, np.ndarray]] = None, **kwargs) -> 'FeatureBasedClusteringSampler':
         """
         Args:
             data: Матрица признаков или сырые данные
             target: Целевая переменная (опционально)
         """
         # Извлечение признаков если необходимо
-        if self.feature_engineering == 'auto' and isinstance(data, pd.DataFrame):
-            features = self._auto_feature_engineering(data)
+        data_df = to_dataframe(data)
+        if self.feature_engineering == 'auto':
+            features = self._auto_feature_engineering(data_df)
         else:
             features = data
 
         # Масштабирование признаков
-        if isinstance(features, pd.DataFrame):
-            features = features.select_dtypes(include=[np.number])
-            features = features.fillna(features.mean())
+        features = features.select_dtypes(include=[np.number])
+        features = features.fillna(features.mean())
+        features = to_numpy(features)
 
         features_scaled = self.scaler.fit_transform(features)
 
@@ -61,7 +63,7 @@ class FeatureBasedClusteringSampler(BaseSampler, HierarchicalStratifiedMixin):
         cluster_labels = self.clusterer.fit_predict(features_scaled)
 
         # Создание разделов
-        self.partitions_ = {}
+        self.partitions = {}
         unique_clusters = np.unique(cluster_labels)
 
         for cluster_id in unique_clusters:
@@ -88,10 +90,12 @@ class FeatureBasedClusteringSampler(BaseSampler, HierarchicalStratifiedMixin):
 
         return numeric_data
 
-    def get_partitions(self, data, target) -> Dict[Any, np.ndarray]:
-        partition = {cluster: dict(feature=safe_index(data, idx),
-                                   target=safe_index(target, idx)) for cluster, idx in self.partitions.items()}
-        return partition
+    def get_partitions(
+        self,
+        data: Union[np.ndarray, pd.DataFrame],
+        target: Union[np.ndarray, pd.Series],
+    ) -> Dict[Any, np.ndarray]:
+        return self._get_partitions_default(data=data, target=target)
 
 
 class TSNEClusteringSampler(FeatureBasedClusteringSampler):
@@ -113,9 +117,9 @@ class TSNEClusteringSampler(FeatureBasedClusteringSampler):
         self.clusterer = KMeans(n_clusters=self.n_clusters, random_state=self.random_state)
         cluster_labels = self.clusterer.fit_predict(tsne_features)
 
-        self.partitions_ = {}
+        self.partitions = {}
         for cluster_id in np.unique(cluster_labels):
             cluster_indices = np.where(cluster_labels == cluster_id)[0]
-            self.partitions_[f'tsne_cluster_{cluster_id}'] = cluster_indices
+            self.partitions[f'tsne_cluster_{cluster_id}'] = cluster_indices
 
         return self

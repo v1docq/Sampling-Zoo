@@ -1,12 +1,10 @@
 import numpy as np
 import pandas as pd
-from typing import Dict, Any, Union
-from collections import defaultdict
-from scipy.spatial import Voronoi
+from typing import Dict, Any, Union, Optional
 from sklearn.cluster import KMeans
-from scipy.spatial.distance import cdist
 
 from .base_sampler import BaseSampler
+from ..utils.utils import to_numpy
 
 class VoronoiSampler(BaseSampler):
     '''
@@ -16,7 +14,7 @@ class VoronoiSampler(BaseSampler):
 
     '''
     def __init__(self, n_partitions: int = 10, random_state: int = 42, emptiness_threshold: float = 0.01):
-        
+        BaseSampler.__init__(self, random_state=random_state)
         self.random_state = random_state
         self.rng = np.random.default_rng(self.random_state)
         self.n_partitions = n_partitions
@@ -31,10 +29,10 @@ class VoronoiSampler(BaseSampler):
             n_init='auto'
         )
 
-    def fit(self, X: pd.DataFrame, y: pd.Series = None):
+    def fit(self, X: Union[np.ndarray, pd.DataFrame], target: Optional[Union[np.ndarray, pd.Series]] = None):
 
         # Преобразуем X, сохраняя возможность работы с numpy
-        X = X.values if isinstance(X, pd.DataFrame) else np.asarray(X)
+        X = to_numpy(X)
 
         # Обучение KMeans. labels_ уже содержит принадлежность к ячейкам Вороного
         self.kmeans.fit(X)
@@ -51,7 +49,7 @@ class VoronoiSampler(BaseSampler):
 
         return self
     
-    def predict_partitions(self, X: pd.DataFrame or np.ndarray):
+    def predict_partitions(self, X: Union[np.ndarray, pd.DataFrame]):
         """
         Определяет принадлежность новых точек к кластерам.
 
@@ -62,12 +60,14 @@ class VoronoiSampler(BaseSampler):
             result: np.ndarray длиной N_samples, где каждый элемент - ID кластера для точки.
         """
         # Преобразуем данные в numpy array, если это необходимо
-        X = X.values if isinstance(X, pd.DataFrame) else np.asarray(X)
+        X = to_numpy(X)
 
         # Используем оптимизированный метод predict из sklearn
         return self.kmeans.predict(X)
         
-    def get_partitions(self, data, target) -> Dict[Any, np.ndarray]:
-        partition = {cluster: dict(feature=data.iloc[idx],
-                                   target=target[idx]) for cluster, idx in self.partitions.items()}
-        return partition
+    def get_partitions(
+        self,
+        data: Union[np.ndarray, pd.DataFrame],
+        target: Union[np.ndarray, pd.Series],
+    ) -> Dict[Any, np.ndarray]:
+        return self._get_partitions_default(data=data, target=target)

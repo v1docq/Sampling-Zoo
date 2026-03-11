@@ -7,14 +7,13 @@ from sklearn.cluster import KMeans
 from scipy.spatial.distance import cdist
 
 from sklearn.decomposition import PCA
-from sklearn.manifold import TSNE
 try:
     import umap
 except Exception:  # pragma: no cover - optional dependency
     umap = None
 
 from .base_sampler import BaseSampler
-# from ..repository.model_repo import SupportingModels
+from ..utils.utils import to_numpy
 
 class DelaunaySampler(BaseSampler):
     """
@@ -38,7 +37,7 @@ class DelaunaySampler(BaseSampler):
                  dim_reduction_method: Optional[Literal['pca', 'umap']] = None,
                  dim_reduction_target: int = 2
                  ):
-        
+        BaseSampler.__init__(self, random_state=random_state)
         self.random_state = random_state
         self.rng = np.random.default_rng(self.random_state)
         self.n_partitions = n_partitions
@@ -89,10 +88,10 @@ class DelaunaySampler(BaseSampler):
                 raise RuntimeError("Reducer has not been fitted. Call fit() first.")
             return self.reducer.transform(X)
                 
-    def fit(self, X: pd.DataFrame, y: pd.Series):
+    def fit(self, X: Union[np.ndarray, pd.DataFrame], target: Optional[Union[np.ndarray, pd.Series]] = None):
 
         # Преобразуем данные в numpy array, если это необходимо
-        X = X.values if isinstance(X, pd.DataFrame) else np.asarray(X)
+        X = to_numpy(X)
 
         # Понижение размерности, если необходимо
         X = self.reduce_dimension(X, fit_mode=True)
@@ -154,7 +153,7 @@ class DelaunaySampler(BaseSampler):
         """
         
         # Преобразуем данные в numpy array, если это необходимо
-        X_values = X.values if isinstance(X, pd.DataFrame) else np.asarray(X)
+        X_values = to_numpy(X)
 
         # Понижение размерности, если необходимо
         X_values = self.reduce_dimension(X_values, fit_mode=False)
@@ -259,7 +258,9 @@ class DelaunaySampler(BaseSampler):
             
         return partitions_to_duplicate
     
-    def get_partitions(self, data, target) -> Dict[Any, np.ndarray]:
-        partition = {cluster: dict(feature=data.iloc[idx],
-                                   target=target[idx]) for cluster, idx in self.partitions.items()}
-        return partition
+    def get_partitions(
+        self,
+        data: Union[np.ndarray, pd.DataFrame],
+        target: Union[np.ndarray, pd.Series],
+    ) -> Dict[Any, np.ndarray]:
+        return self._get_partitions_default(data=data, target=target)

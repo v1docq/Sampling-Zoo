@@ -14,14 +14,18 @@ from core.sampling_strategies.stratified_sampler import (
 from core.sampling_strategies.balance_sampler import StratifiedBalancedSplitSampler
 from core.sampling_strategies.spectral.spectral_leverage import SpectralLeverageSampler
 from core.sampling_strategies.spectral.tensor_energy import TensorEnergySampler
+from core.sampling_strategies.delaunay_sempler import DelaunaySampler
+from core.sampling_strategies.hdbscan_sampler import HDBScanSampler
+from core.sampling_strategies.voronoi_sampler import VoronoiSampler
+from core.sampling_strategies.kernel_sampler import KernelSampler
 
 class SamplingStrategyFactory:
     """
     Фабрика для создания стратегий семплирования
     """
     def __init__(self):
-        self.strategy_map = {
-
+        # CHUNKING SAMPLERS
+        self.chunking_strategies = {
             # Random split
             'random': RandomSplitSampler,
             'random_split': RandomSplitSampler,
@@ -35,10 +39,6 @@ class SamplingStrategyFactory:
             'temporal_split': TemporalSplitSampler,
             'temporal': TemporalSplitSampler,
 
-            # Feature-based strategies
-            'feature_clustering': FeatureBasedClusteringSampler,
-            'tsne_clustering': TSNEClusteringSampler,
-
             # Difficulty-based strategies
             'difficulty': DifficultyBasedSampler,
             'uncertainty': UncertaintySampler,
@@ -46,10 +46,22 @@ class SamplingStrategyFactory:
             # Class balance strategies
             'balance': StratifiedBalancedSplitSampler,
 
-            # Spectral strategies
-            'spectral_leverage': SpectralLeverageSampler,
-            'tensor_energy': TensorEnergySampler
+            # Clustering-based strategies
+            'feature_clustering': FeatureBasedClusteringSampler,
+            'tsne_clustering': TSNEClusteringSampler,
+            'delaunay': DelaunaySampler,
+            'hdbscan': HDBScanSampler,
+            'voronoi': VoronoiSampler,
         }
+
+        # SUBSET SAMPLERS
+        self.subset_strategies = {
+            'spectral_leverage': SpectralLeverageSampler,
+            'tensor_energy': TensorEnergySampler,
+            'kernel': KernelSampler,
+        }
+
+        self.strategy_map = {**self.chunking_strategies, **self.subset_strategies}
 
     def create_strategy(self, strategy_type: str, **kwargs) -> BaseSampler:
         """
@@ -92,25 +104,25 @@ class SamplingStrategyFactory:
         strategy = self.create_and_fit(strategy_type, data, target, strategy_kwargs, fit_kwargs)
         return strategy.get_partitions(data, target) if target is not None else strategy.get_partitions()
 
-    @staticmethod
-    def get_available_strategies() -> List[str]:
+    def get_available_strategies(self) -> List[str]:
         """Возвращает список доступных стратегий"""
-        return sorted([
-            'advanced_stratified',
-            'balance',
-            'difficulty',
-            'feature_clustering',
-            'random',
-            'random_split',
-            'regression_stratified',
-            'stratified',
-            'temporal',
-            'temporal_split',
-            'spectral_leverage',
-            'tensor_energy',
-            'tsne_clustering',
-            'uncertainty',
-        ])
+        return sorted(list(self.strategy_map.keys()))
+
+    def get_chunking_strategies(self) -> List[str]:
+        """Возвращает список чанковых стратегий"""
+        return sorted(list(self.chunking_strategies.keys()))
+
+    def get_subset_strategies(self) -> List[str]:
+        """Возвращает список subset стратегий"""
+        return sorted(list(self.subset_strategies.keys()))
+
+    def is_chunking_strategy(self, strategy_type: str) -> bool:
+        """Проверяет, является ли стратегия чанковой"""
+        return strategy_type in self.chunking_strategies
+
+    def is_subset_strategy(self, strategy_type: str) -> bool:
+        """Проверяет, является ли стратегия subset"""
+        return strategy_type in self.subset_strategies
 
 class AdaptiveSampler:
     """

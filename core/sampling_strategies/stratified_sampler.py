@@ -10,6 +10,7 @@ from sklearn.preprocessing import KBinsDiscretizer, OneHotEncoder
 from sklearn.utils import check_random_state
 
 from .base_sampler import BaseSampler, HierarchicalStratifiedMixin
+from ..utils.utils import to_dataframe, to_series, to_numpy
 
 
 class StratifiedSplitSampler(BaseSampler, HierarchicalStratifiedMixin):
@@ -29,13 +30,21 @@ class StratifiedSplitSampler(BaseSampler, HierarchicalStratifiedMixin):
         self.uniqueness_threshold = uniqueness_threshold
         self.partitions = {}
 
-    def fit(self, data: pd.DataFrame, target: list[str], data_target: list[str] = None):
+    def fit(
+        self,
+        data: Union[np.ndarray, pd.DataFrame],
+        target: list[str],
+        data_target: Union[pd.Series, np.ndarray, pd.DataFrame, list[str]],
+    ):
         """
         Args:
             data: Матрица признаков или сырые данные
             strat_target: Переменные, для которых будет сохранено распределение
-            data_target: Целевая переменная (опционально)
+            data_target: Целевая переменная
         """
+        data = to_dataframe(data)
+        data_target = to_series(data_target, index=data.index)
+
         if len(data_target.shape) >= 2:
             mskf = MultilabelStratifiedKFold(n_splits=self.n_partitions, shuffle=True, random_state=self.random_state)
             # Кодируем целевой признак для классификации
@@ -55,7 +64,10 @@ class StratifiedSplitSampler(BaseSampler, HierarchicalStratifiedMixin):
             multilabel = pd.get_dummies(processed_data)
             split_iteration = mskf.split(multilabel.values, data_target.values)
         else:
-            stratified_sampler = AdvancedStratifiedSampler(n_splits=self.n_partitions, random_state=self.random_state)
+            stratified_sampler = AdvancedStratifiedSampler(
+                n_partitions=self.n_partitions,
+                random_state=self.random_state,
+            )
             stratified_sampler.fit(data, data_target.values)
             split_iteration = stratified_sampler.get_partitions()
 
@@ -65,10 +77,12 @@ class StratifiedSplitSampler(BaseSampler, HierarchicalStratifiedMixin):
 
         return self
 
-    def get_partitions(self, data, target) -> Dict[Any, np.ndarray]:
-        partition = {cluster: dict(feature=data.iloc[idx],
-                                   target=target.iloc[idx]) for cluster, idx in self.partitions.items()}
-        return partition
+    def get_partitions(
+        self,
+        data: Union[np.ndarray, pd.DataFrame],
+        target: Union[np.ndarray, pd.Series],
+    ) -> Dict[Any, np.ndarray]:
+        return self._get_partitions_default(data=data, target=target)
 
     def check_partitions(self, partitions, data):
         print("Partition statistics:")
@@ -98,13 +112,21 @@ class AdvancedStratifiedSampler(BaseSampler, HierarchicalStratifiedMixin):
         HierarchicalStratifiedMixin.__init__(self, n_partitions=n_partitions, random_state=random_state)
         self.partitions = {}
 
-    def fit(self, data: pd.DataFrame, target: Union[pd.Series, np.ndarray], min_samples_per_class: int = 2):
-        folds = self.hierarchical_stratified_split(data, np.asarray(target), min_samples_per_class)
+    def fit(self, data: Union[np.ndarray, pd.DataFrame], target: Union[pd.Series, np.ndarray],
+            min_samples_per_class: int = 2):
+        data = to_dataframe(data)
+        target = to_numpy(target)
+        folds = self.hierarchical_stratified_split(data, target, min_samples_per_class)
         self.partitions = {f'chunk_{i}': fold_indices for i, fold_indices in enumerate(folds)}
         return self
 
-    def get_partitions(self) -> Dict[str, np.ndarray]:
-        return self.partitions
+    def get_partitions(
+        self,
+        data: Optional[Union[np.ndarray, pd.DataFrame]] = None,
+        target: Optional[Union[np.ndarray, pd.Series]] = None,
+    ) -> Dict[str, np.ndarray]:
+        return self._get_partitions_default(data=data, target=target)
+
 
     def get_fold_statistics(self, folds: List[np.ndarray], y: np.ndarray) -> pd.DataFrame:
         stats = []
@@ -150,13 +172,13 @@ class RegressionStratifiedSampler(BaseSampler, HierarchicalStratifiedMixin):
         self.encode = encode
         self.strategy = strategy
         self.use_advanced = use_advanced
-        self.partitions_: Dict[str, np.ndarray] = {}
+        self.partitions: Dict[str, np.ndarray] = {}
         self.bin_edges_: Optional[np.ndarray] = None
         self.binned_target_: Optional[np.ndarray] = None
         self.discretizer_: Optional[KBinsDiscretizer] = None
 
     def _discretize_target(self, target: Union[pd.Series, np.ndarray]) -> np.ndarray:
-        target_series = pd.Series(target)
+        target_series = to_series(target)
 
         if self.strategy == "quantile":
             binned, bin_edges = pd.qcut(
@@ -191,8 +213,9 @@ class RegressionStratifiedSampler(BaseSampler, HierarchicalStratifiedMixin):
         self.discretizer_ = discretizer
         return binned_target.astype(int)
 
-    def fit(self, data: pd.DataFrame, data_target: Union[pd.Series, np.ndarray], target=None):
-        discrete_target = self._discretize_target(data_target)
+    def fit(self, data: Union[np.ndarray, pd.DataFrame], data_target: Union[pd.Series, np.ndarray], target=None):
+        data = to_dataframe(data)
+        discrete_target = self._discretize_target(to_series(data_target, index=data.index))
         self.binned_target_ = discrete_target
 
         if self.use_advanced:
@@ -211,10 +234,12 @@ class RegressionStratifiedSampler(BaseSampler, HierarchicalStratifiedMixin):
 
         return self
 
-    def get_partitions(self, data, target) -> Dict[str, np.ndarray]:
-        partition = {cluster: dict(feature=data.iloc[idx],
-                                   target=target.iloc[idx]) for cluster, idx in self.partitions.items()}
-        return partition
+    def get_partitions(
+        self,
+        data: Union[np.ndarray, pd.DataFrame],
+        target: Union[np.ndarray, pd.Series],
+    ) -> Dict[str, np.ndarray]:
+        return self._get_partitions_default(data=data, target=target)
 
 
 
@@ -233,9 +258,15 @@ class RegressionStratifiedBinning(BaseSampler, HierarchicalStratifiedMixin):
         self.bin_edges_: Optional[np.ndarray] = None
         self.binned_target_: Optional[np.ndarray] = None
 
-    def fit(self, data: pd.DataFrame, data_target: Union[pd.Series, np.ndarray], min_samples_per_class: int = 1,
-            target=None):
-        y = np.asarray(data_target, dtype=float)
+    def fit(
+        self,
+        data: Union[np.ndarray, pd.DataFrame],
+        data_target: Union[pd.Series, np.ndarray],
+        min_samples_per_class: int = 1,
+        target=None,
+    ):
+        data = to_dataframe(data)
+        y = to_numpy(data_target)
         if y.ndim != 1:
             y = y.reshape(-1)
 
@@ -327,7 +358,9 @@ class RegressionStratifiedBinning(BaseSampler, HierarchicalStratifiedMixin):
 
         return merged_labels, np.array(merged_edges)
 
-    def get_partitions(self, data, target) -> Dict[str, np.ndarray]:
-        partition = {cluster: dict(feature=data.iloc[idx],
-                                   target=target.iloc[idx]) for cluster, idx in self.partitions.items()}
-        return partition
+    def get_partitions(
+        self,
+        data: Optional[Union[np.ndarray, pd.DataFrame]] = None,
+        target: Optional[Union[np.ndarray, pd.Series]] = None,
+    ) -> Dict[str, np.ndarray]:
+        return self._get_partitions_default(data=data, target=target)

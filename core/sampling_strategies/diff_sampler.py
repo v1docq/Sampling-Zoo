@@ -3,12 +3,11 @@ import pandas as pd
 import math
 
 from sklearn.model_selection import cross_val_predict
-from sklearn.metrics import accuracy_score, mean_squared_error
 from sklearn.preprocessing import OneHotEncoder, LabelEncoder
-from typing import Dict, Any, Union, Callable
+from typing import Dict, Any, Union
 from .base_sampler import BaseSampler, HierarchicalStratifiedMixin
 from ..repository.model_repo import SupportingModels
-from ..utils.utils import safe_index
+from ..utils.utils import to_dataframe, to_numpy
 
 
 class DifficultyBasedSampler(BaseSampler, HierarchicalStratifiedMixin):
@@ -34,12 +33,21 @@ class DifficultyBasedSampler(BaseSampler, HierarchicalStratifiedMixin):
         self.difficulty_scores_ = None
         self.n_partitions = n_partitions
 
-    def fit(self, data, target, problem=None, model=None, chunks_percent=100, **kwargs):
+    def fit(
+        self,
+        data: Union[np.ndarray, pd.DataFrame],
+        target: Union[pd.Series, np.ndarray],
+        problem=None,
+        model=None,
+        chunks_percent=100,
+        **kwargs,
+    ):
         """
         Args:
             data: Признаки
             target: Целевая переменная
         """
+        target = to_numpy(target)
         if problem is None:
             problem = 'classification' if self._is_classification(target) else 'regression'
         # Выбор базовой модели
@@ -186,10 +194,7 @@ class DifficultyBasedSampler(BaseSampler, HierarchicalStratifiedMixin):
 
     @staticmethod
     def _encode_categorical(data: Union[np.ndarray, pd.DataFrame], encoding_type: str = "label"):
-        if isinstance(data, np.ndarray):
-            df = pd.DataFrame(data)
-        else:
-            df = data.copy()
+        df = to_dataframe(data).copy()
 
         categorical_columns = df.select_dtypes(include=["object", "category"]).columns.tolist()
 
@@ -248,13 +253,12 @@ class DifficultyBasedSampler(BaseSampler, HierarchicalStratifiedMixin):
         """Возвращает вычисленные оценки сложности"""
         return self.difficulty_scores_
 
-    def get_partitions(self, data, target) -> Dict[Any, np.ndarray]:
-        partition = {
-            cluster: dict(feature=safe_index(data, idx),
-                          target=safe_index(target, idx))
-            for cluster, idx in self.partitions.items()
-        }
-        return partition
+    def get_partitions(
+        self,
+        data: Union[np.ndarray, pd.DataFrame],
+        target: Union[np.ndarray, pd.Series],
+    ) -> Dict[Any, np.ndarray]:
+        return self._get_partitions_default(data=data, target=target)
 
 class UncertaintySampler(DifficultyBasedSampler):
     """
@@ -268,8 +272,15 @@ class UncertaintySampler(DifficultyBasedSampler):
         self.model = None
         self.n_partitions = n_partitions
 
-    def fit(self, data: Union[np.ndarray, pd.DataFrame],
-            target: np.ndarray, problem: str = None, model=None, **kwargs) -> 'UncertaintySampler':
+    def fit(
+        self,
+        data: Union[np.ndarray, pd.DataFrame],
+        target: Union[pd.Series, np.ndarray],
+        problem: str = None,
+        model=None,
+        **kwargs,
+    ) -> 'UncertaintySampler':
+        target = to_numpy(target)
         if problem is None:
             problem = 'classification' if self._is_classification(target) else 'regression'
         # Выбор базовой модели
@@ -301,10 +312,12 @@ class UncertaintySampler(DifficultyBasedSampler):
             
         return self
     
-    def get_partitions(self, data, target) -> Dict[Any, np.ndarray]:
-        partition = {cluster: dict(feature=data.iloc[idx],
-                                   target=target[idx]) for cluster, idx in self.partitions.items()}
-        return partition
+    def get_partitions(
+        self,
+        data: Union[np.ndarray, pd.DataFrame],
+        target: Union[np.ndarray, pd.Series],
+    ) -> Dict[Any, np.ndarray]:
+        return self._get_partitions_default(data=data, target=target)
     
     def get_uncertainty_scores(self) -> np.ndarray:
         return self.uncertainty_scores_
