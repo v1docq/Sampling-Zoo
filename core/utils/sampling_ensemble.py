@@ -60,22 +60,31 @@ class SamplingEnsemble:
         try:
             # Создаем стратегию семплирования
             factory = SamplingStrategyFactory()
+            strategy_kwargs = {
+                'n_partitions': self.partitioner_config['n_partitions'],
+                'random_state': random_state,
+            }
+            if self.partitioner_config['strategy'] in ['difficulty', 'uncertainty']:
+                strategy_kwargs.update({
+                    'problem': self.problem,
+                    'model': (
+                        LGBMClassifier(n_estimators=50, n_jobs=-1)
+                        if self.problem == 'classification'
+                        else LGBMRegressor(n_estimators=50, n_jobs=-1)
+                    ),
+                    'chunks_percent': self.partitioner_config['chunks_percent'],
+                })
+
             partitioner = factory.create_strategy(
                 strategy_type=self.partitioner_config['strategy'],
-                n_partitions=self.partitioner_config['n_partitions'],
-                random_state=random_state
+                **strategy_kwargs,
             )
 
             # Применяем семплирование
             if self.partitioner_config['strategy'] in ['difficulty', 'uncertainty']:
-                difficulty_model_class = LGBMClassifier if self.problem == 'classification' else LGBMRegressor
-                difficulty_model = difficulty_model_class(n_estimators=50, n_jobs=-1)
                 partitioner.fit(
                     features,
                     target=target,
-                    problem=self.problem,
-                    model=difficulty_model,
-                    chunks_percent=self.partitioner_config['chunks_percent']
                 )
                 self.partitions = partitioner.get_partitions(features, target)
             elif self.partitioner_config['strategy'].__contains__('stratified'):

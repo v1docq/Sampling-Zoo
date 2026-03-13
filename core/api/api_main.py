@@ -28,7 +28,6 @@ class SamplingStrategyFactory:
         self.chunking_strategies = {
             # Random split
             'random': RandomSplitSampler,
-            'random_split': RandomSplitSampler,
 
             # Stratified Sampling
             'stratified': StratifiedSplitSampler,

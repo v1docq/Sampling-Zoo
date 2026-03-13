@@ -10,17 +10,85 @@ from ..repository.model_repo import SupportingModels
 from ..utils.utils import to_dataframe, to_numpy
 
 
-class DifficultyBasedSampler(BaseSampler, HierarchicalStratifiedMixin):
+class ModelBasedSampler:
+    def __init__(
+        self,
+        problem: str = None,
+        model: Any = None,
+        chunks_percent: int = 100,
+    ):
+        self.problem = problem
+        self.model = model
+        self.chunks_percent = chunks_percent
+
+    def _resolve_problem(self, target: np.ndarray) -> str:
+        if self.problem is None:
+            return 'classification' if self._is_classification(target) else 'regression'
+        return self.problem
+
+    def _ensure_model(self, problem: str) -> None:
+        if self.model is None:
+            self._select_model(problem=problem)
+
+    def _select_model(self, problem: str) -> None:
+        model_params = dict(random_state=self.random_state, n_estimators=50)
+        self.model = SupportingModels.difficulty_learner.value[problem](**model_params)
+
+    @staticmethod
+    def _encode_categorical(data: Union[np.ndarray, pd.DataFrame], encoding_type: str = "label"):
+        df = to_dataframe(data).copy()
+
+        categorical_columns = df.select_dtypes(include=["object", "category"]).columns.tolist()
+
+        if encoding_type == "label":
+            for col in categorical_columns:
+                df[col] = LabelEncoder().fit_transform(df[col].astype(str))
+
+            return df
+
+        elif encoding_type == "one-hot":
+            ohe = OneHotEncoder(handle_unknown="ignore", sparse=False)
+            encoded = ohe.fit_transform(df[categorical_columns])
+
+            encoded_df = pd.DataFrame(
+                encoded,
+                columns=ohe.get_feature_names_out(categorical_columns),
+                index=df.index
+            )
+
+            numeric_df = df.drop(columns=categorical_columns)
+            final_df = pd.concat([numeric_df, encoded_df], axis=1)
+
+            return final_df
+
+        else:
+            raise NotImplementedError("encoding_type must be 'label' or 'one-hot'")
+
+    @staticmethod
+    def _is_classification(target: np.ndarray) -> bool:
+        """Определяет тип задачи (классификация или регрессия)"""
+        return len(np.unique(target)) < 0.1 * len(target) or target.dtype == 'object'
+
+
+class DifficultyBasedSampler(BaseSampler, ModelBasedSampler, HierarchicalStratifiedMixin):
     """
     Семплирование на основе сложности примеров
     """
 
     def __init__(self, difficulty_threshold: float = None,
                  difficulty_metric: str = 'auto',
-                 n_partitions: int = 2, model: Any = None,
-                 random_state: int = 42,
-                 **kwargs):
+                 n_partitions: int = 2,
+                 problem: str = None,
+                 model: Any = None,
+                 chunks_percent: int = 100,
+                 random_state: int = 42):
         BaseSampler.__init__(self, random_state=random_state)
+        ModelBasedSampler.__init__(
+            self,
+            problem=problem,
+            model=model,
+            chunks_percent=chunks_percent,
+        )
         HierarchicalStratifiedMixin.__init__(
             self,
             n_partitions=n_partitions,
@@ -29,7 +97,6 @@ class DifficultyBasedSampler(BaseSampler, HierarchicalStratifiedMixin):
         )
         self.difficulty_threshold = difficulty_threshold
         self.difficulty_metric = difficulty_metric
-        self.model = model
         self.difficulty_scores_ = None
         self.n_partitions = n_partitions
 
@@ -37,10 +104,6 @@ class DifficultyBasedSampler(BaseSampler, HierarchicalStratifiedMixin):
         self,
         data: Union[np.ndarray, pd.DataFrame],
         target: Union[pd.Series, np.ndarray],
-        problem=None,
-        model=None,
-        chunks_percent=100,
-        **kwargs,
     ):
         """
         Args:
@@ -48,13 +111,8 @@ class DifficultyBasedSampler(BaseSampler, HierarchicalStratifiedMixin):
             target: Целевая переменная
         """
         target = to_numpy(target)
-        if problem is None:
-            problem = 'classification' if self._is_classification(target) else 'regression'
-        # Выбор базовой модели
-        if model is not None:
-            self.model = model
-        else:
-            self._select_model(problem=problem)
+        problem = self._resolve_problem(target)
+        self._ensure_model(problem)
         # кодируем категориальные признаки, чтобы избежать ошибки модели
         data = self._encode_categorical(data)
 
@@ -63,8 +121,8 @@ class DifficultyBasedSampler(BaseSampler, HierarchicalStratifiedMixin):
 
         sorted_idx = np.argsort(self.difficulty_scores_)
 
-        if chunks_percent < 100:
-            chunks_to_keep = math.ceil(self.n_partitions * chunks_percent / 100)
+        if self.chunks_percent < 100:
+            chunks_to_keep = math.ceil(self.n_partitions * self.chunks_percent / 100)
 
             rows_per_chunk = len(sorted_idx) // self.n_partitions
             total_rows_needed = chunks_to_keep * rows_per_chunk
@@ -187,46 +245,6 @@ class DifficultyBasedSampler(BaseSampler, HierarchicalStratifiedMixin):
                     partitions[f'chunk_{j}'] = np.setdiff1d(partitions[f'chunk_{j}'], moved, assume_unique=True)
         return partitions
 
-    def _select_model(self, problem: str):
-        if self.model is None:
-            model_params = dict(random_state=self.random_state, n_estimators=50)
-            self.model = SupportingModels.difficulty_learner.value[problem](**model_params)
-
-    @staticmethod
-    def _encode_categorical(data: Union[np.ndarray, pd.DataFrame], encoding_type: str = "label"):
-        df = to_dataframe(data).copy()
-
-        categorical_columns = df.select_dtypes(include=["object", "category"]).columns.tolist()
-
-        if encoding_type == "label":
-            for col in categorical_columns:
-                df[col] = LabelEncoder().fit_transform(df[col].astype(str))
-
-            return df
-
-        elif encoding_type == "one-hot":
-            ohe = OneHotEncoder(handle_unknown="ignore", sparse=False)
-            encoded = ohe.fit_transform(df[categorical_columns])
-
-            encoded_df = pd.DataFrame(
-                encoded,
-                columns=ohe.get_feature_names_out(categorical_columns),
-                index=df.index
-            )
-
-            numeric_df = df.drop(columns=categorical_columns)
-            final_df = pd.concat([numeric_df, encoded_df], axis=1)
-
-            return final_df
-
-        else:
-            raise NotImplementedError("encoding_type must be 'label' or 'one-hot'")
-
-    @staticmethod
-    def _is_classification(target: np.ndarray) -> bool:
-        """Определяет тип задачи (классификация или регрессия)"""
-        return len(np.unique(target)) < 0.1 * len(target) or target.dtype == 'object'
-
     def _compute_difficulty_scores(self, data, target: np.ndarray, problem: str) -> np.ndarray:
         """Вычисляет оценку сложности для каждого примера"""
         if problem == 'classification':
@@ -260,34 +278,46 @@ class DifficultyBasedSampler(BaseSampler, HierarchicalStratifiedMixin):
     ) -> Dict[Any, np.ndarray]:
         return self._get_partitions_default(data=data, target=target)
 
-class UncertaintySampler(DifficultyBasedSampler):
+class UncertaintySampler(BaseSampler, ModelBasedSampler, HierarchicalStratifiedMixin):
     """
     Семплирование на основе неопределенности модели
     """
 
-    def __init__(self, uncertainty_threshold: float = None, n_partitions: int = 2, random_state: int = 42, **kwargs):
-        super().__init__(n_partitions=n_partitions, random_state=random_state, **kwargs)
+    def __init__(
+        self,
+        uncertainty_threshold: float = None,
+        n_partitions: int = 2,
+        problem: str = None,
+        model: Any = None,
+        chunks_percent: int = 100,
+        random_state: int = 42,
+    ):
+        BaseSampler.__init__(self, random_state=random_state)
+        ModelBasedSampler.__init__(
+            self,
+            problem=problem,
+            model=model,
+            chunks_percent=chunks_percent
+        )
+        HierarchicalStratifiedMixin.__init__(
+            self,
+            n_partitions=n_partitions,
+            random_state=random_state,
+            logger_name="UncertaintySampler",
+        )
         self.uncertainty_threshold = uncertainty_threshold
         self.uncertainty_scores_ = None
-        self.model = None
         self.n_partitions = n_partitions
 
     def fit(
         self,
         data: Union[np.ndarray, pd.DataFrame],
         target: Union[pd.Series, np.ndarray],
-        problem: str = None,
-        model=None,
-        **kwargs,
     ) -> 'UncertaintySampler':
         target = to_numpy(target)
-        if problem is None:
-            problem = 'classification' if self._is_classification(target) else 'regression'
-        # Выбор базовой модели
-        if model is not None:
-            self.model = model
-        else:
-            self._select_model(problem=problem)
+        problem = self._resolve_problem(target)
+        self._ensure_model(problem)
+        data = self._encode_categorical(data)
 
         # Получаем вероятности через кросс-валидацию
         proba_predictions = cross_val_predict(self.model, data, target, cv=5, method='predict_proba')
