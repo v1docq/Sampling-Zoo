@@ -7,7 +7,6 @@ from sklearn.cluster import KMeans
 
 from .base_sampler import BaseSampler, HierarchicalStratifiedMixin
 from ..repository.model_repo import SupportingModels
-from ..utils.utils import to_dataframe, to_numpy
 
 CLUSTERING_MODELS = SupportingModels.clustering_models.value
 class FeatureBasedClusteringSampler(BaseSampler, HierarchicalStratifiedMixin):
@@ -34,23 +33,23 @@ class FeatureBasedClusteringSampler(BaseSampler, HierarchicalStratifiedMixin):
         self.clustering_params = kwargs
 
     def fit(self, data: Union[np.ndarray, pd.DataFrame],
-            target: Optional[Union[pd.Series, np.ndarray]] = None, **kwargs) -> 'FeatureBasedClusteringSampler':
+            target: np.ndarray = None, **kwargs) -> 'FeatureBasedClusteringSampler':
         """
         Args:
             data: Матрица признаков или сырые данные
             target: Целевая переменная (опционально)
         """
         # Извлечение признаков если необходимо
-        data_df = to_dataframe(data)
-        if self.feature_engineering == 'auto':
-            features = self._auto_feature_engineering(data_df)
+        if self.feature_engineering == 'auto' and isinstance(data, pd.DataFrame):
+            features = self._auto_feature_engineering(data)
         else:
             features = data
 
         # Масштабирование признаков
-        features = features.select_dtypes(include=[np.number])
-        features = features.fillna(features.mean())
-        features = to_numpy(features)
+        if isinstance(features, pd.DataFrame):
+            features = features.apply(pd.to_numeric, errors='ignore')
+            features = features.select_dtypes(include=[np.number])
+            features = features.fillna(features.mean())
 
         features_scaled = self.scaler.fit_transform(features)
 

@@ -14,7 +14,7 @@ def split_with_api(data, strategy: str):
     print("\n=== Factory Pattern Demo ===")
     splitter = SamplingStrategyFactory()
     trained_strategy = splitter.create_and_fit(
-        'temporal_split',
+        'temporal',
         data,
         strategy_kwargs={'n_splits': 3, 'method': strategy},
         fit_kwargs={'time_column': 'timestamp', 'series_id_column': 'series_id'},

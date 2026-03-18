@@ -26,7 +26,7 @@ class SpectralLeverageSampler(SpectralSamplerBase):
         """Обучает семплер на данных X (и y, если предоставлено)"""
     
         # Преобразуем данные в numpy array, если это необходимо
-        X = X.values if isinstance(X, pd.DataFrame) else np.asarray(X)
+        X = X.values.astype(np.float64) if isinstance(X, pd.DataFrame) else np.asarray(X)
     
         self.build_spectral_representation(X)
         self.compute_sampling_scores()

@@ -35,7 +35,6 @@ class SamplingStrategyFactory:
             'regression_stratified': RegressionStratifiedSampler,
 
             # Temporal strategies
-            'temporal_split': TemporalSplitSampler,
             'temporal': TemporalSplitSampler,
 
             # Difficulty-based strategies
@@ -89,19 +88,28 @@ class SamplingStrategyFactory:
         fit_kwargs = fit_kwargs or {}
 
         strategy = self.create_strategy(strategy_type, **strategy_kwargs)
-        if target is None:
+        if self.is_subset_strategy(strategy_type):
             strategy.fit(data, **fit_kwargs)
-        else:
-            strategy.fit(data, target=target, **fit_kwargs)
+            return strategy
+        elif self.is_chunking_strategy(strategy_type):
+            if target is None or "target" in fit_kwargs:
+                strategy.fit(data, **fit_kwargs)
+            else:
+                strategy.fit(data, target=target, **fit_kwargs)
 
         return strategy
 
     def fit_transform(self, strategy_type: str, data: Union[np.ndarray, pd.DataFrame], target: Any = None,
-                      strategy_kwargs: Dict[str, Any] | None = None,
-                      fit_kwargs: Dict[str, Any] | None = None) -> Dict[str, Any]:
-        """Удобный вызов для создания стратегии и получения разбиений."""
+                      strategy_kwargs: Dict[str, Any] | None = None, fit_kwargs: Dict[str, Any] | None = None,
+                      return_strategy: bool = False) -> Any:
+        """Удобный вызов для создания стратегии и получения разбиений или индексов."""
         strategy = self.create_and_fit(strategy_type, data, target, strategy_kwargs, fit_kwargs)
-        return strategy.get_partitions(data, target) if target is not None else strategy.get_partitions()
+
+        if self.is_subset_strategy(strategy_type):
+            return strategy.sample_indices() if not return_strategy else (strategy, strategy.sample_indices())
+        elif self.is_chunking_strategy(strategy_type):
+            partitions = strategy.get_partitions(data, target) if target is not None else strategy.get_partitions()
+            return partitions if not return_strategy else (strategy, partitions)
 
     def get_available_strategies(self) -> List[str]:
         """Возвращает список доступных стратегий"""

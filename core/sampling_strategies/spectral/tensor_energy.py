@@ -59,7 +59,7 @@ class TensorEnergySampler(SpectralSamplerBase):
         """
 
         # Преобразуем данные в numpy array, если это необходимо
-        X = X.values if isinstance(X, pd.DataFrame) else np.asarray(X)
+        X = X.values.astype(np.float64) if isinstance(X, pd.DataFrame) else np.asarray(X)
 
         # Валидация входных данных
         if X.ndim <= max(self.modes):
