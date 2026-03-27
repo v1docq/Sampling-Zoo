@@ -29,9 +29,10 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 try:
-    from lightgbm import LGBMClassifier
+    from lightgbm import LGBMClassifier, LGBMRegressor
 except Exception:  # pragma: no cover - optional
     LGBMClassifier = None
+    LGBMRegressor = None
 
 try:
     import torch
@@ -40,6 +41,14 @@ try:
 except Exception:  # pragma: no cover - optional
     torch = None
 
+try:
+    from tabpfn import TabPFNClassifier, TabPFNRegressor
+    from tabpfn.constants import ModelVersion
+
+    os.environ['HF_TOKEN'] = 'your_hf_token_with_tabpfn_v2.5_access'
+except Exception:  # pragma: no cover - optional
+    TabPFNClassifier = None
+    TabPFNRegressor = None
 
 @dataclass
 class SearchResult:
@@ -154,34 +163,66 @@ def _make_pytorch_classifier(seed: int) -> ClassifierMixin:
     return TorchMLPClassifier()
 
 
-def make_model_pool(seed: int = 42) -> Dict[str, ClassifierMixin]:
-    models: Dict[str, ClassifierMixin] = {
-        "random_forest": RandomForestClassifier(
+
+
+def make_model_pool(
+    seed: int = 42,
+    model_names: Optional[Sequence[str]] = None,
+    problem_type: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Builds model pool for benchmark runners (name -> factory callable)."""
+    available_names = {"random_forest", "lightgbm", "hist_gradient_boosting", "tabpfn"}
+    if model_names is None:
+        requested = {"random_forest", "lightgbm"}
+    else:
+        requested = {name.strip().lower() for name in model_names}
+
+    unknown = requested - available_names
+    if unknown:
+        raise ValueError(f"Unsupported model(s): {sorted(unknown)}")
+
+    model_pool: Dict[str, Any] = {}
+    normalized_problem = problem_type.strip().lower() if problem_type else "classification"
+
+    if "random_forest" in requested:
+        model_pool["random_forest"] = lambda: RandomForestClassifier(
             n_estimators=80,
             max_depth=10,
             min_samples_leaf=2,
             n_jobs=-1,
             random_state=seed,
-        ),
-        #"pytorch_mlp": _make_pytorch_classifier(seed),
-    }
-
-    if LGBMClassifier is not None:
-        models["lightgbm"] = LGBMClassifier(
-            n_estimators=220,
-            learning_rate=0.05,
-            num_leaves=31,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            random_state=seed,
-            verbosity=-1,
         )
-    else:
-        models["hist_gradient_boosting"] = HistGradientBoostingClassifier(
+
+    if "lightgbm" in requested:
+        if normalized_problem == "regression":
+            model_pool["lightgbm"] = lambda: LGBMRegressor(
+                random_state=seed,
+                verbosity=-1,
+            )
+        else:
+            model_pool["lightgbm"] = lambda: LGBMClassifier(
+                random_state=seed,
+                verbosity=-1,
+            )
+
+    if "hist_gradient_boosting" in requested:
+        model_pool["hist_gradient_boosting"] = lambda: HistGradientBoostingClassifier(
             max_depth=8,
             learning_rate=0.06,
             max_iter=250,
             random_state=seed,
         )
 
-    return models
+    if "tabpfn" in requested:
+        if normalized_problem == "classification":
+            model_pool["tabpfn"] = lambda: TabPFNClassifier.create_default_for_version(
+                ModelVersion.V2_5,
+                n_estimators=12,
+            )
+        else:
+            model_pool["tabpfn"] = lambda: TabPFNRegressor.create_default_for_version(
+                ModelVersion.V2_5,
+                n_estimators=12,
+            )
+
+    return model_pool

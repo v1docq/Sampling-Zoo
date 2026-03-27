@@ -1,5 +1,19 @@
 DEFAULT_BUDGET_RATIOS: tuple[float, ...] = (0.01, 0.05, 0.10, 0.20)
 
+ENSEMBLE_CV_FOLDS: int = 3
+ENSEMBLE_N_PARTITIONS: int = 3
+ENSEMBLE_STRATEGIES: tuple[str, ...] = ("difficulty", "random")
+ENSEMBLE_MODELS: tuple[str, ...] = ("tabpfn", "lightgbm")
+AMLB_CUSTOM_CLASSIFICATION_DATASETS: tuple[str, ...] = (
+    "covtype-normalized",
+    "kddcup",
+    "sf-police-incidents",
+)
+AMLB_CUSTOM_REGRESSION_DATASETS: tuple[str, ...] = (
+    "airlines",
+    "year_prediction_msd",
+)
+
 AMLB_CATEGORY_PROFILES: dict[str, tuple[str, ...]] = {
     "small_samples_many_classes": (
         "amlb_optdigits",

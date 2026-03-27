@@ -1,6 +1,7 @@
 # amlb_datasets.py
 import pandas as pd
 import numpy as np
+from pathlib import Path
 from sklearn.datasets import fetch_openml
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
@@ -26,12 +27,38 @@ class AMLBDatasetLoader:
     def get_custom_datasets():
         """Регрессия - наибольшее число samples"""
         return AmlbExperimentDataset.AMLB_CUSTOM_DATASET.value
-    def load_dataset(self, dataset_info):
+
+    @staticmethod
+    def resolve_dataset_path(raw_path: str) -> Path:
+        candidate = Path(raw_path)
+        root_dir = Path(__file__).resolve().parents[2]
+
+        search_paths = []
+        if candidate.is_absolute():
+            search_paths.append(candidate)
+        else:
+            search_paths.extend(
+                [
+                    Path.cwd() / candidate,
+                    root_dir / candidate,
+                    root_dir / "examples" / "api_example" / candidate.name,
+                    root_dir / "examples" / "api_example" / "dataset" / candidate.name,
+                ]
+            )
+
+        for path in search_paths:
+            if path.exists():
+                return path.resolve()
+
+        raise FileNotFoundError(f"Dataset path not found for '{raw_path}'")
+
+    def load_dataset(self, dataset_info, as_frame: bool = False, preserve_categorical: bool = False):
         """Загружает датасет по его описанию"""
 
         try:
             if 'path' in dataset_info.keys():
-                df = pd.read_csv(dataset_info['path'])
+                resolved_path = self.resolve_dataset_path(dataset_info['path'])
+                df = pd.read_csv(resolved_path)
                 # df = df.drop_duplicates()
                 y = df[dataset_info['target']]
                 del df[dataset_info['target']]
@@ -50,8 +77,30 @@ class AMLBDatasetLoader:
 
             # Обработка пропущенных значений
             if isinstance(X, pd.DataFrame):
-                X = X.fillna(X.mean(numeric_only=True))
-                X = X.to_numpy()
+                numeric_columns = X.select_dtypes(include=['number', 'bool']).columns.tolist()
+                categorical_columns = [col for col in X.columns if col not in numeric_columns]
+
+                if numeric_columns:
+                    X[numeric_columns] = X[numeric_columns].apply(pd.to_numeric, errors='coerce')
+                    X[numeric_columns] = X[numeric_columns].fillna(X[numeric_columns].median(numeric_only=True))
+
+                if preserve_categorical:
+                    for col in categorical_columns:
+                        X[col] = X[col].astype('string').fillna('__missing__').astype('category')
+                else:
+                    X[categorical_columns] = X[categorical_columns].fillna('__missing__')
+
+                if not as_frame:
+                    X = X.to_numpy()
+
+            if as_frame:
+                if not isinstance(X, pd.DataFrame):
+                    X = pd.DataFrame(X)
+                if not isinstance(y, pd.Series):
+                    y = pd.Series(y, name=dataset_info.get('target', 'target'))
+                else:
+                    y = y.reset_index(drop=True)
+                X = X.reset_index(drop=True)
 
             print(f"Загружен датасет {dataset_info['name']}: {X.shape[0]} samples, {X.shape[1]} features")
 
@@ -116,7 +165,7 @@ class AMLBDatasetLoader:
                 # Остальные в train
                 if len(cls_indices) > 1:
                     X_train = np.vstack([X_train, X_rare.iloc[cls_indices[1:]]])
-                    y_train = np.hstack([y_train, y_rare[cls_indices[1:]]])
+                    y_train = np.hstack([y_train, y_rare.iloc[cls_indices[1:]]])
 
         return X_train, X_val, X_test, y_train, y_val, y_test
 

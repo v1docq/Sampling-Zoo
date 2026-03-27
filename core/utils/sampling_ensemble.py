@@ -24,6 +24,7 @@ class SamplingEnsemble:
                  partitioner_config: Dict[str, Any] = None,
                  model_class: Optional[Callable] = None,
                  model_params: Dict[str, Any] = None,
+                 model_factory: Optional[Callable[[], Any]] = None,
                  ensemble_method: str = 'voting'):
 
         self.problem = problem
@@ -34,7 +35,7 @@ class SamplingEnsemble:
         }
 
         # Автоматический выбор модели если не указана
-        if model_class is None:
+        if model_factory is None and model_class is None:
             if problem == 'classification':
                 model_class = LGBMClassifier
             elif problem == 'regression':
@@ -44,6 +45,7 @@ class SamplingEnsemble:
 
         self.model_class = model_class
         self.model_params = model_params or {}
+        self.model_factory = model_factory
         self.ensemble_method = ensemble_method
         self.bs_size = 1000
         self.partitions = None
@@ -64,13 +66,15 @@ class SamplingEnsemble:
                 'n_partitions': self.partitioner_config['n_partitions'],
                 'random_state': random_state,
             }
+            if 'chunks_percent' in self.partitioner_config:
+                strategy_kwargs['chunks_percent'] = self.partitioner_config['chunks_percent']
             if self.partitioner_config['strategy'] in ['difficulty', 'uncertainty']:
                 strategy_kwargs.update({
                     'problem': self.problem,
                     'model': (
-                        LGBMClassifier(n_estimators=50, n_jobs=-1)
+                        LGBMClassifier(n_estimators=50, n_jobs=-1, verbosity=-1)
                         if self.problem == 'classification'
-                        else LGBMRegressor(n_estimators=50, n_jobs=-1)
+                        else LGBMRegressor(n_estimators=50, n_jobs=-1, verbosity=-1)
                     ),
                     'chunks_percent': self.partitioner_config['chunks_percent'],
                 })
@@ -97,7 +101,14 @@ class SamplingEnsemble:
                 partitioner.fit(features)
                 self.partitions = partitioner.get_partitions(features, target)
             print(f"Создано {len(self.partitions)} поднаборов данных:")
-            print(f"Число семплов в 1 поднаборе -  {len(self.partitions['chunk_0']['feature'])}")
+            if self.partitions:
+                sample_key = next(iter(self.partitions))
+                sample_payload = self.partitions[sample_key]
+                if isinstance(sample_payload, dict) and "feature" in sample_payload:
+                    sample_size = len(sample_payload["feature"])
+                else:
+                    sample_size = len(sample_payload)
+                print(f"Число семплов в 1 поднаборе -  {sample_size}")
             return self.partitions
 
         except ImportError:
@@ -105,6 +116,10 @@ class SamplingEnsemble:
 
     def _create_model_instance(self):
         """Создает экземпляр модели с заданными параметрами"""
+        if self.model_factory is not None:
+            return self.model_factory()
+        if self.model_class is None:
+            raise ValueError("Model class is not configured.")
         return self.model_class(**self.model_params)
 
     def _run_inference(self, fitted_model: Callable, test_data: pd.DataFrame,
@@ -114,24 +129,31 @@ class SamplingEnsemble:
             batch_size = batch_size if batch_size is not None else self.bs_size
             batch_data = [test_data.iloc[i:i + self.bs_size] for i in list(range(0, len(test_data), batch_size))]
             for batch in tqdm(batch_data):
-                labels = fitted_model.predict(batch)
-                predict_labels.append(labels)
                 if self.problem == 'regression':
+                    labels = fitted_model.predict(batch)
+                    predict_labels.append(labels)
                     predict_proba.append(labels)
                 else:
-                    predict_proba.append(fitted_model.predict_proba(batch))
+                    proba = fitted_model.predict_proba(batch)
+                    classes = getattr(fitted_model, "classes_", None)
+                    if classes is not None:
+                        labels = classes[np.argmax(proba, axis=1)]
+                    else:
+                        labels = np.argmax(proba, axis=1)
+                    predict_labels.append(labels)
+                    predict_proba.append(proba)
             return np.concatenate(predict_labels), np.concatenate(predict_proba)
         elif calculation_mode == 'non-batch':
             if self.problem == 'regression':
                 labels = fitted_model.predict(test_data)
                 proba = labels
             else:
-                # TODO predict_proba почему то возвращает массив (489838, 4) хотя классов 23
                 proba = fitted_model.predict_proba(test_data)
-                # proba = fitted_model.predict_proba(test_data)
-                # labels = proba.argmax(axis=1)
-                labels = fitted_model.predict(test_data)
-                proba = None
+                classes = getattr(fitted_model, "classes_", None)
+                if classes is not None:
+                    labels = classes[np.argmax(proba, axis=1)]
+                else:
+                    labels = np.argmax(proba, axis=1)
             return labels, proba
         else:
             raise ValueError("Calculation mode must be 'batch' or 'non-batch'")
@@ -157,20 +179,44 @@ class SamplingEnsemble:
             X_extra.append(x_rep)
             y_extra.append(y_rep)
 
-        X_extra = np.stack(X_extra)
-        y_extra = np.array(y_extra)
+        if isinstance(chunk['feature'], pd.DataFrame):
+            extra_df = pd.DataFrame(X_extra, columns=chunk['feature'].columns)
+            for column, dtype in chunk['feature'].dtypes.items():
+                try:
+                    extra_df[column] = extra_df[column].astype(dtype)
+                except Exception:
+                    continue
+            chunk['feature'] = pd.concat([chunk['feature'], extra_df], ignore_index=True)
+        else:
+            X_extra_arr = np.stack(X_extra)
+            chunk['feature'] = np.vstack([chunk['feature'], X_extra_arr])
 
-        chunk['feature'] = np.vstack([chunk['feature'], X_extra])
-        chunk['target'] = np.hstack([chunk['target'], y_extra])
+        if isinstance(chunk['target'], pd.Series):
+            extra_target = pd.Series(y_extra, name=chunk['target'].name)
+            chunk['target'] = pd.concat([chunk['target'], extra_target], ignore_index=True)
+        else:
+            y_extra_arr = np.array(y_extra)
+            chunk['target'] = np.hstack([chunk['target'], y_extra_arr])
 
         return chunk
 
-    def train_partition_models(self, X_train, y_train, X_val, y_val, class_samples, cv_fold,
-                              validation_metric: str = None):
+    def train_partition_models(
+            self,
+            X_train,
+            y_train,
+            X_val,
+            y_val,
+            class_samples,
+            cv_fold,
+            validation_metric: str = None,
+            train_all_chunks: bool = False,
+            save_models_to_disk: bool = True,
+    ):
         """
         Обучает отдельные ML модели на каждой партиции
         """
-        os.makedirs("dumps", exist_ok=True)
+        if save_models_to_disk or 'load_filename' in self.partitioner_config or 'save_filename' in self.partitioner_config:
+            os.makedirs("dumps", exist_ok=True)
         if 'load_filename' in self.partitioner_config:
             with open(f"dumps/{self.partitioner_config['load_filename']}_{cv_fold}.pkl", "rb") as f:
                 partitions = pickle.load(f)
@@ -202,18 +248,20 @@ class SamplingEnsemble:
                 # Обучаем на поднаборе
                 model.fit(partition_data['feature'], partition_data['target'])
 
-                with open(f"dumps/{partition_name}_{cv_fold}.pkl", "wb") as f:
-                    pickle.dump(model, f)
+                if save_models_to_disk:
+                    with open(f"dumps/{partition_name}_{cv_fold}.pkl", "wb") as f:
+                        pickle.dump(model, f)
 
                 # Инференс на валидационных данных
                 predict_labels, predict_proba = self._run_inference(model, X_val, calculation_mode='non-batch')
 
                 # Сохраняем модель и метрики
-                metrics = calculate_metrics(y_true=y_val,
-                                            problem_type=self.problem,
-                                            y_labels=predict_labels,
-                                            y_proba=None
-                                            )
+                metrics = calculate_metrics(
+                    y_true=y_val,
+                    problem_type=self.problem,
+                    y_labels=predict_labels,
+                    y_proba=predict_proba if self.problem == "classification" else None,
+                )
                 model_info = {
                     'name': partition_name,
                     'model': model,
@@ -226,11 +274,17 @@ class SamplingEnsemble:
                 self.partition_metrics[partition_name] = metrics
 
                 print(f"Модель {partition_name} обучена. Размер данных: {model_info['data_size']}")
+                print(f"Метрики модели {partition_name}: {metrics}")
 
                 predictions = self.ensemble_predict(X_val, stage='validation')
-                current_validation_result = calculate_metrics(
-                    y_true=y_val, y_labels=predictions, y_proba=None, problem_type=self.problem
-                )[validation_metric]
+                ensemble_metrics = calculate_metrics(
+                    y_true=y_val,
+                    y_labels=predictions,
+                    y_proba=None,
+                    problem_type=self.problem,
+                )
+                current_validation_result = ensemble_metrics[validation_metric]
+                print(f"Метрики ансамбля после {partition_name}: {ensemble_metrics}")
                 print(f"Текущая валидационная метрика - {current_validation_result}")
                 validation_results.append(current_validation_result)
 
@@ -240,11 +294,11 @@ class SamplingEnsemble:
                 else:
                     best_validation_result_not_updated += 1
 
-                if metric_is_better(np.mean(validation_results[:-10]), current_validation_result):
-                    del self.models[-1]
-
-                if best_validation_result_not_updated >= 10:
-                    break
+                if not train_all_chunks:
+                    if len(validation_results) > 10 and metric_is_better(np.mean(validation_results[:-10]), current_validation_result):
+                        del self.models[-1]
+                    if best_validation_result_not_updated >= 10:
+                        break
 
             except Exception as e:
                 print(f"Ошибка при обучении модели {partition_name}: {str(e)}")
@@ -324,7 +378,7 @@ class SamplingEnsemble:
             if stage == 'validation':
                 pred = model_info['val_predictions']
             elif stage == 'inference':
-                pred = model_info['model'].predict(features.to_numpy() if isinstance(features, pd.DataFrame) else features)
+                pred = model_info['model'].predict(features)
             predictions.append(pred)
 
         # Различные стратегии ансамблирования
@@ -350,7 +404,7 @@ class SamplingEnsemble:
                 for model_info in self.models:
                     # Получаем вероятности если доступно
                     try:
-                        proba = model_info['model'].predict_proba(features.to_numpy() if isinstance(features, pd.DataFrame) else features)
+                        proba = model_info['model'].predict_proba(features)
                         proba_predictions.append(proba)
                     except:
                         # Fallback to hard voting

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Sequence
 import sys
 import numpy as np
 
-from bechmark_models import _search_params, _sample_from_partitions, _to_dense
+from benchmark_models import _search_params, _sample_from_partitions, _to_dense
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
@@ -207,3 +207,29 @@ def make_strategies(seed: int = 42) -> Dict[str, Any]:
         "delaunay": delaunay_strategy,
         "random": random_strategy,
     }
+
+
+def make_chunking_strategy_configs(
+    problem_type: str,
+    strategy_names: Sequence[str],
+    n_partitions: int = 3,
+    seed: int = 42,
+) -> Dict[str, Dict[str, Any]]:
+    configs: Dict[str, Dict[str, Any]] = {}
+    for strategy_name in strategy_names:
+        normalized_name = strategy_name.strip().lower()
+        if normalized_name not in {"difficulty", "random"}:
+            raise ValueError(f"Unsupported chunking strategy: {strategy_name}")
+
+        strategy_config: Dict[str, Any] = {
+            "strategy": normalized_name,
+            "n_partitions": n_partitions,
+            "random_state": seed,
+        }
+        if normalized_name == "difficulty":
+            strategy_config["problem"] = problem_type
+            strategy_config["chunks_percent"] = 100
+
+        configs[normalized_name] = strategy_config
+
+    return configs

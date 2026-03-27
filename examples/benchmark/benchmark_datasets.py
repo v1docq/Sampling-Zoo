@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from inspect import signature
-from typing import Callable
+from typing import Any, Callable, Sequence
 
 import numpy as np
 import pandas as pd
@@ -12,6 +12,9 @@ from sklearn.datasets import fetch_openml, make_classification
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+from core.repository.constant_repo import AmlbExperimentDataset
+from core.utils.amlb_dataloader import AMLBDatasetLoader
 
 
 @dataclass(frozen=True)
@@ -343,3 +346,92 @@ def load_dataset(name: str, seed: int) -> DatasetBundle:
         )
 
     return loaders[normalized_name](seed)
+
+
+@dataclass(frozen=True)
+class RawDatasetMetadata:
+    n_objects: int
+    n_features: int
+    n_train_candidates: int
+    n_categorical: int
+    n_numeric: int
+
+
+@dataclass(frozen=True)
+class RawDatasetBundle:
+    name: str
+    problem_type: str
+    target_name: str
+    source_path: str
+    X: pd.DataFrame
+    y: pd.Series
+    metadata: RawDatasetMetadata
+    feature_columns: list[str]
+    categorical_columns: list[str]
+    numeric_columns: list[str]
+
+
+def _custom_dataset_map() -> dict[str, dict[str, Any]]:
+    return {spec["name"]: spec for spec in AmlbExperimentDataset.AMLB_CUSTOM_DATASET.value}
+
+
+def load_custom_raw_dataset(name: str) -> RawDatasetBundle:
+    dataset_name = name.strip().lower()
+    spec_map = _custom_dataset_map()
+    if dataset_name not in spec_map:
+        available = ", ".join(sorted(spec_map))
+        raise ValueError(f"Unknown custom dataset: {name}. Available: {available}")
+
+    spec = dict(spec_map[dataset_name])
+    dataset_loader = AMLBDatasetLoader()
+    X, y, _ = dataset_loader.load_dataset(
+        dataset_info=spec,
+        as_frame=True,
+        preserve_categorical=True,
+    )
+    if X is None or y is None:
+        raise RuntimeError(f"Failed to load custom dataset: {dataset_name}")
+
+    X_df = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+    y_series = y if isinstance(y, pd.Series) else pd.Series(y, name=spec.get("target", "target"))
+
+    if spec["type"] == "classification":
+        y_numeric = pd.to_numeric(y_series, errors="coerce")
+        valid_mask = y_numeric.notna()
+        X_df = X_df.loc[valid_mask].reset_index(drop=True)
+        y_final = y_numeric.loc[valid_mask].astype(np.int64).reset_index(drop=True)
+    else:
+        y_numeric = pd.to_numeric(y_series, errors="coerce")
+        valid_mask = y_numeric.notna()
+        X_df = X_df.loc[valid_mask].reset_index(drop=True)
+        y_final = y_numeric.loc[valid_mask].reset_index(drop=True)
+
+    numeric_columns = X_df.select_dtypes(include=["number", "bool"]).columns.tolist()
+    categorical_columns = [col for col in X_df.columns if col not in numeric_columns]
+    metadata = RawDatasetMetadata(
+        n_objects=int(X_df.shape[0]),
+        n_features=int(X_df.shape[1]),
+        n_train_candidates=int(X_df.shape[0]),
+        n_categorical=len(categorical_columns),
+        n_numeric=len(numeric_columns),
+    )
+
+    return RawDatasetBundle(
+        name=spec["name"],
+        problem_type=spec["type"],
+        target_name=spec["target"],
+        source_path=str(AMLBDatasetLoader.resolve_dataset_path(spec["path"])),
+        X=X_df,
+        y=y_final,
+        metadata=metadata,
+        feature_columns=X_df.columns.tolist(),
+        categorical_columns=categorical_columns,
+        numeric_columns=numeric_columns,
+    )
+
+
+def load_custom_raw_datasets(names: Sequence[str]) -> list[RawDatasetBundle]:
+    bundles: list[RawDatasetBundle] = []
+    for name in names:
+        bundles.append(load_custom_raw_dataset(name))
+    return bundles

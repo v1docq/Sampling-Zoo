@@ -1,22 +1,33 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
+import sys
 
 import numpy as np
 import pandas as pd
 from scipy import sparse
-from sklearn.base import ClassifierMixin, clone
-from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
+from sklearn.base import ClassifierMixin
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score, log_loss
+from sklearn.model_selection import KFold
 from tqdm.auto import tqdm
 
-from benchmark_datasets import DatasetBundle
+ROOT_DIR = Path(__file__).resolve().parents[2]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from core.metrics.eval_metrics import calculate_metrics
+from core.utils.sampling_ensemble import SamplingEnsemble
+from core.utils.amlb_dataloader import AMLBDatasetLoader
+from core.utils.utils import safe_index
+from benchmark_datasets import DatasetBundle, RawDatasetBundle
 from benchmark_logging import BenchmarkLogger, build_sample_stats
 from benchmark_adapters import _normalize_scores,_select_top_k_by_importance,_strategy_base_name
-from benchmar_repo import AMLB_CATEGORY_PROFILES
+from benchmark_repo import AMLB_CATEGORY_PROFILES
 from benchmark_sampling_strategies import make_strategies
-from bechmark_models import _to_dense
+from benchmark_models import _to_dense
 
 
 @dataclass
@@ -48,7 +59,7 @@ class SpecialStrategyBenchmarkRunner:
         self,
         datasets: Iterable[DatasetBundle],
         strategies: Mapping[str, Callable[[DatasetBundle], Mapping[str, Any]]],
-        base_model: ClassifierMixin,
+        model_factory: Callable[[], ClassifierMixin],
     ) -> List[Dict[str, Any]]:
         self.run_records = []
         datasets_seq = list(datasets)
@@ -77,7 +88,7 @@ class SpecialStrategyBenchmarkRunner:
                     dataset=dataset,
                     strategy_name=strategy_name,
                     strategy_fn=strategy_fn,
-                    base_model=base_model,
+                    model_factory=model_factory,
                     x_train_dense=x_train_dense,
                     y_train=y_train,
                     x_test_dense=x_test_dense,
@@ -93,7 +104,7 @@ class SpecialStrategyBenchmarkRunner:
         dataset: DatasetBundle,
         strategy_name: str,
         strategy_fn: Callable[[DatasetBundle], Mapping[str, Any]],
-        base_model: ClassifierMixin,
+        model_factory: Callable[[], ClassifierMixin],
         x_train_dense: np.ndarray,
         y_train: np.ndarray,
         x_test_dense: np.ndarray,
@@ -108,7 +119,7 @@ class SpecialStrategyBenchmarkRunner:
         y_sampled = y_train[sampled_indices]
 
         fit_started = perf_counter()
-        model = clone(base_model)
+        model = model_factory()
         model.fit(x_sampled, y_sampled)
         fit_time = perf_counter() - fit_started
 
@@ -207,6 +218,7 @@ def _collect_metrics(
 
     if y_proba is None:
         metrics["roc_auc"] = float("nan")
+        metrics["log_loss"] = float("nan")
         return metrics
 
     classes_true = np.unique(y_true)
@@ -219,22 +231,28 @@ def _collect_metrics(
                     pos_idx = np.where(classes_arr == positive_class)[0]
                     if pos_idx.size == 1:
                         metrics["roc_auc"] = float(roc_auc_score(y_true, y_proba[:, int(pos_idx[0])]))
+                        metrics["log_loss"] = float(log_loss(y_true, y_proba))
                     else:
                         metrics["roc_auc"] = float("nan")
+                        metrics["log_loss"] = float("nan")
                 else:
                     metrics["roc_auc"] = float(roc_auc_score(y_true, y_proba[:, -1]))
+                    metrics["log_loss"] = float(log_loss(y_true, y_proba))
             else:
                 metrics["roc_auc"] = float("nan")
+                metrics["log_loss"] = float("nan")
             return metrics
 
         if model_classes is None:
             metrics["roc_auc"] = float("nan")
+            metrics["log_loss"] = float("nan")
             return metrics
 
         classes_arr = np.asarray(model_classes)
         missing_classes = [cls for cls in classes_true.tolist() if cls not in set(classes_arr.tolist())]
         if missing_classes:
             metrics["roc_auc"] = float("nan")
+            metrics["log_loss"] = float("nan")
             return metrics
 
         target_classes = np.sort(classes_true)
@@ -254,10 +272,267 @@ def _collect_metrics(
                 average="macro",
             )
         )
+        metrics["log_loss"] = float(log_loss(y_true, y_proba_selected, labels=target_classes))
     except ValueError:
         metrics["roc_auc"] = float("nan")
+        metrics["log_loss"] = float("nan")
 
     return metrics
+
+
+class EnsembleChunkBenchmarkRunner:
+    """Runner for chunk-based SamplingEnsemble benchmarks on raw AMLB datasets."""
+
+    def __init__(
+        self,
+        logger: Optional[BenchmarkLogger] = None,
+        cv_folds: int = 3,
+        seed: int = 42,
+        show_progress: bool = True,
+        on_record: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> None:
+        self.logger = logger or BenchmarkLogger()
+        self.cv_folds = cv_folds
+        self.seed = seed
+        self.show_progress = show_progress
+        self.loader = AMLBDatasetLoader()
+        self.on_record = on_record
+
+    def run_dataset(
+        self,
+        dataset: RawDatasetBundle,
+        strategy_configs: Mapping[str, Mapping[str, Any]],
+        model_pool: Mapping[str, Callable[[], Any]],
+    ) -> List[Dict[str, Any]]:
+        records: List[Dict[str, Any]] = []
+        model_iter = tqdm(
+            model_pool.items(),
+            total=len(model_pool),
+            disable=not self.show_progress,
+            desc=f"Models ({dataset.name})",
+            leave=False,
+        )
+        for model_name, model_factory in model_iter:
+            strategy_iter = tqdm(
+                strategy_configs.items(),
+                total=len(strategy_configs),
+                disable=not self.show_progress,
+                desc=f"Strategies ({dataset.name}/{model_name})",
+                leave=False,
+            )
+            for strategy_name, partitioner_config in strategy_iter:
+                fold_iter = tqdm(
+                    self._iter_folds(dataset),
+                    total=self.cv_folds,
+                    disable=not self.show_progress,
+                    desc=f"Folds ({dataset.name}/{strategy_name}/{model_name})",
+                    leave=False,
+                )
+                for fold_idx, X_train, X_val, X_test, y_train, y_val, y_test in fold_iter:
+                    record = self._run_single_fold(
+                        dataset=dataset,
+                        strategy_name=strategy_name,
+                        partitioner_config=partitioner_config,
+                        model_name=model_name,
+                        model_factory=model_factory,
+                        fold_idx=fold_idx,
+                        X_train=X_train,
+                        X_val=X_val,
+                        X_test=X_test,
+                        y_train=y_train,
+                        y_val=y_val,
+                        y_test=y_test,
+                    )
+                    if self.on_record is not None:
+                        self.on_record(record)
+                    records.append(record)
+
+        return records
+
+    def _iter_folds(
+        self,
+        dataset: RawDatasetBundle,
+    ) -> Iterable[tuple[int, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, pd.Series]]:
+        X = dataset.X.to_numpy() if isinstance(dataset.X, pd.DataFrame) else np.asarray(dataset.X)
+        y = dataset.y.to_numpy() if isinstance(dataset.y, pd.Series) else np.asarray(dataset.y)
+
+        splitter = KFold(n_splits=self.cv_folds, shuffle=True, random_state=self.seed)
+        split_iter = splitter.split(X)
+        for fold_idx, (train_idx, test_idx) in enumerate(split_iter, start=1):
+            X_train_full = dataset.X.iloc[train_idx].reset_index(drop=True)
+            y_train_full = dataset.y.iloc[train_idx].reset_index(drop=True)
+            X_test = dataset.X.iloc[test_idx].reset_index(drop=True)
+            y_test = dataset.y.iloc[test_idx].reset_index(drop=True)
+
+            X_train, _, X_val, y_train, _, y_val = self.loader.prepare_train_val_test_balanced(
+                X_train_full,
+                y_train_full,
+                test_size=0.2,
+                val_size=0,
+                min_samples=20,
+                problem=dataset.problem_type,
+                random_state=self.seed + fold_idx,
+            )
+            yield (
+                fold_idx,
+                X_train,
+                X_val,
+                X_test,
+                y_train,
+                y_val,
+                y_test,
+            )
+
+    @staticmethod
+    def _ensure_dataframe(X: Any, dataset: RawDatasetBundle) -> pd.DataFrame:
+        if isinstance(X, pd.DataFrame):
+            df = X.copy()
+        else:
+            df = pd.DataFrame(X, columns=dataset.feature_columns)
+        for col in dataset.categorical_columns:
+            if col in df.columns:
+                df[col] = df[col].astype("category")
+        return df
+
+    @staticmethod
+    def _class_representatives(
+        X_train: Any,
+        y_train: Any,
+        seed: int,
+    ) -> Dict[Any, tuple[pd.Series, Any]]:
+        rng = np.random.default_rng(seed)
+        y_array = np.asarray(y_train)
+        representatives: Dict[Any, tuple[pd.Series, Any]] = {}
+        for cls in np.unique(y_array):
+            cls_indices = np.where(y_array == cls)[0]
+            picked = int(rng.choice(cls_indices))
+            representatives[cls] = (safe_index(X_train, picked), safe_index(y_train, picked))
+        return representatives
+
+    def _run_single_fold(
+        self,
+        dataset: RawDatasetBundle,
+        strategy_name: str,
+        partitioner_config: Mapping[str, Any],
+        model_name: str,
+        model_factory: Callable[[], Any],
+        fold_idx: int,
+        X_train: Any,
+        X_val: Any,
+        X_test: Any,
+        y_train: Any,
+        y_val: Any,
+        y_test: Any,
+    ) -> Dict[str, Any]:
+        try:
+            X_train_df = self._ensure_dataframe(X_train, dataset)
+            X_val_df = self._ensure_dataframe(X_val, dataset)
+            X_test_df = self._ensure_dataframe(X_test, dataset)
+
+            class_samples = None
+            if dataset.problem_type == "classification":
+                class_samples = self._class_representatives(X_train_df, y_train, seed=self.seed + fold_idx)
+
+            effective_partitions = max(1, int(np.ceil(len(y_train) / 20000)))
+            target_chunks = 10
+            chunks_percent = min(100.0, 100.0 * target_chunks / max(1, effective_partitions))
+            tuned_partitioner_config = dict(partitioner_config)
+            tuned_partitioner_config["n_partitions"] = effective_partitions
+            tuned_partitioner_config["chunks_percent"] = chunks_percent
+
+            ensemble = SamplingEnsemble(
+                problem=dataset.problem_type,
+                partitioner_config=tuned_partitioner_config,
+                model_factory=model_factory,
+                ensemble_method="voting",
+            )
+
+            fit_started = perf_counter()
+            ensemble.train_partition_models(
+                X_train=X_train_df,
+                y_train=y_train,
+                X_val=X_val_df,
+                y_val=y_val,
+                class_samples=class_samples,
+                cv_fold=fold_idx,
+                validation_metric="f1_weighted" if dataset.problem_type == "classification" else "rmse",
+                train_all_chunks=True,
+                save_models_to_disk=False,
+            )
+            fit_time = perf_counter() - fit_started
+
+            infer_started = perf_counter()
+            predictions = ensemble.ensemble_predict(X_test_df)
+            infer_time = perf_counter() - infer_started
+
+            model_metrics = calculate_metrics(
+                y_true=y_test,
+                y_labels=predictions,
+                y_proba=None,
+                problem_type=dataset.problem_type,
+            )
+
+            chunk_sizes = [int(model_info.get("data_size", 0)) for model_info in ensemble.models]
+            sample_stats = build_sample_stats(
+                y_sampled=np.asarray(y_train),
+                total_train_size=len(y_train),
+            )
+            sample_stats["chunk_count"] = int(len(chunk_sizes))
+            sample_stats["chunk_size_mean"] = float(np.mean(chunk_sizes)) if chunk_sizes else 0.0
+
+            return self.logger.log_strategy_run(
+                dataset_name=dataset.name,
+                strategy_name=f"{strategy_name}__{model_name}__fold_{fold_idx}",
+                strategy_params={
+                    **tuned_partitioner_config,
+                    "model": model_name,
+                    "cv_fold": fold_idx,
+                },
+                model_metrics=model_metrics,
+                timings={"fit": fit_time, "sample": 0.0, "inference": infer_time},
+                sample_stats=sample_stats,
+                extra={
+                    "problem_type": dataset.problem_type,
+                    "strategy": strategy_name,
+                    "model": model_name,
+                    "cv_fold": fold_idx,
+                    "effective_partitions": effective_partitions,
+                    "chunks_percent": chunks_percent,
+                    "n_chunks": len(ensemble.models),
+                    "chunk_sizes": chunk_sizes,
+                    "partition_metrics": ensemble.partition_metrics,
+                    "source_path": dataset.source_path,
+                    "n_train": int(len(X_train)),
+                    "n_val": int(len(X_val)),
+                    "n_test": int(len(X_test)),
+                },
+            )
+        except Exception as ex:
+            return self.logger.log_strategy_run(
+                dataset_name=dataset.name,
+                strategy_name=f"{strategy_name}__{model_name}__fold_{fold_idx}",
+                strategy_params={
+                    **dict(partitioner_config),
+                    "model": model_name,
+                    "cv_fold": fold_idx,
+                },
+                model_metrics={},
+                timings={"fit": 0.0, "sample": 0.0, "inference": 0.0},
+                sample_stats=build_sample_stats(
+                    y_sampled=np.array([], dtype=float),
+                    total_train_size=max(len(y_train), 1),
+                ),
+                extra={
+                    "problem_type": dataset.problem_type,
+                    "strategy": strategy_name,
+                    "model": model_name,
+                    "cv_fold": fold_idx,
+                    "effective_partitions": effective_partitions,
+                    "chunks_percent": chunks_percent,
+                    "source_path": dataset.source_path,
+                    "error": str(ex),
+                },
+            )
 
 def _apply_budget_policy(
     informative_indices: Sequence[int],

@@ -16,7 +16,7 @@ import pandas as pd
 from tqdm.auto import tqdm
 
 from benchmark_sampling_strategies import make_strategies
-from bechmark_models import make_model_pool
+from benchmark_models import make_model_pool
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
@@ -373,14 +373,14 @@ class BenchmarkOrchestrator:
         run_records: list[dict[str, Any]] = []
         model_iter = tqdm(model_pool.items(), total=len(model_pool), desc="Models",
                           disable=not self.config.show_progress)
-        for model_name, model in model_iter:
+        for model_name, model_factory in model_iter:
             runner = SpecialStrategyBenchmarkRunner(
                 logger=logger,
                 enable_diagnostic_plots=self.config.enable_diagnostic_plots,
                 show_progress=self.config.show_progress,
             )
             model_tagged_strategies = {f"{name}__{model_name}": fn for name, fn in strategy_pool.items()}
-            run_records.extend(runner.run(datasets=datasets, strategies=model_tagged_strategies, base_model=model))
+            run_records.extend(runner.run(datasets=datasets, strategies=model_tagged_strategies, model_factory=model_factory))
 
         enriched_df = self.report_builder.build_tables(run_records, logger.paths.root)
         self.report_builder.plot_metrics_vs_budget(enriched_df, logger.paths.plots)

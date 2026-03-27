@@ -9,12 +9,19 @@ def calculate_metrics(y_true, y_labels, y_proba, problem_type):
     """Вычисляет метрики качества"""
     if problem_type == 'classification':
         y_pred = y_labels.flatten()
-        return {
+        metrics = {
             'accuracy': accuracy_score(y_true, y_pred),
-            #'log_loss': log_loss(y_true=y_true, y_pred=y_proba),
             'f1_macro': f1_score(y_true, y_pred, average='macro'),
             'f1_weighted': f1_score(y_true, y_pred, average='weighted')
         }
+        if y_proba is not None:
+            try:
+                metrics['log_loss'] = log_loss(y_true=y_true, y_pred=y_proba)
+            except ValueError:
+                metrics['log_loss'] = float("nan")
+        else:
+            metrics['log_loss'] = float("nan")
+        return metrics
     else:  # regression
         y_pred = y_labels
         return {
