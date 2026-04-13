@@ -160,44 +160,101 @@ class BenchmarkLogger:
         records = list(run_records)
         report_path = self.paths.root / "report.md"
 
+        def _problem_type(record: Mapping[str, Any]) -> str:
+            extra = record.get("extra", {}) or {}
+            pt = str(extra.get("problem_type", "")).lower()
+            if pt in {"classification", "regression"}:
+                return pt
+            metrics = record.get("model_metrics", {}) or {}
+            if any(key in metrics for key in ("rmse", "mse", "r2")):
+                return "regression"
+            return "classification"
+
+        classification_records = [record for record in records if _problem_type(record) == "classification"]
+        regression_records = [record for record in records if _problem_type(record) == "regression"]
+
         lines = [
             f"# Benchmark report ({self.run_id})",
             "",
-            "## Strategy comparison",
-            "",
-            "| Dataset | Strategy | ROC-AUC | F1 macro | F1 weighted | fit(s) | sample(s) | inference(s) |",
-            "|---|---|---:|---:|---:|---:|---:|---:|",
+            f"- Total records: {len(records)}",
+            f"- Classification records: {len(classification_records)}",
+            f"- Regression records: {len(regression_records)}",
         ]
 
         grouped: Dict[str, List[Mapping[str, Any]]] = {}
-        for record in records:
-            dataset_name = str(record.get("dataset", "unknown"))
-            grouped.setdefault(dataset_name, []).append(record)
-
-            metrics = record.get("model_metrics", {})
-            timings = record.get("timings_sec", {})
-            lines.append(
-                "| {dataset} | {strategy} | {roc_auc:.4f} | {f1_macro:.4f} | {f1_weighted:.4f} | {fit:.4f} | {sample:.4f} | {inference:.4f} |".format(
-                    dataset=dataset_name,
-                    strategy=record.get("strategy", "-"),
-                    roc_auc=float(metrics.get("roc_auc", float("nan"))),
-                    f1_macro=float(metrics.get("f1_macro", float("nan"))),
-                    f1_weighted=float(metrics.get("f1_weighted", float("nan"))),
-                    fit=float(timings.get("fit", 0.0)),
-                    sample=float(timings.get("sample", 0.0)),
-                    inference=float(timings.get("inference", 0.0)),
-                )
+        if classification_records:
+            lines.extend(
+                [
+                    "",
+                    "## Classification",
+                    "",
+                    "| Dataset | Strategy | ROC-AUC | F1 macro | F1 weighted | fit(s) | sample(s) | inference(s) |",
+                    "|---|---|---:|---:|---:|---:|---:|---:|",
+                ]
             )
+            for record in classification_records:
+                dataset_name = str(record.get("dataset", "unknown"))
+                grouped.setdefault(dataset_name, []).append(record)
+                metrics = record.get("model_metrics", {})
+                timings = record.get("timings_sec", {})
+                lines.append(
+                    "| {dataset} | {strategy} | {roc_auc:.4f} | {f1_macro:.4f} | {f1_weighted:.4f} | {fit:.4f} | {sample:.4f} | {inference:.4f} |".format(
+                        dataset=dataset_name,
+                        strategy=record.get("strategy", "-"),
+                        roc_auc=float(metrics.get("roc_auc", float("nan"))),
+                        f1_macro=float(metrics.get("f1_macro", float("nan"))),
+                        f1_weighted=float(metrics.get("f1_weighted", float("nan"))),
+                        fit=float(timings.get("fit", 0.0)),
+                        sample=float(timings.get("sample", 0.0)),
+                        inference=float(timings.get("inference", 0.0)),
+                    )
+                )
+
+        if regression_records:
+            lines.extend(
+                [
+                    "",
+                    "## Regression",
+                    "",
+                    "| Dataset | Strategy | RMSE | MSE | R2 | fit(s) | sample(s) | inference(s) |",
+                    "|---|---|---:|---:|---:|---:|---:|---:|",
+                ]
+            )
+            for record in regression_records:
+                dataset_name = str(record.get("dataset", "unknown"))
+                grouped.setdefault(dataset_name, []).append(record)
+                metrics = record.get("model_metrics", {})
+                timings = record.get("timings_sec", {})
+                lines.append(
+                    "| {dataset} | {strategy} | {rmse:.4f} | {mse:.4f} | {r2:.4f} | {fit:.4f} | {sample:.4f} | {inference:.4f} |".format(
+                        dataset=dataset_name,
+                        strategy=record.get("strategy", "-"),
+                        rmse=float(metrics.get("rmse", float("nan"))),
+                        mse=float(metrics.get("mse", float("nan"))),
+                        r2=float(metrics.get("r2", float("nan"))),
+                        fit=float(timings.get("fit", 0.0)),
+                        sample=float(timings.get("sample", 0.0)),
+                        inference=float(timings.get("inference", 0.0)),
+                    )
+                )
 
         lines.extend(["", "## Best / worst by dataset", ""])
         for dataset_name, dataset_records in grouped.items():
-            best = max(dataset_records, key=lambda r: float(r.get("model_metrics", {}).get("f1_macro", float("-inf"))))
-            worst = min(dataset_records, key=lambda r: float(r.get("model_metrics", {}).get("f1_macro", float("inf"))))
-
-            lines.append(f"### {dataset_name}")
-            lines.append(f"- Best (F1 macro): **{best.get('strategy', '-') }** ({float(best.get('model_metrics', {}).get('f1_macro', 0.0)):.4f})")
-            lines.append(f"- Worst (F1 macro): **{worst.get('strategy', '-') }** ({float(worst.get('model_metrics', {}).get('f1_macro', 0.0)):.4f})")
-            lines.append("")
+            first_type = _problem_type(dataset_records[0])
+            if first_type == "regression":
+                best = min(dataset_records, key=lambda r: float(r.get("model_metrics", {}).get("rmse", float("inf"))))
+                worst = max(dataset_records, key=lambda r: float(r.get("model_metrics", {}).get("rmse", float("-inf"))))
+                lines.append(f"### {dataset_name}")
+                lines.append(f"- Best (RMSE): **{best.get('strategy', '-') }** ({float(best.get('model_metrics', {}).get('rmse', float('nan'))):.4f})")
+                lines.append(f"- Worst (RMSE): **{worst.get('strategy', '-') }** ({float(worst.get('model_metrics', {}).get('rmse', float('nan'))):.4f})")
+                lines.append("")
+            else:
+                best = max(dataset_records, key=lambda r: float(r.get("model_metrics", {}).get("f1_macro", float("-inf"))))
+                worst = min(dataset_records, key=lambda r: float(r.get("model_metrics", {}).get("f1_macro", float("inf"))))
+                lines.append(f"### {dataset_name}")
+                lines.append(f"- Best (F1 macro): **{best.get('strategy', '-') }** ({float(best.get('model_metrics', {}).get('f1_macro', float('nan'))):.4f})")
+                lines.append(f"- Worst (F1 macro): **{worst.get('strategy', '-') }** ({float(worst.get('model_metrics', {}).get('f1_macro', float('nan'))):.4f})")
+                lines.append("")
 
         report_path.write_text("\n".join(lines), encoding="utf-8")
         return report_path

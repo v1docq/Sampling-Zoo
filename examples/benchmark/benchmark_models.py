@@ -50,6 +50,12 @@ except Exception:  # pragma: no cover - optional
     TabPFNClassifier = None
     TabPFNRegressor = None
 
+try:
+    from tabicl import TabICLClassifier, TabICLRegressor
+except Exception:  # pragma: no cover - optional
+    TabICLClassifier = None
+    TabICLRegressor = None
+
 @dataclass
 class SearchResult:
     best_params: Dict[str, Any]
@@ -171,7 +177,7 @@ def make_model_pool(
     problem_type: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Builds model pool for benchmark runners (name -> factory callable)."""
-    available_names = {"random_forest", "lightgbm", "hist_gradient_boosting", "tabpfn"}
+    available_names = {"random_forest", "lightgbm", "hist_gradient_boosting", "tabpfn", "tabicl"}
     if model_names is None:
         requested = {"random_forest", "lightgbm"}
     else:
@@ -214,6 +220,8 @@ def make_model_pool(
         )
 
     if "tabpfn" in requested:
+        if TabPFNClassifier is None or TabPFNRegressor is None:
+            raise ValueError("tabpfn is not available. Install tabpfn to use this model.")
         if normalized_problem == "classification":
             model_pool["tabpfn"] = lambda: TabPFNClassifier.create_default_for_version(
                 ModelVersion.V2_5,
@@ -224,5 +232,13 @@ def make_model_pool(
                 ModelVersion.V2_5,
                 n_estimators=12,
             )
+
+    if "tabicl" in requested:
+        if TabICLClassifier is None or TabICLRegressor is None:
+            raise ValueError("tabicl is not available. Install tabicl to use this model.")
+        if normalized_problem == "classification":
+            model_pool["tabicl"] = lambda: TabICLClassifier(n_estimators=12)
+        else:
+            model_pool["tabicl"] = lambda: TabICLRegressor(n_estimators=12)
 
     return model_pool

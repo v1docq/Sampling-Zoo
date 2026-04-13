@@ -304,6 +304,31 @@ class SamplingEnsemble:
                 print(f"Ошибка при обучении модели {partition_name}: {str(e)}")
                 continue
 
+        if self.models:
+            full_metrics = calculate_metrics(
+                y_true=y_val,
+                y_labels=self.ensemble_predict(X_val, stage='validation'),
+                y_proba=None,
+                problem_type=self.problem,
+            )
+            print(f"Метрики ансамбля до сокращения: {full_metrics}")
+
+            selected, best_score = self.select_best_models_forward(
+                X_val=X_val,
+                y_val=y_val,
+                metric_is_better=metric_is_better,
+                validation_metric=validation_metric,
+            )
+
+            reduced_metrics = calculate_metrics(
+                y_true=y_val,
+                y_labels=self.ensemble_predict(X_val, stage='validation'),
+                y_proba=None,
+                problem_type=self.problem,
+            )
+            print(f"Метрики ансамбля после сокращения: {reduced_metrics}")
+            print(f"Лучшая валидационная метрика после сокращения ({validation_metric}): {best_score}")
+
     def select_best_models_forward(
             self,
             X_val: pd.DataFrame,
@@ -324,23 +349,17 @@ class SamplingEnsemble:
         best_score = None
 
         def evaluate(indices):
-            preds = []
-            for i in indices:
-                mi = self.models[i]
-                pred = mi['val_predictions']
-                preds.append(pred)
+            selected_models = [self.models[i] for i in indices]
+            if not selected_models:
+                return None
+            preds = self.ensemble_predict(X_val, stage='validation', models=selected_models)
 
-            stacked = np.column_stack(preds)
-            final_pred, _ = mode(stacked, axis=1)
-
-            score = calculate_metrics(
+            return calculate_metrics(
                 y_true=y_val,
-                y_labels=final_pred.ravel(),
+                y_labels=preds,
                 y_proba=None,
-                problem_type=self.problem
+                problem_type=self.problem,
             )[validation_metric]
-
-            return score
 
         while remaining:
             best_candidate = None
@@ -350,7 +369,7 @@ class SamplingEnsemble:
                 candidate = selected + [i]
                 score = evaluate(candidate)
 
-                if best_candidate_score is None or score > best_candidate_score:
+                if best_candidate_score is None or metric_is_better(score, best_candidate_score):
                     best_candidate = i
                     best_candidate_score = score
 
@@ -360,21 +379,24 @@ class SamplingEnsemble:
             selected.append(best_candidate)
             remaining.remove(best_candidate)
             best_score = best_candidate_score
+            print(f"Forward selection: models={len(selected)} {validation_metric}={best_score}")
 
         self.models = [self.models[i] for i in selected]
 
         return selected, best_score
 
-    def ensemble_predict(self, features: pd.DataFrame, stage: str = 'inference') -> np.ndarray:
+    def ensemble_predict(self, features: pd.DataFrame, stage: str = 'inference', models: Optional[List[Dict[str, Any]]] = None) -> np.ndarray:
         """
         Ансамблирование предсказаний всех моделей
         """
-        if not self.models:
+        active_models = models if models is not None else self.models
+
+        if not active_models:
             raise ValueError("Модели не обучены. Сначала вызовите train_partition_models()")
 
         predictions = []
 
-        for model_info in self.models:
+        for model_info in active_models:
             if stage == 'validation':
                 pred = model_info['val_predictions']
             elif stage == 'inference':
@@ -395,13 +417,13 @@ class SamplingEnsemble:
 
         elif self.ensemble_method == 'weighted':
             # Взвешенное голосование на основе качества моделей
-            weights = [metrics.get('f1_weighted', 0.5) for metrics in self.partition_metrics.values()]
+            weights = [model_info.get('metrics', {}).get('f1_weighted', 0.5) for model_info in active_models]
             weights = np.array(weights) / sum(weights)
 
             if self.problem == 'classification':
                 # Для классификации: взвешенное голосование по вероятностям
                 proba_predictions = []
-                for model_info in self.models:
+                for model_info in active_models:
                     # Получаем вероятности если доступно
                     try:
                         proba = model_info['model'].predict_proba(features)
@@ -418,6 +440,26 @@ class SamplingEnsemble:
 
         else:
             raise ValueError(f"Неизвестный метод ансамблирования: {self.ensemble_method}")
+
+    def ensemble_predict_batch(
+            self,
+            features: pd.DataFrame,
+            stage: str = 'inference',
+            models: Optional[List[Dict[str, Any]]] = None,
+            batch_size: Optional[int] = None,
+    ) -> np.ndarray:
+        batch_size = batch_size or self.bs_size
+        n_samples = len(features)
+        batches = []
+        total_batches = (n_samples + batch_size - 1) // batch_size
+        for batch_idx in range(total_batches):
+            start = batch_idx * batch_size
+            end = min(start + batch_size, n_samples)
+            remaining = total_batches - batch_idx
+            print(f"Batch {batch_idx + 1}/{total_batches} (remaining: {remaining - 1})")
+            batch = features.iloc[start:end] if isinstance(features, pd.DataFrame) else features[start:end]
+            batches.append(self.ensemble_predict(batch, stage=stage, models=models))
+        return np.concatenate(batches)
 
 class SingleModelImplementation(SamplingEnsemble):
     """

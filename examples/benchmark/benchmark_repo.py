@@ -4,6 +4,8 @@ ENSEMBLE_CV_FOLDS: int = 3
 ENSEMBLE_N_PARTITIONS: int = 3
 ENSEMBLE_STRATEGIES: tuple[str, ...] = ("difficulty", "random")
 ENSEMBLE_MODELS: tuple[str, ...] = ("tabpfn", "lightgbm")
+OPENML_CLASSIFICATION_SUITE: int = 271
+OPENML_REGRESSION_SUITE: int = 269
 AMLB_CUSTOM_CLASSIFICATION_DATASETS: tuple[str, ...] = (
     "covtype-normalized",
     "kddcup",

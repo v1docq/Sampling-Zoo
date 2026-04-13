@@ -218,7 +218,7 @@ def make_chunking_strategy_configs(
     configs: Dict[str, Dict[str, Any]] = {}
     for strategy_name in strategy_names:
         normalized_name = strategy_name.strip().lower()
-        if normalized_name not in {"difficulty", "random"}:
+        if normalized_name not in {"difficulty", "random", "feature_clustering"}:
             raise ValueError(f"Unsupported chunking strategy: {strategy_name}")
 
         strategy_config: Dict[str, Any] = {

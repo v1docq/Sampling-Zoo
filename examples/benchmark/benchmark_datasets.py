@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from inspect import signature
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -15,6 +15,11 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 from core.repository.constant_repo import AmlbExperimentDataset
 from core.utils.amlb_dataloader import AMLBDatasetLoader
+
+try:
+    import openml
+except Exception:  # pragma: no cover - optional
+    openml = None
 
 
 @dataclass(frozen=True)
@@ -371,6 +376,81 @@ class RawDatasetBundle:
     numeric_columns: list[str]
 
 
+@dataclass(frozen=True)
+class OpenMLRawDatasetBundle(RawDatasetBundle):
+    task_id: int
+    task_name: str
+    suite_id: Optional[int]
+    dataset_id: int
+
+    def load_split_data(self) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series, list[str], list[str], list[str]]:
+        if openml is None:
+            raise ImportError("openml is not available. Install openml to load suite datasets.")
+
+        task = openml.tasks.get_task(self.task_id)
+        X, y = task.get_X_and_y(dataset_format="dataframe")
+
+        X_df = X.copy() if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+        y_series = y if isinstance(y, pd.Series) else pd.Series(y, name=self.target_name)
+
+        if self.problem_type == "classification":
+            y_codes = y_series.astype("category").cat.codes
+            valid_mask = (y_codes >= 0).to_numpy()
+            y_values = y_codes.to_numpy()
+        else:
+            y_numeric = pd.to_numeric(y_series, errors="coerce")
+            valid_mask = y_numeric.notna().to_numpy()
+            y_values = y_numeric.to_numpy()
+
+        valid_positions = np.flatnonzero(valid_mask)
+        if valid_positions.size == 0:
+            raise RuntimeError(f"OpenML task {self.task_id} has no valid target values after preprocessing.")
+
+        try:
+            train_idx, test_idx = task.get_train_test_split_indices(repeat=0, fold=0, sample=0)
+        except TypeError:
+            train_idx, test_idx = task.get_train_test_split_indices()
+        train_idx = np.asarray(train_idx, dtype=int)
+        test_idx = np.asarray(test_idx, dtype=int)
+
+        position_map = np.full(len(valid_mask), -1, dtype=int)
+        position_map[valid_positions] = np.arange(valid_positions.size, dtype=int)
+        train_idx = position_map[train_idx]
+        test_idx = position_map[test_idx]
+        train_idx = train_idx[train_idx >= 0]
+        test_idx = test_idx[test_idx >= 0]
+
+        X_df = X_df.iloc[valid_positions].reset_index(drop=True)
+        y_final = pd.Series(y_values[valid_positions], name=self.target_name).reset_index(drop=True)
+        if self.problem_type == "classification":
+            y_final = y_final.astype(np.int64)
+
+        max_index = len(X_df) - 1
+        train_idx = train_idx[(train_idx >= 0) & (train_idx <= max_index)]
+        test_idx = test_idx[(test_idx >= 0) & (test_idx <= max_index)]
+        if train_idx.size == 0 or test_idx.size == 0:
+            raise RuntimeError(f"OpenML task {self.task_id} has empty train/test split.")
+
+        numeric_columns = X_df.select_dtypes(include=["number", "bool"]).columns.tolist()
+        categorical_columns = [col for col in X_df.columns if col not in numeric_columns]
+        for col in categorical_columns:
+            X_df[col] = X_df[col].astype("string").fillna("__missing__").astype("category")
+
+        X_train_full = X_df.iloc[train_idx].reset_index(drop=True)
+        y_train_full = y_final.iloc[train_idx].reset_index(drop=True)
+        X_test = X_df.iloc[test_idx].reset_index(drop=True)
+        y_test = y_final.iloc[test_idx].reset_index(drop=True)
+        return (
+            X_train_full,
+            y_train_full,
+            X_test,
+            y_test,
+            X_df.columns.tolist(),
+            categorical_columns,
+            numeric_columns,
+        )
+
+
 def _custom_dataset_map() -> dict[str, dict[str, Any]]:
     return {spec["name"]: spec for spec in AmlbExperimentDataset.AMLB_CUSTOM_DATASET.value}
 
@@ -435,3 +515,137 @@ def load_custom_raw_datasets(names: Sequence[str]) -> list[RawDatasetBundle]:
     for name in names:
         bundles.append(load_custom_raw_dataset(name))
     return bundles
+
+
+def _to_problem_type(task_type: Any) -> str:
+    text = str(task_type).lower()
+    if "regression" in text:
+        return "regression"
+    if "classification" in text:
+        return "classification"
+    raise ValueError(f"Unsupported OpenML task type: {task_type}")
+
+
+def _resolve_task_name(task_id: int, task_name: Optional[str]) -> str:
+    if task_name:
+        return task_name
+    if openml is None:
+        return f"task_{task_id}"
+
+    task_details = openml.tasks.list_tasks(task_id=[task_id], output_format="dataframe")
+    if task_details.empty:
+        return f"task_{task_id}"
+    return str(task_details.iloc[0].get("name", f"task_{task_id}"))
+
+
+def load_suite_dataset(task_id: int, suite_id: Optional[int] = None, task_name: Optional[str] = None) -> OpenMLRawDatasetBundle:
+    if openml is None:
+        raise ImportError("openml is not available. Install openml to load suite datasets.")
+
+    task = openml.tasks.get_task(task_id)
+    resolved_task_name = _resolve_task_name(task_id=task_id, task_name=task_name)
+    problem_type = _to_problem_type(task.task_type)
+
+    dataset_obj = openml.datasets.get_dataset(task.dataset_id, download_data=False)
+    qualities = dataset_obj.qualities or {}
+    n_objects = int(qualities.get("NumberOfInstances") or 0)
+    n_features = int(qualities.get("NumberOfFeatures") or 0)
+
+    try:
+        train_idx, _ = task.get_train_test_split_indices(repeat=0, fold=0, sample=0)
+    except TypeError:
+        train_idx, _ = task.get_train_test_split_indices()
+    n_train_candidates = int(len(train_idx))
+
+    dataset_label = f"{resolved_task_name}__task_{task_id}"
+    metadata = RawDatasetMetadata(
+        n_objects=n_objects,
+        n_features=n_features,
+        n_train_candidates=n_train_candidates,
+        n_categorical=0,
+        n_numeric=0,
+    )
+
+    return OpenMLRawDatasetBundle(
+        name=dataset_label,
+        problem_type=problem_type,
+        target_name=str(getattr(task, "target_name", "target")),
+        source_path=f"openml://task/{task_id}",
+        X=pd.DataFrame(),
+        y=pd.Series(dtype=np.int64 if problem_type == "classification" else np.float64, name=str(getattr(task, "target_name", "target"))),
+        metadata=metadata,
+        feature_columns=[],
+        categorical_columns=[],
+        numeric_columns=[],
+        task_id=int(task_id),
+        task_name=resolved_task_name,
+        suite_id=suite_id,
+        dataset_id=int(dataset_obj.dataset_id),
+    )
+
+
+def _load_suite_group(
+    suite_id: Optional[int],
+    requested_task_names: Optional[Sequence[str]],
+    expected_problem_type: str,
+) -> list[OpenMLRawDatasetBundle]:
+    if suite_id is None:
+        return []
+    if openml is None:
+        raise ImportError("openml is not available. Install openml to load suite datasets.")
+    if not requested_task_names:
+        return []
+
+    suite = openml.study.get_suite(suite_id)
+    task_ids = set(suite.tasks)
+    if not task_ids:
+        return []
+
+    tasks_df = openml.tasks.list_tasks(output_format="dataframe")
+    if tasks_df.empty:
+        return []
+
+    suite_tasks_df = tasks_df[tasks_df["tid"].isin(task_ids)].reset_index(drop=True)
+    if suite_tasks_df.empty:
+        return []
+
+    available_names = set(suite_tasks_df["name"].astype(str).tolist())
+    requested_names = list(requested_task_names)
+    missing = [name for name in requested_names if name not in available_names]
+    if missing:
+        raise ValueError(
+            f"Unknown OpenML task names for suite {suite_id}: {missing}. "
+            f"Available: {sorted(available_names)}"
+        )
+
+    selected_rows = suite_tasks_df[suite_tasks_df["name"].isin(requested_names)]
+    selected_rows_by_name: dict[str, Any] = {}
+    for _, row in selected_rows.iterrows():
+        selected_rows_by_name[str(row["name"])] = row
+
+    bundles: list[OpenMLRawDatasetBundle] = []
+    for requested_name in requested_names:
+        row = selected_rows_by_name[requested_name]
+        task_id_value = row["tid"] if "tid" in row else row.get("task_id", row.get("index"))
+        if task_id_value is None:
+            raise ValueError(f"Failed to resolve task id column for suite {suite_id}.")
+        task_id = int(task_id_value)
+        task_name = str(row["name"])
+        bundle = load_suite_dataset(task_id=task_id, suite_id=suite_id, task_name=task_name)
+        if bundle.problem_type != expected_problem_type:
+            continue
+        bundles.append(bundle)
+
+    return bundles
+
+
+def load_suite_raw_datasets(
+    classification_suite: Optional[int] = None,
+    regression_suite: Optional[int] = None,
+    classification_tasks: Optional[Sequence[str]] = None,
+    regression_tasks: Optional[Sequence[str]] = None,
+) -> list[OpenMLRawDatasetBundle]:
+    datasets: list[OpenMLRawDatasetBundle] = []
+    datasets.extend(_load_suite_group(classification_suite, classification_tasks, expected_problem_type="classification"))
+    datasets.extend(_load_suite_group(regression_suite, regression_tasks, expected_problem_type="regression"))
+    return datasets
