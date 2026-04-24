@@ -8,8 +8,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 # Прямой импорт класса и через API фабрику
-from core.sampling_strategies.spectral.spectral_leverage import SpectralLeverageSampler
-from core.api.api_main import SamplingStrategyFactory
+from sampling_zoo.core.sampling_strategies.spectral.spectral_leverage import SpectralLeverageSampler
+from sampling_zoo.core.api.api_main import SamplingStrategyFactory
 
 
 def generate_low_rank_matrix(n_samples=1000, n_features=50, latent_rank=5, noise_level=0.1, seed=42):

@@ -19,10 +19,10 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from core.metrics.eval_metrics import calculate_metrics
-from core.utils.sampling_ensemble import SamplingEnsemble
-from core.utils.amlb_dataloader import AMLBDatasetLoader
-from core.utils.utils import safe_index
+from sampling_zoo.core.metrics.eval_metrics import calculate_metrics
+from sampling_zoo.core.utils.sampling_ensemble import SamplingEnsemble
+from sampling_zoo.core.utils.amlb_dataloader import AMLBDatasetLoader
+from sampling_zoo.core.utils.utils import safe_index
 from benchmark_datasets import DatasetBundle, OpenMLRawDatasetBundle, RawDatasetBundle
 from benchmark_logging import BenchmarkLogger, build_sample_stats
 from benchmark_adapters import _normalize_scores,_select_top_k_by_importance,_strategy_base_name

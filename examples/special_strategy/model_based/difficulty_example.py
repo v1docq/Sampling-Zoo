@@ -9,8 +9,8 @@ from sklearn.linear_model import LogisticRegression
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.append(str(ROOT))
 
-from core.api.api_main import SamplingStrategyFactory
-from core.utils.synt_data import create_sklearn_dataset
+from sampling_zoo.core.api.api_main import SamplingStrategyFactory
+from sampling_zoo.core.utils.synt_data import create_sklearn_dataset
 
 TASK_TYPE = "classification"
 STRATEGY_TYPE = "difficulty"

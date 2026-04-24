@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 from sklearn.metrics import roc_auc_score, f1_score
 import lightgbm as lgb
-from core.sampling_strategies.kernel_sampler import KernelSampler
+from sampling_zoo.core.sampling_strategies.kernel_sampler import KernelSampler
 import torch
 from itertools import product
 from sklearn.preprocessing import StandardScaler

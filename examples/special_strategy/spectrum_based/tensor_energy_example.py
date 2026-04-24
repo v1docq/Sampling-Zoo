@@ -1,6 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from core.api.api_main import SamplingStrategyFactory
+from sampling_zoo.core.api.api_main import SamplingStrategyFactory
 
 
 def create_synthetic_tensor(n_frames=50, height=30, width=30, noise_level=0.1):

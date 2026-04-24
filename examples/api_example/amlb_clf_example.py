@@ -17,10 +17,8 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.append(str(ROOT))
 
-from core.utils.amlb_config import ExperimentConfigBuilder
-from core.utils.amlb_setup import ExperimentConfig, LargeScaleAutoMLExperiment
-from core.repository.constant_repo import AmlbExperimentDataset
-
+from sampling_zoo.core.utils.amlb_config import ExperimentConfigBuilder
+from sampling_zoo.core.utils.amlb_setup import ExperimentConfig, LargeScaleAutoMLExperiment
 
 EXPERIMENT_REQUEST = """
 datasets: covtype-normalized

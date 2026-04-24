@@ -4,13 +4,13 @@ import os
 from scipy.stats import mode
 import pandas as pd
 import numpy as np
-from typing import List, Dict, Any, Optional, Callable, Union
+from typing import List, Dict, Any, Optional, Callable
 from lightgbm import LGBMRegressor, LGBMClassifier
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from tqdm import tqdm
 
-from core.api.api_main import SamplingStrategyFactory
-from core.metrics.eval_metrics import calculate_metrics, get_metric_comparator
+from sampling_zoo.core.api.api_main import SamplingStrategyFactory
+from sampling_zoo.core.metrics.eval_metrics import calculate_metrics, get_metric_comparator
 
 
 class SamplingEnsemble:

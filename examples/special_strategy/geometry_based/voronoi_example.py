@@ -4,12 +4,11 @@ import matplotlib.pyplot as plt
 from sklearn.datasets import make_blobs
 from sklearn.cluster import KMeans
 from scipy.spatial import Voronoi, voronoi_plot_2d
-from typing import Dict, Any, Union
 
 import sys
 import os
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
-from core.sampling_strategies.voronoi_sampler import VoronoiSampler
+from sampling_zoo.core.sampling_strategies.voronoi_sampler import VoronoiSampler
 
 # Генерация данных
 n_centers = 5

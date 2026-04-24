@@ -13,8 +13,8 @@ from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-from core.repository.constant_repo import AmlbExperimentDataset
-from core.utils.amlb_dataloader import AMLBDatasetLoader
+from sampling_zoo.core.repository.constant_repo import AmlbExperimentDataset
+from sampling_zoo.core.utils.amlb_dataloader import AMLBDatasetLoader
 
 try:
     import openml

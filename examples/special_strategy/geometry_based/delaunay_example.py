@@ -3,7 +3,7 @@ import os
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
 # from core.api.api_main import SamplingStrategyFactory
-from core.sampling_strategies.delaunay_sempler import DelaunaySampler
+from sampling_zoo.core.sampling_strategies.delaunay_sempler import DelaunaySampler
 
 import numpy as np
 import pandas as pd

@@ -3,7 +3,7 @@ import os
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
 # from core.api.api_main import SamplingStrategyFactory
-from core.sampling_strategies.hdbscan_sampler import HDBScanSampler
+from sampling_zoo.core.sampling_strategies.hdbscan_sampler import HDBScanSampler
 
 from sklearn.datasets import make_blobs
 import numpy as np

@@ -8,12 +8,12 @@ from pathlib import Path
 from typing import Dict, Tuple, Optional
 import numpy as np
 from sklearn.model_selection import KFold
-from core.metrics.eval_metrics import calculate_metrics
-from core.repository.constant_repo import AmlbExperimentDataset
-from core.utils.amlb_config import ModelSpec, ExperimentConfig, ExperimentConfigBuilder, SamplingStrategySpec
-from core.utils.amlb_dataloader import AMLBDatasetLoader
-from core.utils.amlb_tracking import ExperimentTracker
-from core.utils.sampling_ensemble import SamplingEnsemble, SingleModelImplementation
+from sampling_zoo.core.metrics.eval_metrics import calculate_metrics
+from sampling_zoo.core.repository.constant_repo import AmlbExperimentDataset
+from sampling_zoo.core.utils.amlb_config import ModelSpec, ExperimentConfig, ExperimentConfigBuilder, SamplingStrategySpec
+from sampling_zoo.core.utils.amlb_dataloader import AMLBDatasetLoader
+from sampling_zoo.core.utils.amlb_tracking import ExperimentTracker
+from sampling_zoo.core.utils.sampling_ensemble import SamplingEnsemble, SingleModelImplementation
 
 __all__ = [
     "ExperimentConfig",

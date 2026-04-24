@@ -8,8 +8,8 @@ import pandas as pd
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.append(str(ROOT))
 
-from core.api.api_main import SamplingStrategyFactory
-from core.utils.synt_data import create_noisy_dataset
+from sampling_zoo.core.api.api_main import SamplingStrategyFactory
+from sampling_zoo.core.utils.synt_data import create_noisy_dataset
 
 DATASET_SAMPLES = 10_000
 STRATEGY_TYPE = "feature_clustering"

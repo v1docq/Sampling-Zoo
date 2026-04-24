@@ -11,12 +11,12 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from core.sampling_strategies.delaunay_sempler import DelaunaySampler
-from core.sampling_strategies.hdbscan_sampler import HDBScanSampler
-from core.sampling_strategies.random_sampler import RandomSplitSampler
-from core.sampling_strategies.spectral.spectral_leverage import SpectralLeverageSampler
-from core.sampling_strategies.spectral.tensor_energy import TensorEnergySampler
-from core.sampling_strategies.voronoi_sampler import VoronoiSampler
+from sampling_zoo.core.sampling_strategies.delaunay_sempler import DelaunaySampler
+from sampling_zoo.core.sampling_strategies.hdbscan_sampler import HDBScanSampler
+from sampling_zoo.core.sampling_strategies.random_sampler import RandomSplitSampler
+from sampling_zoo.core.sampling_strategies.spectral.spectral_leverage import SpectralLeverageSampler
+from sampling_zoo.core.sampling_strategies.spectral.tensor_energy import TensorEnergySampler
+from sampling_zoo.core.sampling_strategies.voronoi_sampler import VoronoiSampler
 from benchmark_datasets import DatasetBundle
 
 

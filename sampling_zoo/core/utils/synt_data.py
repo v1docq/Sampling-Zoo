@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 from sklearn.datasets import make_classification, make_regression
 from sklearn.metrics import confusion_matrix
-from core.repository.constant_repo import SyntDataset
+from sampling_zoo.core.repository.constant_repo import SyntDataset
 
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
