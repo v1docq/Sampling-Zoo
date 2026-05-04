@@ -3,8 +3,15 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
-from iterstrat.ml_stratifiers import MultilabelStratifiedKFold, RepeatedMultilabelStratifiedKFold, \
-    IterativeStratification
+try:
+    from iterstrat.ml_stratifiers import MultilabelStratifiedKFold, RepeatedMultilabelStratifiedKFold, \
+        IterativeStratification
+except Exception:  # pragma: no cover - optional dependency
+    class _MissingIterstrat:
+        def __init__(self, *args, **kwargs):
+            raise ImportError("iterative-stratification is required for multilabel stratified sampling")
+
+    MultilabelStratifiedKFold = RepeatedMultilabelStratifiedKFold = IterativeStratification = _MissingIterstrat
 from sklearn.model_selection import RepeatedStratifiedKFold, StratifiedGroupKFold, StratifiedKFold
 from sklearn.preprocessing import KBinsDiscretizer, OneHotEncoder
 from sklearn.utils import check_random_state

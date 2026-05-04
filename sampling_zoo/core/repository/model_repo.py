@@ -1,8 +1,15 @@
 from enum import Enum
 
-from imblearn.over_sampling import SMOTE, ADASYN
-from imblearn.under_sampling import RandomUnderSampler, EditedNearestNeighbours, TomekLinks
-from imblearn.combine import SMOTEENN, SMOTETomek
+try:
+    from imblearn.over_sampling import SMOTE, ADASYN
+    from imblearn.under_sampling import RandomUnderSampler, EditedNearestNeighbours, TomekLinks
+    from imblearn.combine import SMOTEENN, SMOTETomek
+except Exception:  # pragma: no cover - optional dependency
+    class _MissingImblearnSampler:
+        def __init__(self, *args, **kwargs):
+            raise ImportError("imbalanced-learn is required for balance sampling strategies")
+
+    SMOTE = ADASYN = RandomUnderSampler = EditedNearestNeighbours = TomekLinks = SMOTEENN = SMOTETomek = _MissingImblearnSampler
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.cluster import KMeans, DBSCAN
 from sklearn.preprocessing import StandardScaler

@@ -12,7 +12,7 @@ import pandas as pd
 from scipy import sparse
 from sklearn.base import ClassifierMixin
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score, log_loss
-from sklearn.model_selection import KFold
+from sklearn.model_selection import KFold, train_test_split
 from tqdm.auto import tqdm
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -455,6 +455,42 @@ class EnsembleChunkBenchmarkRunner:
         return X_train, X_val, y_train, y_val
 
     @staticmethod
+    def _split_small_train_val(
+        X_train: Any,
+        y_train: Any,
+        problem_type: str,
+        random_state: int,
+    ) -> tuple[Any, Any, Any, Any]:
+        if len(y_train) < 4:
+            return X_train, X_train.iloc[0:0].copy() if isinstance(X_train, pd.DataFrame) else X_train[:0], y_train, y_train.iloc[0:0].copy() if isinstance(y_train, pd.Series) else y_train[:0]
+
+        y_array = np.asarray(y_train)
+        stratify = None
+        if problem_type == "classification":
+            _, counts = np.unique(y_array, return_counts=True)
+            if counts.size > 1 and np.min(counts) >= 2:
+                stratify = y_array
+
+        train_idx, val_idx = train_test_split(
+            np.arange(len(y_array)),
+            test_size=0.25,
+            random_state=random_state,
+            stratify=stratify,
+        )
+
+        def _take(value: Any, indices: np.ndarray) -> Any:
+            if isinstance(value, (pd.DataFrame, pd.Series)):
+                return value.iloc[indices].reset_index(drop=True)
+            return value[indices]
+
+        return (
+            _take(X_train, train_idx),
+            _take(X_train, val_idx),
+            _take(y_train, train_idx),
+            _take(y_train, val_idx),
+        )
+
+    @staticmethod
     def _ensure_dataframe(X: Any, dataset: RawDatasetBundle) -> pd.DataFrame:
         if isinstance(X, pd.DataFrame):
             df = X.copy()
@@ -528,11 +564,23 @@ class EnsembleChunkBenchmarkRunner:
         y_test: Any,
     ) -> Dict[str, Any]:
         train_size = len(y_train)
-        effective_partitions = max(1, int(np.ceil(train_size / 20000)))
+        force_chunking = bool(partitioner_config.get("force_chunking", False))
+        force_direct_model = bool(partitioner_config.get("force_direct_model", False)) or partitioner_config.get("strategy") == "full_dataset"
+        configured_partitions = int(partitioner_config.get("n_partitions", 1))
+        effective_partitions = configured_partitions if force_chunking else max(1, int(np.ceil(train_size / 20000)))
         target_chunks = 10
         chunks_percent = min(100.0, 100.0 * target_chunks / max(1, effective_partitions))
-        use_direct_model = train_size < 20000
+        use_direct_model = force_direct_model or (train_size < 20000 and not force_chunking)
         try:
+            if force_chunking and len(y_val) == 0:
+                X_train, X_val, y_train, y_val = self._split_small_train_val(
+                    X_train=X_train,
+                    y_train=y_train,
+                    problem_type=dataset.problem_type,
+                    random_state=self.seed + fold_idx,
+                )
+                train_size = len(y_train)
+
             X_train_df = self._ensure_dataframe(X_train, dataset)
             X_val_df = self._ensure_dataframe(X_val, dataset)
             X_test_df = self._ensure_dataframe(X_test, dataset)
@@ -623,7 +671,7 @@ class EnsembleChunkBenchmarkRunner:
                 problem=dataset.problem_type,
                 partitioner_config=tuned_partitioner_config,
                 model_factory=model_factory,
-                ensemble_method="voting",
+                ensemble_method=tuned_partitioner_config.get("ensemble_method", "voting"),
             )
 
             fit_started = perf_counter()
@@ -657,6 +705,9 @@ class EnsembleChunkBenchmarkRunner:
                 problem_type=dataset.problem_type,
                 total_train_size=len(y_train),
             )
+            trained_rows = int(sum(chunk_sizes))
+            sample_stats["sample_size"] = trained_rows
+            sample_stats["coverage_ratio"] = float(trained_rows / max(len(y_train), 1))
             sample_stats["chunk_count"] = int(len(chunk_sizes))
             sample_stats["chunk_size_mean"] = float(np.mean(chunk_sizes)) if chunk_sizes else 0.0
 
@@ -684,6 +735,8 @@ class EnsembleChunkBenchmarkRunner:
                     "n_chunks": len(ensemble.models),
                     "chunk_sizes": chunk_sizes,
                     "partition_metrics": ensemble.partition_metrics,
+                    "sampler_diagnostics": getattr(ensemble.partitioner, "diagnostics_", {}),
+                    "budget_policy": getattr(ensemble, "budget_policy_", {}),
                     "source_path": dataset.source_path,
                     "n_train": int(len(X_train)),
                     "n_val": int(len(X_val)),

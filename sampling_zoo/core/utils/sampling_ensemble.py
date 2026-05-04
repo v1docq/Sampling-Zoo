@@ -5,12 +5,17 @@ from scipy.stats import mode
 import pandas as pd
 import numpy as np
 from typing import List, Dict, Any, Optional, Callable
-from lightgbm import LGBMRegressor, LGBMClassifier
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from tqdm import tqdm
 
 from sampling_zoo.core.api.api_main import SamplingStrategyFactory
 from sampling_zoo.core.metrics.eval_metrics import calculate_metrics, get_metric_comparator
+
+try:
+    from lightgbm import LGBMRegressor, LGBMClassifier
+except Exception:  # pragma: no cover - optional dependency
+    LGBMRegressor = None
+    LGBMClassifier = None
 
 
 class SamplingEnsemble:
@@ -37,9 +42,9 @@ class SamplingEnsemble:
         # Автоматический выбор модели если не указана
         if model_factory is None and model_class is None:
             if problem == 'classification':
-                model_class = LGBMClassifier
+                model_class = LGBMClassifier or RandomForestClassifier
             elif problem == 'regression':
-                model_class = LGBMRegressor
+                model_class = LGBMRegressor or RandomForestRegressor
             else:
                 raise ValueError("Problem type must be 'classification' or 'regression'")
 
@@ -49,6 +54,7 @@ class SamplingEnsemble:
         self.ensemble_method = ensemble_method
         self.bs_size = 1000
         self.partitions = None
+        self.partitioner = None
         self.models = []
         self.partition_metrics = {}
 
@@ -62,36 +68,61 @@ class SamplingEnsemble:
         try:
             # Создаем стратегию семплирования
             factory = SamplingStrategyFactory()
-            strategy_kwargs = {
-                'n_partitions': self.partitioner_config['n_partitions'],
-                'random_state': random_state,
+            strategy_name = self.partitioner_config['strategy']
+            reserved_config_keys = {
+                'strategy',
+                'model',
+                'problem',
+                'ensemble_method',
+                'load_filename',
+                'save_filename',
+                'budget_ratio',
+                'experiment_chunk_fraction',
+                'force_chunking',
+                'force_direct_model',
             }
-            if 'chunks_percent' in self.partitioner_config:
-                strategy_kwargs['chunks_percent'] = self.partitioner_config['chunks_percent']
-            if self.partitioner_config['strategy'] in ['difficulty', 'uncertainty']:
+            strategy_kwargs = {
+                key: value
+                for key, value in self.partitioner_config.items()
+                if key not in reserved_config_keys
+            }
+            strategy_kwargs.setdefault('n_partitions', self.partitioner_config.get('n_partitions', 5))
+            strategy_kwargs.setdefault('random_state', random_state)
+            if strategy_name == 'feature_clustering':
+                allowed_keys = {'n_partitions', 'method', 'feature_engineering', 'random_state'}
+                strategy_kwargs = {key: value for key, value in strategy_kwargs.items() if key in allowed_keys}
+            elif strategy_name == 'random':
+                allowed_keys = {'n_partitions', 'random_state', 'chunks_percent'}
+                strategy_kwargs = {key: value for key, value in strategy_kwargs.items() if key in allowed_keys}
+
+            if strategy_name in ['difficulty', 'uncertainty']:
+                support_model = (
+                    (LGBMClassifier(n_estimators=50, n_jobs=-1, verbosity=-1) if LGBMClassifier is not None
+                     else RandomForestClassifier(n_estimators=50, n_jobs=-1, random_state=random_state))
+                    if self.problem == 'classification'
+                    else (LGBMRegressor(n_estimators=50, n_jobs=-1, verbosity=-1) if LGBMRegressor is not None
+                          else RandomForestRegressor(n_estimators=50, n_jobs=-1, random_state=random_state))
+                )
                 strategy_kwargs.update({
                     'problem': self.problem,
-                    'model': (
-                        LGBMClassifier(n_estimators=50, n_jobs=-1, verbosity=-1)
-                        if self.problem == 'classification'
-                        else LGBMRegressor(n_estimators=50, n_jobs=-1, verbosity=-1)
-                    ),
-                    'chunks_percent': self.partitioner_config['chunks_percent'],
+                    'model': support_model,
+                    'chunks_percent': self.partitioner_config.get('chunks_percent', 100),
                 })
 
             partitioner = factory.create_strategy(
-                strategy_type=self.partitioner_config['strategy'],
+                strategy_type=strategy_name,
                 **strategy_kwargs,
             )
+            self.partitioner = partitioner
 
             # Применяем семплирование
-            if self.partitioner_config['strategy'] in ['difficulty', 'uncertainty']:
+            if strategy_name in ['difficulty', 'uncertainty']:
                 partitioner.fit(
                     features,
                     target=target,
                 )
                 self.partitions = partitioner.get_partitions(features, target)
-            elif self.partitioner_config['strategy'].__contains__('stratified'):
+            elif strategy_name.__contains__('stratified'):
                 features['target'] = target
                 partitioner.fit(data=features, target=features.columns.to_list(), data_target=features['target'])
                 self.partitions = partitioner.get_partitions(features, target=features['target'])
@@ -100,6 +131,11 @@ class SamplingEnsemble:
             else:
                 partitioner.fit(features)
                 self.partitions = partitioner.get_partitions(features, target)
+            self.partitions = self._apply_budget_policy_to_partitions(
+                partitions=self.partitions,
+                total_rows=len(features),
+                random_state=random_state,
+            )
             print(f"Создано {len(self.partitions)} поднаборов данных:")
             if self.partitions:
                 sample_key = next(iter(self.partitions))
@@ -113,6 +149,96 @@ class SamplingEnsemble:
 
         except ImportError:
             raise ImportError("Sampling-Zoo не установлен. Установите его из https://github.com/v1docq/Sampling-Zoo")
+
+    @staticmethod
+    def _partition_size(partition_data: Any) -> int:
+        if isinstance(partition_data, dict) and 'feature' in partition_data:
+            return len(partition_data['feature'])
+        return len(partition_data)
+
+    @staticmethod
+    def _take_local_rows(value: Any, local_indices: np.ndarray) -> Any:
+        if isinstance(value, (pd.DataFrame, pd.Series)):
+            return value.iloc[local_indices].reset_index(drop=True)
+        return np.asarray(value)[local_indices]
+
+    def _slice_partition(self, partition_data: Any, local_indices: np.ndarray) -> Any:
+        if isinstance(partition_data, dict):
+            return {
+                key: self._take_local_rows(value, local_indices)
+                for key, value in partition_data.items()
+            }
+        return self._take_local_rows(partition_data, local_indices)
+
+    def _apply_budget_policy_to_partitions(
+        self,
+        partitions: Dict[str, Any],
+        total_rows: int,
+        random_state: int,
+    ) -> Dict[str, Any]:
+        budget_ratio = self.partitioner_config.get('budget_ratio')
+        if budget_ratio is None:
+            self.budget_policy_ = {'applied': False}
+            return partitions
+
+        budget_ratio = float(budget_ratio)
+        if not (0 < budget_ratio <= 1):
+            raise ValueError("budget_ratio must be in (0, 1]")
+
+        sizes = {name: self._partition_size(chunk) for name, chunk in partitions.items()}
+        sizes = {name: size for name, size in sizes.items() if size > 0}
+        if not sizes:
+            self.budget_policy_ = {'applied': False, 'reason': 'empty_partitions'}
+            return partitions
+
+        budget_size = max(1, min(total_rows, int(round(total_rows * budget_ratio))))
+        current_size = int(sum(sizes.values()))
+        if current_size <= budget_size:
+            self.budget_policy_ = {
+                'applied': False,
+                'budget_ratio': budget_ratio,
+                'budget_size': budget_size,
+                'current_size': current_size,
+            }
+            return partitions
+
+        ordered_names = sorted(sizes, key=lambda name: sizes[name], reverse=True)
+        if budget_size < len(ordered_names):
+            ordered_names = ordered_names[:budget_size]
+
+        ordered_total = sum(sizes[name] for name in ordered_names)
+        counts = {
+            name: max(1, min(sizes[name], int(np.floor(budget_size * sizes[name] / max(ordered_total, 1)))))
+            for name in ordered_names
+        }
+
+        while sum(counts.values()) > budget_size:
+            candidates = [name for name, count in counts.items() if count > 1]
+            if not candidates:
+                break
+            counts[max(candidates, key=lambda item: counts[item])] -= 1
+
+        while sum(counts.values()) < budget_size:
+            candidates = [name for name in ordered_names if counts[name] < sizes[name]]
+            if not candidates:
+                break
+            counts[max(candidates, key=lambda item: sizes[item] - counts[item])] += 1
+
+        rng = np.random.default_rng(random_state)
+        budgeted: Dict[str, Any] = {}
+        for name in ordered_names:
+            local_indices = np.sort(rng.choice(np.arange(sizes[name]), size=counts[name], replace=False))
+            budgeted[name] = self._slice_partition(partitions[name], local_indices)
+
+        self.budget_policy_ = {
+            'applied': True,
+            'budget_ratio': budget_ratio,
+            'budget_size': budget_size,
+            'current_size': current_size,
+            'selected_size': int(sum(counts.values())),
+            'partition_sizes': {name: int(count) for name, count in counts.items()},
+        }
+        return budgeted
 
     def _create_model_instance(self):
         """Создает экземпляр модели с заданными параметрами"""
@@ -385,6 +511,74 @@ class SamplingEnsemble:
 
         return selected, best_score
 
+    def _validation_weights(self, active_models: List[Dict[str, Any]]) -> np.ndarray:
+        """
+        Converts validation metrics into non-negative model priors.
+        For regression lower RMSE/MAE is better; for classification higher F1/accuracy is better.
+        """
+        raw_weights = []
+        eps = 1e-8
+        for model_info in active_models:
+            metrics = model_info.get('metrics', {}) or {}
+            if self.problem == 'regression':
+                if 'rmse' in metrics and np.isfinite(metrics['rmse']):
+                    raw_weights.append(1.0 / (float(metrics['rmse']) + eps))
+                elif 'mae' in metrics and np.isfinite(metrics['mae']):
+                    raw_weights.append(1.0 / (float(metrics['mae']) + eps))
+                else:
+                    raw_weights.append(1.0)
+            else:
+                value = metrics.get('f1_weighted', metrics.get('accuracy', 1.0))
+                raw_weights.append(max(float(value), eps) if np.isfinite(value) else 1.0)
+
+        weights = np.asarray(raw_weights, dtype=float)
+        if not np.all(np.isfinite(weights)) or weights.sum() <= 0:
+            weights = np.ones(len(active_models), dtype=float)
+        return weights / weights.sum()
+
+    def _routing_weights(self, features: pd.DataFrame, active_models: List[Dict[str, Any]]) -> np.ndarray:
+        """
+        Returns row-wise routing probabilities aligned with active_models.
+        If the sampler cannot route new points, falls back to uniform routing.
+        """
+        n_samples = len(features)
+        n_models = len(active_models)
+        if self.partitioner is None:
+            return np.full((n_samples, n_models), 1.0 / max(n_models, 1))
+
+        model_names = [model_info.get('name') for model_info in active_models]
+        try:
+            if hasattr(self.partitioner, 'predict_partition_proba'):
+                proba = np.asarray(self.partitioner.predict_partition_proba(features), dtype=float)
+                partition_names = list(getattr(self.partitioner, 'partition_names_', []))
+                if partition_names and proba.shape[1] == len(partition_names):
+                    name_to_col = {name: idx for idx, name in enumerate(partition_names)}
+                    aligned = np.zeros((proba.shape[0], n_models), dtype=float)
+                    for model_idx, name in enumerate(model_names):
+                        if name in name_to_col:
+                            aligned[:, model_idx] = proba[:, name_to_col[name]]
+                    if aligned.sum() > 0:
+                        row_sums = aligned.sum(axis=1, keepdims=True)
+                        aligned = np.where(row_sums > 0, aligned / row_sums, 1.0 / n_models)
+                        return aligned
+
+            if hasattr(self.partitioner, 'predict_partitions'):
+                labels = np.asarray(self.partitioner.predict_partitions(features))
+                aligned = np.full((labels.shape[0], n_models), 0.0, dtype=float)
+                for model_idx, name in enumerate(model_names):
+                    try:
+                        label_id = int(str(name).split('_')[-1])
+                    except Exception:
+                        label_id = model_idx
+                    aligned[:, model_idx] = (labels == label_id).astype(float)
+                row_sums = aligned.sum(axis=1, keepdims=True)
+                aligned = np.where(row_sums > 0, aligned / row_sums, 1.0 / n_models)
+                return aligned
+        except Exception:
+            pass
+
+        return np.full((n_samples, n_models), 1.0 / max(n_models, 1))
+
     def ensemble_predict(self, features: pd.DataFrame, stage: str = 'inference', models: Optional[List[Dict[str, Any]]] = None) -> np.ndarray:
         """
         Ансамблирование предсказаний всех моделей
@@ -417,8 +611,7 @@ class SamplingEnsemble:
 
         elif self.ensemble_method == 'weighted':
             # Взвешенное голосование на основе качества моделей
-            weights = [model_info.get('metrics', {}).get('f1_weighted', 0.5) for model_info in active_models]
-            weights = np.array(weights) / sum(weights)
+            weights = self._validation_weights(active_models)
 
             if self.problem == 'classification':
                 # Для классификации: взвешенное голосование по вероятностям
@@ -437,6 +630,43 @@ class SamplingEnsemble:
 
             elif self.problem == 'regression':
                 return np.average(predictions, axis=0, weights=weights)
+
+        elif self.ensemble_method == 'routed_weighted':
+            validation_weights = self._validation_weights(active_models)
+            routing_weights = self._routing_weights(features, active_models)
+            combined_weights = routing_weights * validation_weights.reshape(1, -1)
+            row_sums = combined_weights.sum(axis=1, keepdims=True)
+            combined_weights = np.where(row_sums > 0, combined_weights / row_sums, 1.0 / len(active_models))
+
+            if self.problem == 'regression':
+                stacked_preds = np.column_stack(predictions)
+                return np.sum(stacked_preds * combined_weights, axis=1)
+
+            proba_predictions = []
+            classes_reference = None
+            for model_info in active_models:
+                model = model_info['model']
+                if not hasattr(model, 'predict_proba'):
+                    # Fallback to hard labels encoded as one-hot over observed predictions.
+                    labels = model.predict(features)
+                    if classes_reference is None:
+                        classes_reference = np.unique(labels)
+                    one_hot = np.zeros((len(labels), len(classes_reference)))
+                    for class_idx, cls in enumerate(classes_reference):
+                        one_hot[:, class_idx] = (labels == cls).astype(float)
+                    proba_predictions.append(one_hot)
+                    continue
+                proba = model.predict_proba(features)
+                proba_predictions.append(proba)
+                if classes_reference is None and hasattr(model, 'classes_'):
+                    classes_reference = np.asarray(model.classes_)
+
+            weighted_proba = np.zeros_like(proba_predictions[0], dtype=float)
+            for model_idx, proba in enumerate(proba_predictions):
+                weighted_proba += proba * combined_weights[:, model_idx:model_idx + 1]
+            if classes_reference is not None and len(classes_reference) == weighted_proba.shape[1]:
+                return classes_reference[np.argmax(weighted_proba, axis=1)]
+            return np.argmax(weighted_proba, axis=1)
 
         else:
             raise ValueError(f"Неизвестный метод ансамблирования: {self.ensemble_method}")

@@ -5,11 +5,14 @@ from typing import Any, Dict, Sequence
 import sys
 import numpy as np
 
-from benchmark_models import _search_params, _sample_from_partitions, _to_dense
-
 ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
+BENCHMARK_DIR = Path(__file__).resolve().parent
+if str(BENCHMARK_DIR) not in sys.path:
+    sys.path.insert(0, str(BENCHMARK_DIR))
+
+from benchmark_models import _search_params, _sample_from_partitions, _to_dense
 
 from sampling_zoo.core.sampling_strategies.delaunay_sempler import DelaunaySampler
 from sampling_zoo.core.sampling_strategies.hdbscan_sampler import HDBScanSampler
@@ -214,21 +217,52 @@ def make_chunking_strategy_configs(
     strategy_names: Sequence[str],
     n_partitions: int = 3,
     seed: int = 42,
+    ensemble_method: str = "voting",
+    chunk_fraction: float | None = None,
+    budget_ratio: float | None = None,
+    force_chunking: bool = False,
+    extra_strategy_params: Dict[str, Any] | None = None,
 ) -> Dict[str, Dict[str, Any]]:
     configs: Dict[str, Dict[str, Any]] = {}
+    extra_strategy_params = extra_strategy_params or {}
     for strategy_name in strategy_names:
         normalized_name = strategy_name.strip().lower()
-        if normalized_name not in {"difficulty", "random", "feature_clustering"}:
+        if normalized_name not in {"difficulty", "random", "feature_clustering", "rmt_contraction"}:
             raise ValueError(f"Unsupported chunking strategy: {strategy_name}")
 
         strategy_config: Dict[str, Any] = {
             "strategy": normalized_name,
             "n_partitions": n_partitions,
             "random_state": seed,
+            "ensemble_method": ensemble_method,
         }
+        if budget_ratio is not None:
+            strategy_config["budget_ratio"] = float(budget_ratio)
+        if chunk_fraction is not None:
+            strategy_config["experiment_chunk_fraction"] = float(chunk_fraction)
+        if force_chunking:
+            strategy_config["force_chunking"] = True
+
         if normalized_name == "difficulty":
             strategy_config["problem"] = problem_type
             strategy_config["chunks_percent"] = 100
+        elif normalized_name == "feature_clustering":
+            strategy_config["method"] = "kmeans"
+        elif normalized_name == "rmt_contraction":
+            strategy_config.update({
+                "n_views": 16,
+                "projection_dim": 8,
+                "approx_rank": 16,
+                "selection_method": "hybrid",
+                "routing_temperature": 1.0,
+                "routing_shrinkage": 0.05,
+                "backend": "auto",
+                "max_encoded_features": 4096,
+            })
+            if chunk_fraction is not None:
+                strategy_config["chunk_fraction"] = float(chunk_fraction)
+
+        strategy_config.update(extra_strategy_params.get(normalized_name, {}))
 
         configs[normalized_name] = strategy_config
 

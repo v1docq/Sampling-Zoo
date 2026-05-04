@@ -19,7 +19,9 @@ import numpy as np
 import pandas as pd
 from scipy import sparse
 from sklearn.base import ClassifierMixin
-from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier, RandomForestRegressor
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import f1_score
 from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.neural_network import MLPClassifier
@@ -177,7 +179,7 @@ def make_model_pool(
     problem_type: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Builds model pool for benchmark runners (name -> factory callable)."""
-    available_names = {"random_forest", "lightgbm", "hist_gradient_boosting", "tabpfn", "tabicl"}
+    available_names = {"random_forest", "lightgbm", "hist_gradient_boosting", "ridge", "tabpfn", "tabicl"}
     if model_names is None:
         requested = {"random_forest", "lightgbm"}
     else:
@@ -191,15 +193,26 @@ def make_model_pool(
     normalized_problem = problem_type.strip().lower() if problem_type else "classification"
 
     if "random_forest" in requested:
-        model_pool["random_forest"] = lambda: RandomForestClassifier(
-            n_estimators=80,
-            max_depth=10,
-            min_samples_leaf=2,
-            n_jobs=-1,
-            random_state=seed,
-        )
+        if normalized_problem == "regression":
+            model_pool["random_forest"] = lambda: RandomForestRegressor(
+                n_estimators=80,
+                max_depth=10,
+                min_samples_leaf=2,
+                n_jobs=-1,
+                random_state=seed,
+            )
+        else:
+            model_pool["random_forest"] = lambda: RandomForestClassifier(
+                n_estimators=80,
+                max_depth=10,
+                min_samples_leaf=2,
+                n_jobs=-1,
+                random_state=seed,
+            )
 
     if "lightgbm" in requested:
+        if LGBMClassifier is None or LGBMRegressor is None:
+            raise ValueError("lightgbm is not available. Install lightgbm or choose another model.")
         if normalized_problem == "regression":
             model_pool["lightgbm"] = lambda: LGBMRegressor(
                 random_state=seed,
@@ -212,12 +225,26 @@ def make_model_pool(
             )
 
     if "hist_gradient_boosting" in requested:
-        model_pool["hist_gradient_boosting"] = lambda: HistGradientBoostingClassifier(
-            max_depth=8,
-            learning_rate=0.06,
-            max_iter=250,
-            random_state=seed,
-        )
+        if normalized_problem == "regression":
+            model_pool["hist_gradient_boosting"] = lambda: HistGradientBoostingRegressor(
+                max_depth=8,
+                learning_rate=0.06,
+                max_iter=250,
+                random_state=seed,
+            )
+        else:
+            model_pool["hist_gradient_boosting"] = lambda: HistGradientBoostingClassifier(
+                max_depth=8,
+                learning_rate=0.06,
+                max_iter=250,
+                random_state=seed,
+            )
+
+    if "ridge" in requested:
+        if normalized_problem == "regression":
+            model_pool["ridge"] = lambda: Ridge()
+        else:
+            model_pool["ridge"] = lambda: LogisticRegression(max_iter=500, random_state=seed)
 
     if "tabpfn" in requested:
         if TabPFNClassifier is None or TabPFNRegressor is None:

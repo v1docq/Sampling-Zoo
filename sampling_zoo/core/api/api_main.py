@@ -14,10 +14,14 @@ from sampling_zoo.core.sampling_strategies.stratified_sampler import (
 from sampling_zoo.core.sampling_strategies.balance_sampler import StratifiedBalancedSplitSampler
 from sampling_zoo.core.sampling_strategies.spectral.spectral_leverage import SpectralLeverageSampler
 from sampling_zoo.core.sampling_strategies.spectral.tensor_energy import TensorEnergySampler
+from sampling_zoo.core.sampling_strategies.spectral.rmt_contraction_sampler import RMTContractionTensorSampler
 from sampling_zoo.core.sampling_strategies.delaunay_sempler import DelaunaySampler
 from sampling_zoo.core.sampling_strategies.hdbscan_sampler import HDBScanSampler
 from sampling_zoo.core.sampling_strategies.voronoi_sampler import VoronoiSampler
-from sampling_zoo.core.sampling_strategies.kernel_sampler import KernelSampler
+try:
+    from sampling_zoo.core.sampling_strategies.kernel_sampler import KernelSampler
+except Exception:  # pragma: no cover - optional torch-backed sampler
+    KernelSampler = None
 
 class SamplingStrategyFactory:
     """
@@ -50,14 +54,16 @@ class SamplingStrategyFactory:
             'delaunay': DelaunaySampler,
             'hdbscan': HDBScanSampler,
             'voronoi': VoronoiSampler,
+            'rmt_contraction': RMTContractionTensorSampler,
         }
 
         # SUBSET SAMPLERS
         self.subset_strategies = {
             'spectral_leverage': SpectralLeverageSampler,
             'tensor_energy': TensorEnergySampler,
-            'kernel': KernelSampler,
         }
+        if KernelSampler is not None:
+            self.subset_strategies['kernel'] = KernelSampler
 
         self.strategy_map = {**self.chunking_strategies, **self.subset_strategies}
 
