@@ -87,8 +87,8 @@ class SamplingStrategyFactory:
         return self.strategy_map[strategy_type](**kwargs)
 
     def create_and_fit(self, strategy_type: str, data: Union[np.ndarray, pd.DataFrame], target: Any = None,
-                       strategy_kwargs: Dict[str, Any] | None = None,
-                       fit_kwargs: Dict[str, Any] | None = None) -> BaseSampler:
+                       strategy_kwargs: Dict = None,
+                       fit_kwargs: Dict = None) -> BaseSampler:
         """Создает стратегию и сразу обучает её на переданных данных."""
         strategy_kwargs = strategy_kwargs or {}
         fit_kwargs = fit_kwargs or {}
@@ -106,7 +106,7 @@ class SamplingStrategyFactory:
         return strategy
 
     def fit_transform(self, strategy_type: str, data: Union[np.ndarray, pd.DataFrame], target: Any = None,
-                      strategy_kwargs: Dict[str, Any] | None = None, fit_kwargs: Dict[str, Any] | None = None,
+                      strategy_kwargs: Dict = None, fit_kwargs: Dict = None,
                       return_strategy: bool = False) -> Any:
         """Удобный вызов для создания стратегии и получения разбиений или индексов."""
         strategy = self.create_and_fit(strategy_type, data, target, strategy_kwargs, fit_kwargs)

@@ -1,13 +1,23 @@
 from abc import ABC, abstractmethod
 import logging
 from collections import Counter
-from typing import Any, Dict, List, Union, Optional
+from typing import Any, Dict, List, Union, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from scipy import sparse
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
 from sklearn.model_selection import StratifiedShuffleSplit
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 from ..utils.utils import safe_index
+
+try:  # optional backend
+    import torch
+except Exception:  # pragma: no cover - torch is optional
+    torch = None
 
 
 class BaseSampler(ABC):
@@ -18,6 +28,10 @@ class BaseSampler(ABC):
     def __init__(self, random_state: int = 42, **kwargs):
         self.random_state = random_state
         self.partitions = None
+        self.preprocessor_: Optional[ColumnTransformer] = None
+        self.encoded_feature_subset_: Optional[np.ndarray] = None
+        self.raw_encoded_feature_count_: Optional[int] = None
+        self.encoded_feature_count_: Optional[int] = None
 
     @abstractmethod
     def fit(
@@ -118,6 +132,173 @@ class BaseSampler(ABC):
             return self.partitions
 
         return self._build_feature_target_partitions(data, target)
+
+    @staticmethod
+    def _validate_positive_int(name: str, value: int) -> int:
+        if int(value) < 1:
+            raise ValueError(f"{name} must be positive")
+        return int(value)
+
+    @staticmethod
+    def _validate_fraction(name: str, value: float) -> float:
+        value = float(value)
+        if not (0 < value <= 1):
+            raise ValueError(f"{name} must be in (0, 1]")
+        return value
+
+    @staticmethod
+    def _validate_percent(name: str, value: float) -> float:
+        value = float(value)
+        if not (0 < value <= 100):
+            raise ValueError(f"{name} must be in (0, 100]")
+        return value
+
+    @staticmethod
+    def _validate_choice(name: str, value: str, choices: Sequence[str]) -> str:
+        if value not in choices:
+            allowed = ", ".join(choices)
+            raise ValueError(f"{name} must be one of: {allowed}")
+        return value
+
+    def _configure_tabular_preprocessing(
+        self,
+        *,
+        include_categorical: bool = True,
+        max_one_hot_cardinality: int = 128,
+        max_encoded_features: Optional[int] = None,
+    ) -> None:
+        self.include_categorical = bool(include_categorical)
+        self.max_one_hot_cardinality = int(max_one_hot_cardinality)
+        self.max_encoded_features = max_encoded_features
+
+    def _fit_transform_features(self, data: Union[np.ndarray, pd.DataFrame]) -> np.ndarray:
+        if isinstance(data, pd.DataFrame):
+            X = self._fit_transform_dataframe(data)
+        else:
+            X = self._fit_transform_array(data)
+        return self._cap_and_densify_encoded_features(X)
+
+    def _fit_transform_dataframe(self, data: pd.DataFrame) -> Any:
+        df = data.copy()
+        numeric_cols = df.select_dtypes(include=[np.number, "bool"]).columns.tolist()
+        categorical_cols = self._select_categorical_columns(df, numeric_cols)
+        transformers = self._build_tabular_transformers(numeric_cols, categorical_cols)
+        if not transformers:
+            raise ValueError(f"No usable numeric/categorical columns for {type(self).__name__}")
+        self.preprocessor_ = ColumnTransformer(transformers, remainder="drop", sparse_threshold=1.0)
+        return self.preprocessor_.fit_transform(df)
+
+    def _fit_transform_array(self, data: Union[np.ndarray, pd.DataFrame]) -> Any:
+        arr = np.asarray(data)
+        if arr.ndim != 2:
+            raise ValueError("Input data must be a 2D matrix")
+        self.preprocessor_ = ColumnTransformer([
+            ("num", Pipeline([
+                ("imputer", SimpleImputer(strategy="median")),
+                ("scaler", StandardScaler()),
+            ]), list(range(arr.shape[1])))
+        ])
+        return self.preprocessor_.fit_transform(arr)
+
+    def _select_categorical_columns(self, df: pd.DataFrame, numeric_cols: Sequence[str]) -> List[str]:
+        categorical_cols = [c for c in df.columns if c not in numeric_cols]
+        if not getattr(self, "include_categorical", True):
+            return []
+        return [
+            c for c in categorical_cols
+            if df[c].astype("string").nunique(dropna=True) <= getattr(self, "max_one_hot_cardinality", 128)
+        ]
+
+    @staticmethod
+    def _build_tabular_transformers(
+        numeric_cols: Sequence[str],
+        categorical_cols: Sequence[str],
+    ) -> List[Tuple[str, Pipeline, Sequence[str]]]:
+        transformers: List[Tuple[str, Pipeline, Sequence[str]]] = []
+        if numeric_cols:
+            transformers.append((
+                "num",
+                Pipeline([
+                    ("imputer", SimpleImputer(strategy="median")),
+                    ("scaler", StandardScaler()),
+                ]),
+                numeric_cols,
+            ))
+        if categorical_cols:
+            try:
+                encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=True)
+            except TypeError:  # sklearn < 1.2
+                encoder = OneHotEncoder(handle_unknown="ignore", sparse=True)
+            transformers.append((
+                "cat",
+                Pipeline([
+                    ("imputer", SimpleImputer(strategy="most_frequent")),
+                    ("encoder", encoder),
+                ]),
+                categorical_cols,
+            ))
+        return transformers
+
+    def _cap_and_densify_encoded_features(self, X: Any) -> np.ndarray:
+        self.raw_encoded_feature_count_ = int(X.shape[1])
+        if self.max_encoded_features is not None and X.shape[1] > self.max_encoded_features:
+            rng = np.random.default_rng(self.random_state)
+            keep = np.sort(rng.choice(X.shape[1], size=self.max_encoded_features, replace=False))
+            self.encoded_feature_subset_ = keep
+            X = X[:, keep]
+        else:
+            self.encoded_feature_subset_ = None
+        self.encoded_feature_count_ = int(X.shape[1])
+        return self._as_dense_float(X)
+
+    def _transform_features(self, data: Union[np.ndarray, pd.DataFrame]) -> np.ndarray:
+        if self.preprocessor_ is None:
+            raise RuntimeError("Preprocessor is not fitted")
+        X = self.preprocessor_.transform(data.copy() if isinstance(data, pd.DataFrame) else data)
+        keep = getattr(self, "encoded_feature_subset_", None)
+        if keep is not None:
+            X = X[:, keep]
+        return self._as_dense_float(X)
+
+    @staticmethod
+    def _as_dense_float(X: Any) -> np.ndarray:
+        if sparse.issparse(X):
+            X = X.toarray()
+        X = np.asarray(X, dtype=np.float64)
+        return np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _resolve_backend(self) -> str:
+        if self.backend == "numpy":
+            return "numpy"
+        if self.backend == "torch":
+            if torch is None:
+                raise ImportError("backend='torch' requires torch to be installed")
+            self._resolve_torch_device()
+            return "torch"
+        if torch is None:
+            return "numpy"
+        self._resolve_torch_device()
+        return "torch"
+
+    def _resolve_torch_device(self) -> Any:
+        if torch is None:
+            return None
+        device = torch.device(self.device)
+        if device.type == "cuda" and not torch.cuda.is_available():
+            if self.backend == "torch":
+                raise ValueError(f"Requested torch device is not available: {self.device}")
+            device = torch.device("cpu")
+        return device
+
+    def _torch_dtype(self) -> Any:
+        if torch is None:
+            return None
+        return torch.float32 if self.dtype == "float32" else torch.float64
+
+    def _to_torch_matrix(self, X: np.ndarray) -> Any:
+        if torch is None:
+            raise RuntimeError("Torch backend selected but torch is unavailable")
+        return torch.as_tensor(X, dtype=self._torch_dtype(), device=self._resolve_torch_device())
 
 
 class HierarchicalStratifiedMixin:

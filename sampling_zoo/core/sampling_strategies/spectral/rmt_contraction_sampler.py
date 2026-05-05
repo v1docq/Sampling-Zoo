@@ -1,20 +1,16 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from dataclasses import dataclass, replace
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
-from scipy import sparse
 from sklearn.cluster import KMeans
-from sklearn.compose import ColumnTransformer
-from sklearn.impute import SimpleImputer
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.utils.extmath import randomized_svd
 
-from ..base_sampler import BaseSampler
+from .base_sampler import SpectralSamplerBase
+from ...utils.progress import progress_bar
 from ...utils.utils import safe_index
 
 try:  # optional backend
@@ -35,7 +31,48 @@ class ViewSpec:
     output_dim: int
 
 
-class RMTContractionTensorSampler(BaseSampler):
+@dataclass(frozen=True)
+class RMTContractionConfig:
+    """Normalized construction parameters for RMT contraction sampling."""
+
+    n_partitions: int = 5
+    n_views: int = 16
+    view_size: Optional[Union[int, float]] = None
+    projection_dim: Optional[int] = None
+    approx_rank: Union[int, float] = 16
+    view_strategy: str = "gaussian"
+    chunk_fraction: float = 1.0
+    chunks_percent: float = 100.0
+    min_chunk_size: int = 1
+    max_chunk_size: Optional[int] = None
+    selection_method: str = "hybrid"
+    routing_temperature: float = 1.0
+    routing_shrinkage: float = 0.05
+    include_categorical: bool = True
+    max_one_hot_cardinality: int = 128
+    max_encoded_features: Optional[int] = 4096
+    oversample_factor: int = 10
+    power_iterations: int = 2
+    backend: str = "auto"
+    device: str = "cpu"
+    dtype: str = "float32"
+    max_unfolding_elements: Optional[int] = None
+    show_progress: bool = True
+    random_state: Union[int, None] = 42
+
+    @classmethod
+    def from_overrides(
+        cls,
+        config: Optional["RMTContractionConfig"],
+        overrides: Dict[str, Any],
+    ) -> "RMTContractionConfig":
+        base = config or cls()
+        valid_fields = cls.__dataclass_fields__
+        accepted = {key: value for key, value in overrides.items() if key in valid_fields}
+        return replace(base, **accepted)
+
+
+class RMTContractionTensorSampler(SpectralSamplerBase):
     """
     Chunking sampler based on random feature contractions and sample-mode spectra.
 
@@ -53,88 +90,74 @@ class RMTContractionTensorSampler(BaseSampler):
 
     def __init__(
         self,
-        n_partitions: int = 5,
-        n_views: int = 16,
-        view_size: Optional[Union[int, float]] = None,
-        projection_dim: Optional[int] = None,
-        approx_rank: Union[int, float] = 16,
-        view_strategy: str = "subsample",  # {"subsample", "gaussian"}
-        chunk_fraction: float = 1.0,
-        chunks_percent: float = 100.0,
-        min_chunk_size: int = 1,
-        max_chunk_size: Optional[int] = None,
-        selection_method: str = "hybrid",  # {"all", "leverage", "maxvol", "hybrid"}
-        routing_temperature: float = 1.0,
-        routing_shrinkage: float = 0.05,
-        include_categorical: bool = True,
-        max_one_hot_cardinality: int = 128,
-        max_encoded_features: Optional[int] = 4096,
-        oversample_factor: int = 10,
-        power_iterations: int = 2,
-        backend: str = "auto",
-        device: str = "cpu",
-        dtype: str = "float32",
-        max_unfolding_elements: Optional[int] = None,
-        random_state: int = 42,
+        config: Optional[RMTContractionConfig] = None,
+        *args: Any,
         **kwargs: Any,
     ) -> None:
-        super().__init__(random_state=random_state)
-        if n_partitions < 1:
-            raise ValueError("n_partitions must be positive")
-        if n_views < 1:
-            raise ValueError("n_views must be positive")
-        if not (0 < chunk_fraction <= 1):
-            raise ValueError("chunk_fraction must be in (0, 1]")
-        if not (0 < chunks_percent <= 100):
-            raise ValueError("chunks_percent must be in (0, 100]")
-        if selection_method not in {"all", "leverage", "maxvol", "hybrid"}:
-            raise ValueError("selection_method must be one of: all, leverage, maxvol, hybrid")
-        if view_strategy not in {"subsample", "gaussian"}:
-            raise ValueError("view_strategy must be one of: subsample, gaussian")
-        if backend not in {"auto", "torch", "numpy"}:
-            raise ValueError("backend must be one of: auto, torch, numpy")
-        if dtype not in {"float32", "float64"}:
-            raise ValueError("dtype must be one of: float32, float64")
-
-        self.n_partitions = int(n_partitions)
-        self.n_views = int(n_views)
-        self.view_size = view_size
-        self.projection_dim = projection_dim
-        self.approx_rank = approx_rank
-        self.view_strategy = view_strategy
-        self.chunk_fraction = float(chunk_fraction)
-        self.chunks_percent = float(chunks_percent)
-        self.min_chunk_size = int(min_chunk_size)
-        self.max_chunk_size = max_chunk_size
-        self.selection_method = selection_method
-        self.routing_temperature = float(routing_temperature)
-        self.routing_shrinkage = float(routing_shrinkage)
-        self.include_categorical = bool(include_categorical)
-        self.max_one_hot_cardinality = int(max_one_hot_cardinality)
-        self.max_encoded_features = max_encoded_features
-        self.oversample_factor = int(oversample_factor)
-        self.power_iterations = int(power_iterations)
-        self.backend = backend
-        self.backend_: Optional[str] = None
-        self.device = device
-        self.dtype = dtype
-        self.max_unfolding_elements = max_unfolding_elements
-
-        self.preprocessor_: Optional[ColumnTransformer] = None
-        self.view_specs_: List[ViewSpec] = []
-        self.singular_values_: Optional[np.ndarray] = None
-        self.right_basis_: Optional[np.ndarray] = None
-        self.sample_embedding_: Optional[np.ndarray] = None
-        self.leverage_scores_: Optional[np.ndarray] = None
-        self.clusterer_: Optional[KMeans] = None
-        self.cluster_labels_: Optional[np.ndarray] = None
-        self.partition_names_: List[str] = []
-        self.partition_to_cluster_: Dict[str, int] = {}
-        self.partitions: Dict[str, np.ndarray] = {}
-        self.diagnostics_: Dict[str, Any] = {}
-        self.encoded_feature_subset_: Optional[np.ndarray] = None
-        self.raw_encoded_feature_count_: Optional[int] = None
-        self.encoded_feature_count_: Optional[int] = None
+        if config is not None and not isinstance(config, RMTContractionConfig):
+            positional_names = (
+                "n_partitions",
+                "n_views",
+                "view_size",
+                "projection_dim",
+                "approx_rank",
+                "view_strategy",
+                "chunk_fraction",
+                "chunks_percent",
+                "min_chunk_size",
+                "max_chunk_size",
+                "selection_method",
+                "routing_temperature",
+                "routing_shrinkage",
+                "include_categorical",
+                "max_one_hot_cardinality",
+                "max_encoded_features",
+                "oversample_factor",
+                "power_iterations",
+                "backend",
+                "device",
+                "dtype",
+                "max_unfolding_elements",
+                "show_progress",
+                "random_state",
+            )
+            values = (config, *args)
+            if len(values) > len(positional_names):
+                raise TypeError(f"Expected at most {len(positional_names)} positional arguments")
+            for name, value in zip(positional_names, values):
+                kwargs.setdefault(name, value)
+            config = None
+        elif args:
+            raise TypeError("Positional overrides require positional n_partitions as the first argument")
+        cfg = RMTContractionConfig.from_overrides(config, kwargs)
+        super().__init__(
+            sample_size=None,
+            approx_rank=cfg.approx_rank,
+            random_state=cfg.random_state,
+            n_partitions=cfg.n_partitions,
+            n_views=cfg.n_views,
+            view_strategy=cfg.view_strategy,
+            chunk_fraction=cfg.chunk_fraction,
+            chunks_percent=cfg.chunks_percent,
+            min_chunk_size=cfg.min_chunk_size,
+            max_chunk_size=cfg.max_chunk_size,
+            selection_method=cfg.selection_method,
+            routing_temperature=cfg.routing_temperature,
+            routing_shrinkage=cfg.routing_shrinkage,
+            backend=cfg.backend,
+            device=cfg.device,
+            dtype=cfg.dtype,
+            include_categorical=cfg.include_categorical,
+            max_one_hot_cardinality=cfg.max_one_hot_cardinality,
+            max_encoded_features=cfg.max_encoded_features,
+            show_progress=cfg.show_progress,
+        )
+        self.config = cfg
+        self.view_size = cfg.view_size
+        self.projection_dim = cfg.projection_dim
+        self.oversample_factor = int(cfg.oversample_factor)
+        self.power_iterations = int(cfg.power_iterations)
+        self.max_unfolding_elements = cfg.max_unfolding_elements
 
     def fit(
         self,
@@ -142,31 +165,68 @@ class RMTContractionTensorSampler(BaseSampler):
         target: Optional[Union[np.ndarray, pd.Series]] = None,
         **kwargs: Any,
     ) -> "RMTContractionTensorSampler":
-        self.backend_ = self._resolve_backend()
-        rng = np.random.default_rng(self.random_state)
-        X_num = self._fit_transform_features(data)
-        M = self._build_mode0_unfolding(X_num, fit=True, rng=rng)
+        with progress_bar(
+            enabled=self.show_progress,
+            desc="RMT sampler fit",
+            total=5,
+        ) as stage:
+            rng = self._start_fit()
+            X_num = self._fit_transform_features(data)
+            stage.update(1)
+            M = self._build_fit_unfolding(X_num, rng)
+            stage.update(1)
+            U, S, Vt, scores, rank = self._fit_spectral_basis(M)
+            stage.update(1)
+            self._store_spectral_basis(U, S, Vt, scores)
+            self._fit_clusters_and_partitions(scores, target)
+            stage.update(1)
+            self._build_diagnostics(M, rank)
+            stage.update(1)
+        return self
 
+    def _start_fit(self) -> np.random.Generator:
+        self.backend_ = self._resolve_backend()
+        return np.random.default_rng(self.random_state)
+
+    def _build_fit_unfolding(self, X_num: np.ndarray, rng: np.random.Generator) -> Any:
+        return self._build_mode0_unfolding(X_num, fit=True, rng=rng)
+
+    def _fit_spectral_basis(
+        self,
+        M: Any,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
         n_samples, n_features = self._matrix_shape(M)
         rank = self._resolve_rank(self.approx_rank, n_samples, n_features)
         n_components = min(n_samples, n_features, rank + self.oversample_factor)
         if n_components < 1:
             raise ValueError("Cannot compute randomized SVD: empty transformed matrix")
-
         U, S, Vt, scores = self._compute_spectral_basis(M, rank, n_components)
+        return U, S, Vt, scores, rank
 
+    def _store_spectral_basis(
+        self,
+        U: np.ndarray,
+        S: np.ndarray,
+        Vt: np.ndarray,
+        scores: np.ndarray,
+    ) -> None:
         self.singular_values_ = S
         self.right_basis_ = Vt
         self.sample_embedding_ = U
         self.leverage_scores_ = scores
 
-        n_clusters = min(self.n_partitions, n_samples)
+    def _fit_clusters_and_partitions(
+        self,
+        scores: np.ndarray,
+        target: Optional[Union[np.ndarray, pd.Series]],
+    ) -> None:
+        if self.sample_embedding_ is None:
+            raise RuntimeError("Sample embedding is not available")
+        n_clusters = min(self.n_partitions, self.sample_embedding_.shape[0])
         self.clusterer_ = self._make_kmeans(n_clusters=n_clusters)
         labels = self.clusterer_.fit_predict(self.sample_embedding_)
         self.cluster_labels_ = labels
         self._build_partitions_from_labels(labels, scores, target)
-        self._build_diagnostics(M, rank)
-        return self
 
     def get_partitions(
         self,
@@ -230,123 +290,6 @@ class RMTContractionTensorSampler(BaseSampler):
         X_num = self._transform_features(X)
         M_new = self._build_mode0_unfolding(X_num, fit=False, rng=None)
         return self._project_new_unfolding(M_new)
-
-    def _fit_transform_features(self, data: ArrayLike) -> np.ndarray:
-        if isinstance(data, pd.DataFrame):
-            df = data.copy()
-            numeric_cols = df.select_dtypes(include=[np.number, "bool"]).columns.tolist()
-            categorical_cols = [c for c in df.columns if c not in numeric_cols]
-            if not self.include_categorical:
-                categorical_cols = []
-            else:
-                categorical_cols = [
-                    c for c in categorical_cols
-                    if df[c].astype("string").nunique(dropna=True) <= self.max_one_hot_cardinality
-                ]
-
-            transformers: List[Tuple[str, Pipeline, Sequence[str]]] = []
-            if numeric_cols:
-                transformers.append((
-                    "num",
-                    Pipeline([
-                        ("imputer", SimpleImputer(strategy="median")),
-                        ("scaler", StandardScaler()),
-                    ]),
-                    numeric_cols,
-                ))
-            if categorical_cols:
-                try:
-                    encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=True)
-                except TypeError:  # sklearn < 1.2
-                    encoder = OneHotEncoder(handle_unknown="ignore", sparse=True)
-                transformers.append((
-                    "cat",
-                    Pipeline([
-                        ("imputer", SimpleImputer(strategy="most_frequent")),
-                        ("encoder", encoder),
-                    ]),
-                    categorical_cols,
-                ))
-
-            if not transformers:
-                raise ValueError("No usable numeric/categorical columns for RMTContractionTensorSampler")
-
-            self.preprocessor_ = ColumnTransformer(transformers, remainder="drop", sparse_threshold=1.0)
-            X = self.preprocessor_.fit_transform(df)
-        else:
-            arr = np.asarray(data)
-            if arr.ndim != 2:
-                raise ValueError("Input data must be a 2D matrix")
-            self.preprocessor_ = ColumnTransformer([
-                ("num", Pipeline([
-                    ("imputer", SimpleImputer(strategy="median")),
-                    ("scaler", StandardScaler()),
-                ]), list(range(arr.shape[1])))
-            ])
-            X = self.preprocessor_.fit_transform(arr)
-
-        self.raw_encoded_feature_count_ = int(X.shape[1])
-        if self.max_encoded_features is not None and X.shape[1] > self.max_encoded_features:
-            rng = np.random.default_rng(self.random_state)
-            keep = np.sort(rng.choice(X.shape[1], size=self.max_encoded_features, replace=False))
-            self.encoded_feature_subset_ = keep
-            X = X[:, keep]
-        else:
-            self.encoded_feature_subset_ = None
-        self.encoded_feature_count_ = int(X.shape[1])
-        X = self._as_dense_float(X)
-        return X
-
-    def _transform_features(self, data: ArrayLike) -> np.ndarray:
-        if self.preprocessor_ is None:
-            raise RuntimeError("Preprocessor is not fitted")
-        X = self.preprocessor_.transform(data.copy() if isinstance(data, pd.DataFrame) else data)
-        keep = getattr(self, "encoded_feature_subset_", None)
-        if keep is not None:
-            X = X[:, keep]
-        X = self._as_dense_float(X)
-        return X
-
-    @staticmethod
-    def _as_dense_float(X: Any) -> np.ndarray:
-        if sparse.issparse(X):
-            X = X.toarray()
-        X = np.asarray(X, dtype=np.float64)
-        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-        return X
-
-    def _resolve_backend(self) -> str:
-        if self.backend == "numpy":
-            return "numpy"
-        if self.backend == "torch":
-            if torch is None:
-                raise ImportError("backend='torch' requires torch to be installed")
-            self._resolve_torch_device()
-            return "torch"
-        if torch is None:
-            return "numpy"
-        self._resolve_torch_device()
-        return "torch"
-
-    def _resolve_torch_device(self) -> Any:
-        if torch is None:
-            return None
-        device = torch.device(self.device)
-        if device.type == "cuda" and not torch.cuda.is_available():
-            if self.backend == "torch":
-                raise ValueError(f"Requested torch device is not available: {self.device}")
-            device = torch.device("cpu")
-        return device
-
-    def _torch_dtype(self) -> Any:
-        if torch is None:
-            return None
-        return torch.float32 if self.dtype == "float32" else torch.float64
-
-    def _to_torch_matrix(self, X: np.ndarray) -> Any:
-        if torch is None:
-            raise RuntimeError("Torch backend selected but torch is unavailable")
-        return torch.as_tensor(X, dtype=self._torch_dtype(), device=self._resolve_torch_device())
 
     @staticmethod
     def _matrix_shape(X: Any) -> Tuple[int, int]:

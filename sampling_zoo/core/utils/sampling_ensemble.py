@@ -6,10 +6,10 @@ import pandas as pd
 import numpy as np
 from typing import List, Dict, Any, Optional, Callable
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from tqdm import tqdm
 
 from sampling_zoo.core.api.api_main import SamplingStrategyFactory
 from sampling_zoo.core.metrics.eval_metrics import calculate_metrics, get_metric_comparator
+from sampling_zoo.core.utils.progress import progress_bar, progress_iter, progress_write
 
 try:
     from lightgbm import LGBMRegressor, LGBMClassifier
@@ -30,7 +30,8 @@ class SamplingEnsemble:
                  model_class: Optional[Callable] = None,
                  model_params: Dict[str, Any] = None,
                  model_factory: Optional[Callable[[], Any]] = None,
-                 ensemble_method: str = 'voting'):
+                 ensemble_method: str = 'voting',
+                 show_progress: bool = True):
 
         self.problem = problem
         self.partitioner_config = partitioner_config or {
@@ -52,103 +53,172 @@ class SamplingEnsemble:
         self.model_params = model_params or {}
         self.model_factory = model_factory
         self.ensemble_method = ensemble_method
+        self.show_progress = show_progress
         self.bs_size = 1000
         self.partitions = None
         self.partitioner = None
         self.models = []
         self.partition_metrics = {}
 
+    def _log(self, message: str) -> None:
+        progress_write(message, enabled=self.show_progress)
+
     def prepare_data_partitions(self,
                                 features: pd.DataFrame,
                                 target: pd.Series,
                                 random_state: int = 42) -> Dict[str, pd.DataFrame]:
         """
-        Разбивает данные на интеллектуальные поднаборы с помощью Sampling-Zoo
+        Build data partitions with the configured Sampling-Zoo strategy.
         """
         try:
-            # Создаем стратегию семплирования
-            factory = SamplingStrategyFactory()
-            strategy_name = self.partitioner_config['strategy']
-            reserved_config_keys = {
-                'strategy',
-                'model',
-                'problem',
-                'ensemble_method',
-                'load_filename',
-                'save_filename',
-                'budget_ratio',
-                'experiment_chunk_fraction',
-                'force_chunking',
-                'force_direct_model',
-            }
-            strategy_kwargs = {
-                key: value
-                for key, value in self.partitioner_config.items()
-                if key not in reserved_config_keys
-            }
-            strategy_kwargs.setdefault('n_partitions', self.partitioner_config.get('n_partitions', 5))
-            strategy_kwargs.setdefault('random_state', random_state)
-            if strategy_name == 'feature_clustering':
-                allowed_keys = {'n_partitions', 'method', 'feature_engineering', 'random_state'}
-                strategy_kwargs = {key: value for key, value in strategy_kwargs.items() if key in allowed_keys}
-            elif strategy_name == 'random':
-                allowed_keys = {'n_partitions', 'random_state', 'chunks_percent'}
-                strategy_kwargs = {key: value for key, value in strategy_kwargs.items() if key in allowed_keys}
+            strategy_name = self._strategy_name()
+            with progress_bar(
+                enabled=self.show_progress,
+                desc=f"Prepare chunks ({strategy_name})",
+                total=4,
+            ) as stage:
+                strategy_kwargs = self._build_partitioner_kwargs(strategy_name, random_state)
+                stage.update(1)
 
-            if strategy_name in ['difficulty', 'uncertainty']:
-                support_model = (
-                    (LGBMClassifier(n_estimators=50, n_jobs=-1, verbosity=-1) if LGBMClassifier is not None
-                     else RandomForestClassifier(n_estimators=50, n_jobs=-1, random_state=random_state))
-                    if self.problem == 'classification'
-                    else (LGBMRegressor(n_estimators=50, n_jobs=-1, verbosity=-1) if LGBMRegressor is not None
-                          else RandomForestRegressor(n_estimators=50, n_jobs=-1, random_state=random_state))
+                self.partitioner = self._create_partitioner(strategy_name, strategy_kwargs)
+                stage.update(1)
+
+                self.partitions = self._fit_and_collect_partitions(self.partitioner, strategy_name, features, target)
+                stage.update(1)
+
+                self.partitions = self._apply_budget_policy_to_partitions(
+                    partitions=self.partitions,
+                    total_rows=len(features),
+                    random_state=random_state,
                 )
-                strategy_kwargs.update({
-                    'problem': self.problem,
-                    'model': support_model,
-                    'chunks_percent': self.partitioner_config.get('chunks_percent', 100),
-                })
+                stage.update(1)
 
-            partitioner = factory.create_strategy(
-                strategy_type=strategy_name,
-                **strategy_kwargs,
-            )
-            self.partitioner = partitioner
-
-            # Применяем семплирование
-            if strategy_name in ['difficulty', 'uncertainty']:
-                partitioner.fit(
-                    features,
-                    target=target,
-                )
-                self.partitions = partitioner.get_partitions(features, target)
-            elif strategy_name.__contains__('stratified'):
-                features['target'] = target
-                partitioner.fit(data=features, target=features.columns.to_list(), data_target=features['target'])
-                self.partitions = partitioner.get_partitions(features, target=features['target'])
-                for chunk in self.partitions:
-                    del self.partitions[chunk]['feature']['target']
-            else:
-                partitioner.fit(features)
-                self.partitions = partitioner.get_partitions(features, target)
-            self.partitions = self._apply_budget_policy_to_partitions(
-                partitions=self.partitions,
-                total_rows=len(features),
-                random_state=random_state,
-            )
-            print(f"Создано {len(self.partitions)} поднаборов данных:")
-            if self.partitions:
-                sample_key = next(iter(self.partitions))
-                sample_payload = self.partitions[sample_key]
-                if isinstance(sample_payload, dict) and "feature" in sample_payload:
-                    sample_size = len(sample_payload["feature"])
-                else:
-                    sample_size = len(sample_payload)
-                print(f"Число семплов в 1 поднаборе -  {sample_size}")
+            self._log_partition_summary(self.partitions)
             return self.partitions
 
-        except ImportError:
-            raise ImportError("Sampling-Zoo не установлен. Установите его из https://github.com/v1docq/Sampling-Zoo")
+        except ImportError as exc:
+            raise ImportError(
+                "Sampling-Zoo is not installed. Install it from https://github.com/v1docq/Sampling-Zoo"
+            ) from exc
+
+    def _strategy_name(self) -> str:
+        return self.partitioner_config['strategy']
+
+    @staticmethod
+    def _reserved_partitioner_config_keys() -> set:
+        return {
+            'strategy',
+            'model',
+            'problem',
+            'ensemble_method',
+            'load_filename',
+            'save_filename',
+            'budget_ratio',
+            'experiment_chunk_fraction',
+            'force_chunking',
+            'force_direct_model',
+            'show_progress',
+        }
+
+    def _build_partitioner_kwargs(self, strategy_name: str, random_state: int) -> Dict[str, Any]:
+        strategy_kwargs = {
+            key: value
+            for key, value in self.partitioner_config.items()
+            if key not in self._reserved_partitioner_config_keys()
+        }
+        strategy_kwargs.setdefault('n_partitions', self.partitioner_config.get('n_partitions', 5))
+        strategy_kwargs.setdefault('random_state', random_state)
+        strategy_kwargs = self._filter_partitioner_kwargs(strategy_name, strategy_kwargs)
+        return self._with_supervised_partitioner_kwargs(strategy_name, strategy_kwargs, random_state)
+
+    def _filter_partitioner_kwargs(self, strategy_name: str, strategy_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        allowed_by_strategy = {
+            'feature_clustering': {'n_partitions', 'method', 'feature_engineering', 'random_state'},
+            'random': {'n_partitions', 'random_state', 'chunks_percent'},
+        }
+        allowed_keys = allowed_by_strategy.get(strategy_name)
+        if allowed_keys is not None:
+            return {key: value for key, value in strategy_kwargs.items() if key in allowed_keys}
+        if strategy_name == 'rmt_contraction':
+            strategy_kwargs.setdefault('show_progress', self.show_progress)
+        return strategy_kwargs
+
+    def _with_supervised_partitioner_kwargs(
+        self,
+        strategy_name: str,
+        strategy_kwargs: Dict[str, Any],
+        random_state: int,
+    ) -> Dict[str, Any]:
+        if strategy_name not in ['difficulty', 'uncertainty']:
+            return strategy_kwargs
+        strategy_kwargs.update({
+            'problem': self.problem,
+            'model': self._create_support_model(random_state),
+            'chunks_percent': self.partitioner_config.get('chunks_percent', 100),
+        })
+        return strategy_kwargs
+
+    def _create_support_model(self, random_state: int) -> Callable:
+        if self.problem == 'classification':
+            return (
+                LGBMClassifier(n_estimators=50, n_jobs=-1, verbosity=-1) if LGBMClassifier is not None
+                else RandomForestClassifier(n_estimators=50, n_jobs=-1, random_state=random_state)
+            )
+        return (
+            LGBMRegressor(n_estimators=50, n_jobs=-1, verbosity=-1) if LGBMRegressor is not None
+            else RandomForestRegressor(n_estimators=50, n_jobs=-1, random_state=random_state)
+        )
+
+    @staticmethod
+    def _create_partitioner(strategy_name: str, strategy_kwargs: Dict[str, Any]) -> Any:
+        return SamplingStrategyFactory().create_strategy(
+            strategy_type=strategy_name,
+            **strategy_kwargs,
+        )
+
+    def _fit_and_collect_partitions(
+        self,
+        partitioner: Any,
+        strategy_name: str,
+        features: pd.DataFrame,
+        target: pd.Series,
+    ) -> Dict[str, Any]:
+        if strategy_name in ['difficulty', 'uncertainty']:
+            return self._fit_supervised_partitioner(partitioner, features, target)
+        if strategy_name.__contains__('stratified'):
+            return self._fit_stratified_partitioner(partitioner, features, target)
+        return self._fit_standard_partitioner(partitioner, features, target)
+
+    @staticmethod
+    def _fit_supervised_partitioner(partitioner: Any, features: pd.DataFrame, target: pd.Series) -> Dict[str, Any]:
+        partitioner.fit(features, target=target)
+        return partitioner.get_partitions(features, target)
+
+    @staticmethod
+    def _fit_standard_partitioner(partitioner: Any, features: pd.DataFrame, target: pd.Series) -> Dict[str, Any]:
+        partitioner.fit(features)
+        return partitioner.get_partitions(features, target)
+
+    @staticmethod
+    def _fit_stratified_partitioner(partitioner: Any, features: pd.DataFrame, target: pd.Series) -> Dict[str, Any]:
+        features['target'] = target
+        partitioner.fit(data=features, target=features.columns.to_list(), data_target=features['target'])
+        partitions = partitioner.get_partitions(features, target=features['target'])
+        for chunk in partitions:
+            del partitions[chunk]['feature']['target']
+        return partitions
+
+    def _log_partition_summary(self, partitions: Dict[str, Any]) -> None:
+        self._log(f"Created {len(partitions)} data partitions:")
+        sample_size = self._first_partition_size(partitions)
+        if sample_size is not None:
+            self._log(f"Samples in first partition: {sample_size}")
+
+    def _first_partition_size(self, partitions: Dict[str, Any]) -> Optional[int]:
+        if not partitions:
+            return None
+        sample_key = next(iter(partitions))
+        return self._partition_size(partitions[sample_key])
 
     @staticmethod
     def _partition_size(partition_data: Any) -> int:
@@ -254,7 +324,12 @@ class SamplingEnsemble:
             predict_labels, predict_proba = [], []
             batch_size = batch_size if batch_size is not None else self.bs_size
             batch_data = [test_data.iloc[i:i + self.bs_size] for i in list(range(0, len(test_data), batch_size))]
-            for batch in tqdm(batch_data):
+            for batch in progress_iter(
+                batch_data,
+                enabled=self.show_progress,
+                total=len(batch_data),
+                desc="Model inference batches",
+            ):
                 if self.problem == 'regression':
                     labels = fitted_model.predict(batch)
                     predict_labels.append(labels)
@@ -339,121 +414,277 @@ class SamplingEnsemble:
             save_models_to_disk: bool = True,
     ):
         """
-        Обучает отдельные ML модели на каждой партиции
+        Train one model per prepared data partition.
         """
-        if save_models_to_disk or 'load_filename' in self.partitioner_config or 'save_filename' in self.partitioner_config:
-            os.makedirs("dumps", exist_ok=True)
-        if 'load_filename' in self.partitioner_config:
-            with open(f"dumps/{self.partitioner_config['load_filename']}_{cv_fold}.pkl", "rb") as f:
-                partitions = pickle.load(f)
-        else:
-            partitions = self.prepare_data_partitions(X_train, y_train)
-            if 'save_filename' in self.partitioner_config:
-                with open(f"dumps/{self.partitioner_config['save_filename']}_{cv_fold}.pkl", "wb") as f:
-                    pickle.dump(partitions, f)
-
-        validation_results = []
-        best_validation_result, best_validation_result_not_updated = None, 0
-
-        if validation_metric is None:
-            validation_metric = 'f1_weighted' if self.problem == 'classification' else 'rmse'
-        elif validation_metric == 'f1':
-            validation_metric = 'f1_weighted'
-
+        partitions = self._load_or_prepare_partitions(
+            X_train=X_train,
+            y_train=y_train,
+            cv_fold=cv_fold,
+            save_models_to_disk=save_models_to_disk,
+        )
+        validation_metric = self._normalize_validation_metric(validation_metric)
         metric_is_better = get_metric_comparator(validation_metric)
 
-        for partition_name, partition_data in partitions.items():
-            print(f"Обучение модели для поднабора {partition_name}...")
-            if self.problem == 'classification' and class_samples:
-                partition_data = self.ensure_all_classes_in_chunk(partition_data, class_samples)
+        self._train_partition_loop(
+            partitions=partitions,
+            X_val=X_val,
+            y_val=y_val,
+            class_samples=class_samples,
+            cv_fold=cv_fold,
+            validation_metric=validation_metric,
+            metric_is_better=metric_is_better,
+            train_all_chunks=train_all_chunks,
+            save_models_to_disk=save_models_to_disk,
+        )
+        self._finalize_partition_training(
+            X_val=X_val,
+            y_val=y_val,
+            metric_is_better=metric_is_better,
+            validation_metric=validation_metric,
+        )
 
+    def _load_or_prepare_partitions(
+        self,
+        X_train: pd.DataFrame,
+        y_train: pd.Series,
+        cv_fold: int,
+        save_models_to_disk: bool,
+    ) -> Dict[str, Any]:
+        self._ensure_dump_dir_if_needed(save_models_to_disk)
+        if 'load_filename' in self.partitioner_config:
+            return self._load_partitions_from_disk(cv_fold)
+
+        partitions = self.prepare_data_partitions(X_train, y_train)
+        self._save_partitions_if_requested(partitions, cv_fold)
+        return partitions
+
+    def _ensure_dump_dir_if_needed(self, save_models_to_disk: bool) -> None:
+        if save_models_to_disk or 'load_filename' in self.partitioner_config or 'save_filename' in self.partitioner_config:
+            os.makedirs("dumps", exist_ok=True)
+
+    def _load_partitions_from_disk(self, cv_fold: int) -> Dict[str, Any]:
+        with open(f"dumps/{self.partitioner_config['load_filename']}_{cv_fold}.pkl", "rb") as handle:
+            return pickle.load(handle)
+
+    def _save_partitions_if_requested(self, partitions: Dict[str, Any], cv_fold: int) -> None:
+        if 'save_filename' not in self.partitioner_config:
+            return
+        with open(f"dumps/{self.partitioner_config['save_filename']}_{cv_fold}.pkl", "wb") as handle:
+            pickle.dump(partitions, handle)
+
+    def _normalize_validation_metric(self, validation_metric: Optional[str]) -> str:
+        if validation_metric is None:
+            return 'f1_weighted' if self.problem == 'classification' else 'rmse'
+        if validation_metric == 'f1':
+            return 'f1_weighted'
+        return validation_metric
+
+    def _train_partition_loop(
+        self,
+        partitions: Dict[str, Any],
+        X_val: pd.DataFrame,
+        y_val: pd.Series,
+        class_samples: Any,
+        cv_fold: int,
+        validation_metric: str,
+        metric_is_better: Callable,
+        train_all_chunks: bool,
+        save_models_to_disk: bool,
+    ) -> None:
+        validation_results = []
+        best_validation_result = None
+        best_validation_result_not_updated = 0
+
+        partition_iter = progress_iter(
+            partitions.items(),
+            enabled=self.show_progress,
+            total=len(partitions),
+            desc="Train chunk models",
+        )
+        for partition_name, partition_data in partition_iter:
+            partition_iter.set_postfix_str(str(partition_name))
             try:
-                # Создаем экземпляр модели
-                model = self._create_model_instance()
-
-                # Обучаем на поднаборе
-                model.fit(partition_data['feature'], partition_data['target'])
-
-                if save_models_to_disk:
-                    with open(f"dumps/{partition_name}_{cv_fold}.pkl", "wb") as f:
-                        pickle.dump(model, f)
-
-                # Инференс на валидационных данных
-                predict_labels, predict_proba = self._run_inference(model, X_val, calculation_mode='non-batch')
-
-                # Сохраняем модель и метрики
-                metrics = calculate_metrics(
-                    y_true=y_val,
-                    problem_type=self.problem,
-                    y_labels=predict_labels,
-                    y_proba=predict_proba if self.problem == "classification" else None,
+                current_validation_result = self._train_partition_and_score_ensemble(
+                    partition_name=partition_name,
+                    partition_data=partition_data,
+                    X_val=X_val,
+                    y_val=y_val,
+                    class_samples=class_samples,
+                    cv_fold=cv_fold,
+                    validation_metric=validation_metric,
+                    save_models_to_disk=save_models_to_disk,
                 )
-                model_info = {
-                    'name': partition_name,
-                    'model': model,
-                    'data_size': len(partition_data['feature']),
-                    'metrics': metrics,
-                    'val_predictions': predict_labels,
-                }
-
-                self.models.append(model_info)
-                self.partition_metrics[partition_name] = metrics
-
-                print(f"Модель {partition_name} обучена. Размер данных: {model_info['data_size']}")
-                print(f"Метрики модели {partition_name}: {metrics}")
-
-                predictions = self.ensemble_predict(X_val, stage='validation')
-                ensemble_metrics = calculate_metrics(
-                    y_true=y_val,
-                    y_labels=predictions,
-                    y_proba=None,
-                    problem_type=self.problem,
-                )
-                current_validation_result = ensemble_metrics[validation_metric]
-                print(f"Метрики ансамбля после {partition_name}: {ensemble_metrics}")
-                print(f"Текущая валидационная метрика - {current_validation_result}")
                 validation_results.append(current_validation_result)
-
-                if best_validation_result is None or metric_is_better(current_validation_result, best_validation_result):
-                    best_validation_result = current_validation_result
-                    best_validation_result_not_updated = 0
-                else:
-                    best_validation_result_not_updated += 1
-
-                if not train_all_chunks:
-                    if len(validation_results) > 10 and metric_is_better(np.mean(validation_results[:-10]), current_validation_result):
-                        del self.models[-1]
-                    if best_validation_result_not_updated >= 10:
-                        break
-
-            except Exception as e:
-                print(f"Ошибка при обучении модели {partition_name}: {str(e)}")
+                best_validation_result, best_validation_result_not_updated = self._update_best_validation_result(
+                    current_validation_result=current_validation_result,
+                    best_validation_result=best_validation_result,
+                    best_validation_result_not_updated=best_validation_result_not_updated,
+                    metric_is_better=metric_is_better,
+                )
+                if self._should_stop_partition_training(
+                    validation_results=validation_results,
+                    current_validation_result=current_validation_result,
+                    best_validation_result_not_updated=best_validation_result_not_updated,
+                    metric_is_better=metric_is_better,
+                    train_all_chunks=train_all_chunks,
+                ):
+                    break
+            except Exception as exc:
+                self._log(f"Error while training chunk {partition_name}: {str(exc)}")
                 continue
 
-        if self.models:
-            full_metrics = calculate_metrics(
-                y_true=y_val,
-                y_labels=self.ensemble_predict(X_val, stage='validation'),
-                y_proba=None,
-                problem_type=self.problem,
-            )
-            print(f"Метрики ансамбля до сокращения: {full_metrics}")
+    def _train_partition_and_score_ensemble(
+        self,
+        partition_name: str,
+        partition_data: Dict[str, Any],
+        X_val: pd.DataFrame,
+        y_val: pd.Series,
+        class_samples: Any,
+        cv_fold: int,
+        validation_metric: str,
+        save_models_to_disk: bool,
+    ) -> float:
+        model_info = self._train_single_partition_model(
+            partition_name=partition_name,
+            partition_data=partition_data,
+            X_val=X_val,
+            y_val=y_val,
+            class_samples=class_samples,
+            cv_fold=cv_fold,
+            save_models_to_disk=save_models_to_disk,
+        )
+        ensemble_metrics = self._evaluate_current_ensemble(X_val, y_val)
+        current_validation_result = ensemble_metrics[validation_metric]
+        self._log(f"Ensemble metrics after {partition_name}: {ensemble_metrics}")
+        self._log(f"Current validation metric: {current_validation_result}")
+        return current_validation_result
 
-            selected, best_score = self.select_best_models_forward(
-                X_val=X_val,
-                y_val=y_val,
-                metric_is_better=metric_is_better,
-                validation_metric=validation_metric,
-            )
+    def _train_single_partition_model(
+        self,
+        partition_name: str,
+        partition_data: Dict[str, Any],
+        X_val: pd.DataFrame,
+        y_val: pd.Series,
+        class_samples: Any,
+        cv_fold: int,
+        save_models_to_disk: bool,
+    ) -> Dict[str, Any]:
+        self._log(f"Training model for chunk {partition_name}...")
+        partition_data = self._ensure_partition_class_coverage(partition_data, class_samples)
+        model = self._create_model_instance()
+        model.fit(partition_data['feature'], partition_data['target'])
+        self._save_partition_model_if_requested(model, partition_name, cv_fold, save_models_to_disk)
 
-            reduced_metrics = calculate_metrics(
-                y_true=y_val,
-                y_labels=self.ensemble_predict(X_val, stage='validation'),
-                y_proba=None,
-                problem_type=self.problem,
-            )
-            print(f"Метрики ансамбля после сокращения: {reduced_metrics}")
-            print(f"Лучшая валидационная метрика после сокращения ({validation_metric}): {best_score}")
+        predict_labels, predict_proba = self._run_inference(model, X_val, calculation_mode='non-batch')
+        metrics = calculate_metrics(
+            y_true=y_val,
+            problem_type=self.problem,
+            y_labels=predict_labels,
+            y_proba=predict_proba if self.problem == "classification" else None,
+        )
+        model_info = self._build_partition_model_info(partition_name, model, partition_data, metrics, predict_labels)
+        self._register_partition_model(partition_name, model_info, metrics)
+        self._log_partition_model_result(partition_name, model_info, metrics)
+        return model_info
+
+    def _ensure_partition_class_coverage(self, partition_data: Dict[str, Any], class_samples: Any) -> Dict[str, Any]:
+        if self.problem == 'classification' and class_samples:
+            return self.ensure_all_classes_in_chunk(partition_data, class_samples)
+        return partition_data
+
+    @staticmethod
+    def _build_partition_model_info(
+        partition_name: str,
+        model: Callable,
+        partition_data: Dict[str, Any],
+        metrics: Dict[str, Any],
+        predict_labels: np.ndarray,
+    ) -> Dict[str, Any]:
+        return {
+            'name': partition_name,
+            'model': model,
+            'data_size': len(partition_data['feature']),
+            'metrics': metrics,
+            'val_predictions': predict_labels,
+        }
+
+    def _register_partition_model(self, partition_name: str, model_info: Dict[str, Any], metrics: Dict[str, Any]) -> None:
+        self.models.append(model_info)
+        self.partition_metrics[partition_name] = metrics
+
+    def _log_partition_model_result(self, partition_name: str, model_info: Dict[str, Any], metrics: Dict[str, Any]) -> None:
+        self._log(f"Model {partition_name} trained. Data size: {model_info['data_size']}")
+        self._log(f"Model {partition_name} metrics: {metrics}")
+
+    @staticmethod
+    def _save_partition_model_if_requested(
+        model: Callable,
+        partition_name: str,
+        cv_fold: int,
+        save_models_to_disk: bool,
+    ) -> None:
+        if not save_models_to_disk:
+            return
+        with open(f"dumps/{partition_name}_{cv_fold}.pkl", "wb") as handle:
+            pickle.dump(model, handle)
+
+    def _evaluate_current_ensemble(self, X_val: pd.DataFrame, y_val: pd.Series) -> Dict[str, Any]:
+        predictions = self.ensemble_predict(X_val, stage='validation')
+        return calculate_metrics(
+            y_true=y_val,
+            y_labels=predictions,
+            y_proba=None,
+            problem_type=self.problem,
+        )
+
+    @staticmethod
+    def _update_best_validation_result(
+        current_validation_result: float,
+        best_validation_result: Optional[float],
+        best_validation_result_not_updated: int,
+        metric_is_better: Callable,
+    ) -> tuple[float, int]:
+        if best_validation_result is None or metric_is_better(current_validation_result, best_validation_result):
+            return current_validation_result, 0
+        return best_validation_result, best_validation_result_not_updated + 1
+
+    def _should_stop_partition_training(
+        self,
+        validation_results: List[float],
+        current_validation_result: float,
+        best_validation_result_not_updated: int,
+        metric_is_better: Callable,
+        train_all_chunks: bool,
+    ) -> bool:
+        if train_all_chunks:
+            return False
+        if len(validation_results) > 10 and metric_is_better(np.mean(validation_results[:-10]), current_validation_result):
+            del self.models[-1]
+        return best_validation_result_not_updated >= 10
+
+    def _finalize_partition_training(
+        self,
+        X_val: pd.DataFrame,
+        y_val: pd.Series,
+        metric_is_better: Callable,
+        validation_metric: str,
+    ) -> None:
+        if not self.models:
+            return
+
+        full_metrics = self._evaluate_current_ensemble(X_val, y_val)
+        self._log(f"Ensemble metrics before pruning: {full_metrics}")
+
+        _selected, best_score = self.select_best_models_forward(
+            X_val=X_val,
+            y_val=y_val,
+            metric_is_better=metric_is_better,
+            validation_metric=validation_metric,
+        )
+
+        reduced_metrics = self._evaluate_current_ensemble(X_val, y_val)
+        self._log(f"Ensemble metrics after pruning: {reduced_metrics}")
+        self._log(f"Best validation metric after pruning ({validation_metric}): {best_score}")
 
     def select_best_models_forward(
             self,
@@ -487,26 +718,31 @@ class SamplingEnsemble:
                 problem_type=self.problem,
             )[validation_metric]
 
-        while remaining:
-            best_candidate = None
-            best_candidate_score = best_score
+        with progress_bar(
+            enabled=self.show_progress,
+            desc="Forward model selection",
+            total=n_models,
+        ) as selection_bar:
+            while remaining:
+                best_candidate = None
+                best_candidate_score = best_score
 
-            for i in remaining:
-                candidate = selected + [i]
-                score = evaluate(candidate)
+                for i in remaining:
+                    candidate = selected + [i]
+                    score = evaluate(candidate)
 
-                if best_candidate_score is None or metric_is_better(score, best_candidate_score):
-                    best_candidate = i
-                    best_candidate_score = score
+                    if best_candidate_score is None or metric_is_better(score, best_candidate_score):
+                        best_candidate = i
+                        best_candidate_score = score
 
-            if best_candidate is None:
-                break
+                if best_candidate is None:
+                    break
 
-            selected.append(best_candidate)
-            remaining.remove(best_candidate)
-            best_score = best_candidate_score
-            print(f"Forward selection: models={len(selected)} {validation_metric}={best_score}")
-
+                selected.append(best_candidate)
+                remaining.remove(best_candidate)
+                best_score = best_candidate_score
+                selection_bar.update(1)
+                self._log(f"Forward selection: models={len(selected)} {validation_metric}={best_score}")
         self.models = [self.models[i] for i in selected]
 
         return selected, best_score
@@ -682,11 +918,15 @@ class SamplingEnsemble:
         n_samples = len(features)
         batches = []
         total_batches = (n_samples + batch_size - 1) // batch_size
-        for batch_idx in range(total_batches):
+        batch_iter = progress_iter(
+            range(total_batches),
+            enabled=self.show_progress,
+            total=total_batches,
+            desc="Ensemble inference batches",
+        )
+        for batch_idx in batch_iter:
             start = batch_idx * batch_size
             end = min(start + batch_size, n_samples)
-            remaining = total_batches - batch_idx
-            print(f"Batch {batch_idx + 1}/{total_batches} (remaining: {remaining - 1})")
             batch = features.iloc[start:end] if isinstance(features, pd.DataFrame) else features[start:end]
             batches.append(self.ensemble_predict(batch, stage=stage, models=models))
         return np.concatenate(batches)
@@ -759,9 +999,9 @@ class SingleModelImplementation(SamplingEnsemble):
                                     y_labels=predict_labels,
                                     y_proba=None
                                     )
-        print(f"Валидационные метрики - {metrics}")
+        self._log(f"Validation metrics: {metrics}")
         validation_result = metrics[validation_metric]
-        print(f"Валидационная метрика ({validation_metric}) - {validation_result}")
+        self._log(f"Validation metric ({validation_metric}): {validation_result}")
 
     def predict(self, features: pd.DataFrame) -> np.ndarray:
         """Предсказание на новых данных"""

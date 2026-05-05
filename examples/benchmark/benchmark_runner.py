@@ -22,6 +22,7 @@ if str(ROOT_DIR) not in sys.path:
 from sampling_zoo.core.metrics.eval_metrics import calculate_metrics
 from sampling_zoo.core.utils.sampling_ensemble import SamplingEnsemble
 from sampling_zoo.core.utils.amlb_dataloader import AMLBDatasetLoader
+from sampling_zoo.core.utils.progress import progress_bar
 from sampling_zoo.core.utils.utils import safe_index
 from benchmark_datasets import DatasetBundle, OpenMLRawDatasetBundle, RawDatasetBundle
 from benchmark_logging import BenchmarkLogger, build_sample_stats
@@ -281,142 +282,189 @@ def _collect_metrics(
     return metrics
 
 
-class EnsembleChunkBenchmarkRunner:
-    """Runner for chunk-based SamplingEnsemble benchmarks on raw AMLB datasets."""
+
+@dataclass(frozen=True)
+class FoldSplit:
+    fold_idx: int
+    split_label: str
+    X_train: Any
+    X_val: Any
+    X_test: Any
+    y_train: Any
+    y_val: Any
+    y_test: Any
+
+
+@dataclass(frozen=True)
+class FoldExecutionPlan:
+    force_chunking: bool
+    force_direct_model: bool
+    configured_partitions: int
+    effective_partitions: int
+    chunks_percent: float
+    use_direct_model: bool
+
+
+class EnsembleFoldBenchmarkExecutor:
+    """Owns fold splitting, fold-level model execution, and fold result logging."""
 
     def __init__(
         self,
-        logger: Optional[BenchmarkLogger] = None,
-        cv_folds: int = 3,
-        seed: int = 42,
-        show_progress: bool = True,
-        on_record: Optional[Callable[[Dict[str, Any]], None]] = None,
+        logger: BenchmarkLogger,
+        loader: AMLBDatasetLoader,
+        cv_folds: int,
+        seed: int,
+        show_progress: bool,
     ) -> None:
-        self.logger = logger or BenchmarkLogger()
+        self.logger = logger
+        self.loader = loader
         self.cv_folds = cv_folds
         self.seed = seed
         self.show_progress = show_progress
-        self.loader = AMLBDatasetLoader()
-        self.on_record = on_record
 
-    def run_dataset(
+    def run_strategy_folds(
         self,
         dataset: RawDatasetBundle,
-        strategy_configs: Mapping[str, Mapping[str, Any]],
-        model_pool: Mapping[str, Callable[[], Any]],
-    ) -> List[Dict[str, Any]]:
-        records: List[Dict[str, Any]] = []
-        openml_split_data = dataset.load_split_data() if isinstance(dataset, OpenMLRawDatasetBundle) else None
-        try:
-            model_iter = tqdm(
-                model_pool.items(),
-                total=len(model_pool),
-                disable=not self.show_progress,
-                desc=f"Models ({dataset.name})",
-                leave=False,
-            )
-            for model_name, model_factory in model_iter:
-                strategy_iter = tqdm(
-                    strategy_configs.items(),
-                    total=len(strategy_configs),
-                    disable=not self.show_progress,
-                    desc=f"Strategies ({dataset.name}/{model_name})",
-                    leave=False,
+        strategy_name: str,
+        partitioner_config: Mapping[str, Any],
+        model_name: str,
+        model_factory: Callable[[], Any],
+        openml_split_data: Optional[tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series, list[str], list[str], list[str]]] = None,
+    ) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        split_total = self.split_count(dataset)
+        split_desc = "Splits" if split_total == 1 else "Folds"
+        fold_iter = tqdm(
+            self.iter_folds(dataset, openml_split_data=openml_split_data),
+            total=split_total,
+            disable=not self.show_progress,
+            desc=f"{split_desc} ({dataset.name}/{strategy_name}/{model_name})",
+            leave=False,
+        )
+        for fold in fold_iter:
+            records.append(
+                self.run_single_fold(
+                    dataset=dataset,
+                    strategy_name=strategy_name,
+                    partitioner_config=partitioner_config,
+                    model_name=model_name,
+                    model_factory=model_factory,
+                    fold=fold,
                 )
-                for strategy_name, partitioner_config in strategy_iter:
-                    split_total = self._split_count(dataset)
-                    split_desc = "Splits" if split_total == 1 else "Folds"
-                    fold_iter = tqdm(
-                        self._iter_folds(dataset, openml_split_data=openml_split_data),
-                        total=split_total,
-                        disable=not self.show_progress,
-                        desc=f"{split_desc} ({dataset.name}/{strategy_name}/{model_name})",
-                        leave=False,
-                    )
-                    for fold_idx, split_label, X_train, X_val, X_test, y_train, y_val, y_test in fold_iter:
-                        record = self._run_single_fold(
-                            dataset=dataset,
-                            strategy_name=strategy_name,
-                            partitioner_config=partitioner_config,
-                            model_name=model_name,
-                            model_factory=model_factory,
-                            fold_idx=fold_idx,
-                            split_label=split_label,
-                            X_train=X_train,
-                            X_val=X_val,
-                            X_test=X_test,
-                            y_train=y_train,
-                            y_val=y_val,
-                            y_test=y_test,
-                        )
-                        if self.on_record is not None:
-                            self.on_record(record)
-                        records.append(record)
-        finally:
-            if openml_split_data is not None:
-                del openml_split_data
-                gc.collect()
-
+            )
         return records
 
-    def _split_count(self, dataset: RawDatasetBundle) -> int:
+    def split_count(self, dataset: RawDatasetBundle) -> int:
         return 1 if isinstance(dataset, OpenMLRawDatasetBundle) else self.cv_folds
 
-    def _iter_folds(
+    def iter_folds(
         self,
         dataset: RawDatasetBundle,
         openml_split_data: Optional[tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series, list[str], list[str], list[str]]] = None,
-    ) -> Iterable[tuple[int, str, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, pd.Series]]:
+    ) -> Iterable[FoldSplit]:
         if isinstance(dataset, OpenMLRawDatasetBundle):
-            if openml_split_data is None:
-                openml_split_data = dataset.load_split_data()
-            X_train_full, y_train_full, X_test, y_test, _, _, _ = openml_split_data
-
-            X_train, X_val, y_train, y_val = self._prepare_train_val_for_execution(
-                X_train_full=X_train_full,
-                y_train_full=y_train_full,
-                problem_type=dataset.problem_type,
-                random_state=self.seed + 1,
-            )
-
-            yield (
-                1,
-                "split_1",
-                X_train,
-                X_val,
-                X_test,
-                y_train,
-                y_val,
-                y_test,
-            )
+            yield self._openml_fold(dataset, openml_split_data)
             return
 
         X = dataset.X.to_numpy() if isinstance(dataset.X, pd.DataFrame) else np.asarray(dataset.X)
-        y = dataset.y.to_numpy() if isinstance(dataset.y, pd.Series) else np.asarray(dataset.y)
         splitter = KFold(n_splits=self.cv_folds, shuffle=True, random_state=self.seed)
-        split_iter = splitter.split(X)
-        for fold_idx, (train_idx, test_idx) in enumerate(split_iter, start=1):
-            X_train_full = dataset.X.iloc[train_idx].reset_index(drop=True)
-            y_train_full = dataset.y.iloc[train_idx].reset_index(drop=True)
-            X_test = dataset.X.iloc[test_idx].reset_index(drop=True)
-            y_test = dataset.y.iloc[test_idx].reset_index(drop=True)
+        for fold_idx, (train_idx, test_idx) in enumerate(splitter.split(X), start=1):
+            yield self._local_cv_fold(dataset, fold_idx, train_idx, test_idx)
 
-            X_train, X_val, y_train, y_val = self._prepare_train_val_for_execution(
-                X_train_full=X_train_full,
-                y_train_full=y_train_full,
-                problem_type=dataset.problem_type,
-                random_state=self.seed + fold_idx,
+    def run_single_fold(
+        self,
+        dataset: RawDatasetBundle,
+        strategy_name: str,
+        partitioner_config: Mapping[str, Any],
+        model_name: str,
+        model_factory: Callable[[], Any],
+        fold: FoldSplit,
+    ) -> dict[str, Any]:
+        plan = self._build_execution_plan(partitioner_config, train_size=len(fold.y_train))
+        try:
+            with progress_bar(
+                enabled=self.show_progress,
+                desc=f"Fold pipeline ({dataset.name}/{strategy_name}/{model_name}/{fold.split_label})",
+                total=5,
+            ) as fold_stage:
+                fold = self._ensure_validation_split(dataset, partitioner_config, fold)
+                fold_stage.update(1)
+
+                X_train_df, X_val_df, X_test_df = self._ensure_fold_dataframes(dataset, fold)
+                fold_stage.update(1)
+
+                if plan.use_direct_model:
+                    return self._run_direct_model_fold(
+                        dataset=dataset,
+                        strategy_name=strategy_name,
+                        partitioner_config=partitioner_config,
+                        model_name=model_name,
+                        model_factory=model_factory,
+                        fold=fold,
+                        plan=plan,
+                        X_train_df=X_train_df,
+                        X_test_df=X_test_df,
+                        fold_stage=fold_stage,
+                    )
+
+                return self._run_ensemble_fold(
+                    dataset=dataset,
+                    strategy_name=strategy_name,
+                    partitioner_config=partitioner_config,
+                    model_name=model_name,
+                    model_factory=model_factory,
+                    fold=fold,
+                    plan=plan,
+                    X_train_df=X_train_df,
+                    X_val_df=X_val_df,
+                    X_test_df=X_test_df,
+                    fold_stage=fold_stage,
+                )
+        except Exception as ex:
+            return self._log_failed_fold(
+                dataset=dataset,
+                strategy_name=strategy_name,
+                partitioner_config=partitioner_config,
+                model_name=model_name,
+                fold=fold,
+                plan=plan,
+                error=ex,
             )
-            yield (
-                fold_idx,
-                f"fold_{fold_idx}",
-                X_train,
-                X_val,
-                X_test,
-                y_train,
-                y_val,
-                y_test,
-            )
+
+    def _openml_fold(
+        self,
+        dataset: OpenMLRawDatasetBundle,
+        openml_split_data: Optional[tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series, list[str], list[str], list[str]]],
+    ) -> FoldSplit:
+        if openml_split_data is None:
+            openml_split_data = dataset.load_split_data(show_progress=self.show_progress)
+        X_train_full, y_train_full, X_test, y_test, _, _, _ = openml_split_data
+        X_train, X_val, y_train, y_val = self._prepare_train_val_for_execution(
+            X_train_full=X_train_full,
+            y_train_full=y_train_full,
+            problem_type=dataset.problem_type,
+            random_state=self.seed + 1,
+        )
+        return FoldSplit(1, "split_1", X_train, X_val, X_test, y_train, y_val, y_test)
+
+    def _local_cv_fold(
+        self,
+        dataset: RawDatasetBundle,
+        fold_idx: int,
+        train_idx: np.ndarray,
+        test_idx: np.ndarray,
+    ) -> FoldSplit:
+        X_train_full = dataset.X.iloc[train_idx].reset_index(drop=True)
+        y_train_full = dataset.y.iloc[train_idx].reset_index(drop=True)
+        X_test = dataset.X.iloc[test_idx].reset_index(drop=True)
+        y_test = dataset.y.iloc[test_idx].reset_index(drop=True)
+        X_train, X_val, y_train, y_val = self._prepare_train_val_for_execution(
+            X_train_full=X_train_full,
+            y_train_full=y_train_full,
+            problem_type=dataset.problem_type,
+            random_state=self.seed + fold_idx,
+        )
+        return FoldSplit(fold_idx, f"fold_{fold_idx}", X_train, X_val, X_test, y_train, y_val, y_test)
 
     def _prepare_train_val_for_execution(
         self,
@@ -428,16 +476,8 @@ class EnsembleChunkBenchmarkRunner:
         if len(y_train_full) < 20000:
             X_train = X_train_full.reset_index(drop=True) if isinstance(X_train_full, pd.DataFrame) else X_train_full
             y_train = y_train_full.reset_index(drop=True) if isinstance(y_train_full, pd.Series) else y_train_full
-
-            if isinstance(X_train, pd.DataFrame):
-                X_val = X_train.iloc[0:0].copy()
-            else:
-                X_val = X_train[:0]
-
-            if isinstance(y_train, pd.Series):
-                y_val = y_train.iloc[0:0].copy()
-            else:
-                y_val = y_train[:0]
+            X_val = X_train.iloc[0:0].copy() if isinstance(X_train, pd.DataFrame) else X_train[:0]
+            y_val = y_train.iloc[0:0].copy() if isinstance(y_train, pd.Series) else y_train[:0]
             return X_train, X_val, y_train, y_val
 
         X_train, _, X_val, y_train, _, y_val = self.loader.prepare_train_val_test_balanced(
@@ -454,6 +494,51 @@ class EnsembleChunkBenchmarkRunner:
             y_val = y_val.iloc[:12000] if isinstance(y_val, pd.Series) else y_val[:12000]
         return X_train, X_val, y_train, y_val
 
+    def _build_execution_plan(self, partitioner_config: Mapping[str, Any], train_size: int) -> FoldExecutionPlan:
+        force_chunking = bool(partitioner_config.get("force_chunking", False))
+        force_direct_model = (
+            bool(partitioner_config.get("force_direct_model", False))
+            or partitioner_config.get("strategy") == "full_dataset"
+        )
+        configured_partitions = int(partitioner_config.get("n_partitions", 1))
+        effective_partitions = configured_partitions if force_chunking else max(1, int(np.ceil(train_size / 20000)))
+        target_chunks = 10
+        chunks_percent = min(100.0, 100.0 * target_chunks / max(1, effective_partitions))
+        use_direct_model = force_direct_model or (train_size < 20000 and not force_chunking)
+        return FoldExecutionPlan(
+            force_chunking=force_chunking,
+            force_direct_model=force_direct_model,
+            configured_partitions=configured_partitions,
+            effective_partitions=effective_partitions,
+            chunks_percent=chunks_percent,
+            use_direct_model=use_direct_model,
+        )
+
+    def _ensure_validation_split(
+        self,
+        dataset: RawDatasetBundle,
+        partitioner_config: Mapping[str, Any],
+        fold: FoldSplit,
+    ) -> FoldSplit:
+        if not bool(partitioner_config.get("force_chunking", False)) or len(fold.y_val) > 0:
+            return fold
+        X_train, X_val, y_train, y_val = self._split_small_train_val(
+            X_train=fold.X_train,
+            y_train=fold.y_train,
+            problem_type=dataset.problem_type,
+            random_state=self.seed + fold.fold_idx,
+        )
+        return FoldSplit(
+            fold_idx=fold.fold_idx,
+            split_label=fold.split_label,
+            X_train=X_train,
+            X_val=X_val,
+            X_test=fold.X_test,
+            y_train=y_train,
+            y_val=y_val,
+            y_test=fold.y_test,
+        )
+
     @staticmethod
     def _split_small_train_val(
         X_train: Any,
@@ -462,7 +547,9 @@ class EnsembleChunkBenchmarkRunner:
         random_state: int,
     ) -> tuple[Any, Any, Any, Any]:
         if len(y_train) < 4:
-            return X_train, X_train.iloc[0:0].copy() if isinstance(X_train, pd.DataFrame) else X_train[:0], y_train, y_train.iloc[0:0].copy() if isinstance(y_train, pd.Series) else y_train[:0]
+            X_val = X_train.iloc[0:0].copy() if isinstance(X_train, pd.DataFrame) else X_train[:0]
+            y_val = y_train.iloc[0:0].copy() if isinstance(y_train, pd.Series) else y_train[:0]
+            return X_train, X_val, y_train, y_val
 
         y_array = np.asarray(y_train)
         stratify = None
@@ -490,6 +577,13 @@ class EnsembleChunkBenchmarkRunner:
             _take(y_train, val_idx),
         )
 
+    def _ensure_fold_dataframes(self, dataset: RawDatasetBundle, fold: FoldSplit) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        return (
+            self._ensure_dataframe(fold.X_train, dataset),
+            self._ensure_dataframe(fold.X_val, dataset),
+            self._ensure_dataframe(fold.X_test, dataset),
+        )
+
     @staticmethod
     def _ensure_dataframe(X: Any, dataset: RawDatasetBundle) -> pd.DataFrame:
         if isinstance(X, pd.DataFrame):
@@ -500,6 +594,152 @@ class EnsembleChunkBenchmarkRunner:
             if col in df.columns:
                 df[col] = df[col].astype("category")
         return df
+
+    def _run_direct_model_fold(
+        self,
+        dataset: RawDatasetBundle,
+        strategy_name: str,
+        partitioner_config: Mapping[str, Any],
+        model_name: str,
+        model_factory: Callable[[], Any],
+        fold: FoldSplit,
+        plan: FoldExecutionPlan,
+        X_train_df: pd.DataFrame,
+        X_test_df: pd.DataFrame,
+        fold_stage: Any,
+    ) -> dict[str, Any]:
+        fit_started = perf_counter()
+        model = model_factory()
+        model.fit(X_train_df, fold.y_train)
+        fit_time = perf_counter() - fit_started
+        fold_stage.update(1)
+
+        infer_started = perf_counter()
+        predictions, y_proba = self._predict_direct_model(model, X_test_df, dataset.problem_type)
+        infer_time = perf_counter() - infer_started
+        fold_stage.update(1)
+
+        model_metrics = calculate_metrics(
+            y_true=fold.y_test,
+            y_labels=predictions,
+            y_proba=y_proba if dataset.problem_type == "classification" else None,
+            problem_type=dataset.problem_type,
+        )
+        sample_stats = self._build_train_sample_stats(
+            y_train=fold.y_train,
+            problem_type=dataset.problem_type,
+            total_train_size=len(fold.y_train),
+        )
+        sample_stats["chunk_count"] = 1
+        sample_stats["chunk_size_mean"] = float(len(fold.y_train))
+
+        payload = self._log_direct_model_fold(
+            dataset=dataset,
+            strategy_name=strategy_name,
+            partitioner_config=partitioner_config,
+            model_name=model_name,
+            fold=fold,
+            model_metrics=model_metrics,
+            fit_time=fit_time,
+            infer_time=infer_time,
+            sample_stats=sample_stats,
+        )
+        fold_stage.update(1)
+        return payload
+
+    @staticmethod
+    def _predict_direct_model(model: Any, X_test_df: pd.DataFrame, problem_type: str) -> tuple[Any, Any]:
+        if problem_type != "classification":
+            return model.predict(X_test_df), None
+
+        y_proba = model.predict_proba(X_test_df) if hasattr(model, "predict_proba") else None
+        if y_proba is not None and getattr(y_proba, "ndim", 0) == 2 and y_proba.shape[1] > 0:
+            classes = np.asarray(getattr(model, "classes_", np.arange(y_proba.shape[1])))
+            if classes.shape[0] == y_proba.shape[1]:
+                return classes[np.argmax(y_proba, axis=1)], y_proba
+        return model.predict(X_test_df), y_proba
+
+    def _run_ensemble_fold(
+        self,
+        dataset: RawDatasetBundle,
+        strategy_name: str,
+        partitioner_config: Mapping[str, Any],
+        model_name: str,
+        model_factory: Callable[[], Any],
+        fold: FoldSplit,
+        plan: FoldExecutionPlan,
+        X_train_df: pd.DataFrame,
+        X_val_df: pd.DataFrame,
+        X_test_df: pd.DataFrame,
+        fold_stage: Any,
+    ) -> dict[str, Any]:
+        class_samples = None
+        if dataset.problem_type == "classification":
+            class_samples = self._class_representatives(X_train_df, fold.y_train, seed=self.seed + fold.fold_idx)
+
+        tuned_partitioner_config = self._tune_partitioner_config(partitioner_config, plan)
+        ensemble = SamplingEnsemble(
+            problem=dataset.problem_type,
+            partitioner_config=tuned_partitioner_config,
+            model_factory=model_factory,
+            ensemble_method=tuned_partitioner_config.get("ensemble_method", "voting"),
+            show_progress=self.show_progress,
+        )
+
+        fit_started = perf_counter()
+        ensemble.train_partition_models(
+            X_train=X_train_df,
+            y_train=fold.y_train,
+            X_val=X_val_df,
+            y_val=fold.y_val,
+            class_samples=class_samples,
+            cv_fold=fold.fold_idx,
+            validation_metric="f1_weighted" if dataset.problem_type == "classification" else "rmse",
+            train_all_chunks=True,
+            save_models_to_disk=False,
+        )
+        fit_time = perf_counter() - fit_started
+        fold_stage.update(1)
+
+        infer_started = perf_counter()
+        predictions = ensemble.ensemble_predict_batch(X_test_df, batch_size=10000)
+        infer_time = perf_counter() - infer_started
+        fold_stage.update(1)
+
+        model_metrics = calculate_metrics(
+            y_true=fold.y_test,
+            y_labels=predictions,
+            y_proba=None,
+            problem_type=dataset.problem_type,
+        )
+        sample_stats, chunk_sizes = self._build_ensemble_sample_stats(
+            ensemble=ensemble,
+            y_train=fold.y_train,
+            problem_type=dataset.problem_type,
+        )
+        payload = self._log_ensemble_fold(
+            dataset=dataset,
+            strategy_name=strategy_name,
+            tuned_partitioner_config=tuned_partitioner_config,
+            model_name=model_name,
+            fold=fold,
+            plan=plan,
+            ensemble=ensemble,
+            model_metrics=model_metrics,
+            fit_time=fit_time,
+            infer_time=infer_time,
+            sample_stats=sample_stats,
+            chunk_sizes=chunk_sizes,
+        )
+        fold_stage.update(1)
+        return payload
+
+    @staticmethod
+    def _tune_partitioner_config(partitioner_config: Mapping[str, Any], plan: FoldExecutionPlan) -> dict[str, Any]:
+        tuned_partitioner_config = dict(partitioner_config)
+        tuned_partitioner_config["n_partitions"] = plan.effective_partitions
+        tuned_partitioner_config["chunks_percent"] = plan.chunks_percent
+        return tuned_partitioner_config
 
     @staticmethod
     def _class_representatives(
@@ -547,237 +787,298 @@ class EnsembleChunkBenchmarkRunner:
             )
         return stats
 
-    def _run_single_fold(
+    def _build_ensemble_sample_stats(
+        self,
+        ensemble: SamplingEnsemble,
+        y_train: Any,
+        problem_type: str,
+    ) -> tuple[dict[str, Any], list[int]]:
+        chunk_sizes = [int(model_info.get("data_size", 0)) for model_info in ensemble.models]
+        sample_stats = self._build_train_sample_stats(
+            y_train=y_train,
+            problem_type=problem_type,
+            total_train_size=len(y_train),
+        )
+        trained_rows = int(sum(chunk_sizes))
+        sample_stats["sample_size"] = trained_rows
+        sample_stats["coverage_ratio"] = float(trained_rows / max(len(y_train), 1))
+        sample_stats["chunk_count"] = int(len(chunk_sizes))
+        sample_stats["chunk_size_mean"] = float(np.mean(chunk_sizes)) if chunk_sizes else 0.0
+        return sample_stats, chunk_sizes
+
+    def _log_direct_model_fold(
         self,
         dataset: RawDatasetBundle,
         strategy_name: str,
         partitioner_config: Mapping[str, Any],
         model_name: str,
-        model_factory: Callable[[], Any],
-        fold_idx: int,
-        split_label: str,
-        X_train: Any,
-        X_val: Any,
-        X_test: Any,
-        y_train: Any,
-        y_val: Any,
-        y_test: Any,
-    ) -> Dict[str, Any]:
-        train_size = len(y_train)
-        force_chunking = bool(partitioner_config.get("force_chunking", False))
-        force_direct_model = bool(partitioner_config.get("force_direct_model", False)) or partitioner_config.get("strategy") == "full_dataset"
-        configured_partitions = int(partitioner_config.get("n_partitions", 1))
-        effective_partitions = configured_partitions if force_chunking else max(1, int(np.ceil(train_size / 20000)))
-        target_chunks = 10
-        chunks_percent = min(100.0, 100.0 * target_chunks / max(1, effective_partitions))
-        use_direct_model = force_direct_model or (train_size < 20000 and not force_chunking)
+        fold: FoldSplit,
+        model_metrics: Mapping[str, Any],
+        fit_time: float,
+        infer_time: float,
+        sample_stats: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        fold_value = self._fold_value(fold)
+        return self.logger.log_strategy_run(
+            dataset_name=dataset.name,
+            strategy_name=f"{strategy_name}__{model_name}__{fold.split_label}",
+            strategy_params={
+                **dict(partitioner_config),
+                "model": model_name,
+                "cv_fold": fold_value,
+                "split_label": fold.split_label,
+                "chunking_skipped": True,
+            },
+            model_metrics=dict(model_metrics),
+            timings={"fit": fit_time, "sample": 0.0, "inference": infer_time},
+            sample_stats=dict(sample_stats),
+            extra={
+                **self._base_fold_extra(dataset, strategy_name, model_name, fold),
+                "effective_partitions": 1,
+                "chunks_percent": 100.0,
+                "n_chunks": 1,
+                "chunk_sizes": [int(len(fold.y_train))],
+                "partition_metrics": [],
+                "chunking_skipped": True,
+                "chunking_skip_reason": "train_size_below_20000",
+            },
+        )
+
+    def _log_ensemble_fold(
+        self,
+        dataset: RawDatasetBundle,
+        strategy_name: str,
+        tuned_partitioner_config: Mapping[str, Any],
+        model_name: str,
+        fold: FoldSplit,
+        plan: FoldExecutionPlan,
+        ensemble: SamplingEnsemble,
+        model_metrics: Mapping[str, Any],
+        fit_time: float,
+        infer_time: float,
+        sample_stats: Mapping[str, Any],
+        chunk_sizes: Sequence[int],
+    ) -> dict[str, Any]:
+        fold_value = self._fold_value(fold)
+        return self.logger.log_strategy_run(
+            dataset_name=dataset.name,
+            strategy_name=f"{strategy_name}__{model_name}__{fold.split_label}",
+            strategy_params={
+                **dict(tuned_partitioner_config),
+                "model": model_name,
+                "cv_fold": fold_value,
+                "split_label": fold.split_label,
+            },
+            model_metrics=dict(model_metrics),
+            timings={"fit": fit_time, "sample": 0.0, "inference": infer_time},
+            sample_stats=dict(sample_stats),
+            extra={
+                **self._base_fold_extra(dataset, strategy_name, model_name, fold),
+                "effective_partitions": plan.effective_partitions,
+                "chunks_percent": plan.chunks_percent,
+                "n_chunks": len(ensemble.models),
+                "chunk_sizes": list(chunk_sizes),
+                "partition_metrics": ensemble.partition_metrics,
+                "sampler_diagnostics": getattr(ensemble.partitioner, "diagnostics_", {}),
+                "budget_policy": getattr(ensemble, "budget_policy_", {}),
+            },
+        )
+
+    def _log_failed_fold(
+        self,
+        dataset: RawDatasetBundle,
+        strategy_name: str,
+        partitioner_config: Mapping[str, Any],
+        model_name: str,
+        fold: FoldSplit,
+        plan: FoldExecutionPlan,
+        error: Exception,
+    ) -> dict[str, Any]:
+        fold_value = self._fold_value(fold)
+        return self.logger.log_strategy_run(
+            dataset_name=dataset.name,
+            strategy_name=f"{strategy_name}__{model_name}__{fold.split_label}",
+            strategy_params={
+                **dict(partitioner_config),
+                "model": model_name,
+                "cv_fold": fold_value,
+                "split_label": fold.split_label,
+            },
+            model_metrics={},
+            timings={"fit": 0.0, "sample": 0.0, "inference": 0.0},
+            sample_stats=build_sample_stats(
+                y_sampled=np.array([], dtype=float),
+                total_train_size=max(len(fold.y_train), 1),
+            ),
+            extra={
+                **self._base_fold_extra(dataset, strategy_name, model_name, fold),
+                "effective_partitions": plan.effective_partitions,
+                "chunks_percent": plan.chunks_percent,
+                "error": str(error),
+            },
+        )
+
+    def _base_fold_extra(
+        self,
+        dataset: RawDatasetBundle,
+        strategy_name: str,
+        model_name: str,
+        fold: FoldSplit,
+    ) -> dict[str, Any]:
+        return {
+            "problem_type": dataset.problem_type,
+            "strategy": strategy_name,
+            "model": model_name,
+            "cv_fold": self._fold_value(fold),
+            "split_label": fold.split_label,
+            "source_path": dataset.source_path,
+            "n_train": int(len(fold.X_train)),
+            "n_val": int(len(fold.X_val)),
+            "n_test": int(len(fold.X_test)),
+            "task_id": getattr(dataset, "task_id", None),
+            "task_name": getattr(dataset, "task_name", None),
+            "suite_id": getattr(dataset, "suite_id", None),
+        }
+
+    @staticmethod
+    def _fold_value(fold: FoldSplit) -> Optional[int]:
+        return fold.fold_idx if fold.split_label.startswith("fold_") else None
+
+
+class EnsembleChunkBenchmarkRunner:
+    """Runner for chunk-based SamplingEnsemble benchmarks on raw AMLB datasets."""
+
+    def __init__(
+        self,
+        logger: Optional[BenchmarkLogger] = None,
+        cv_folds: int = 3,
+        seed: int = 42,
+        show_progress: bool = True,
+        on_record: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> None:
+        self.logger = logger or BenchmarkLogger()
+        self.cv_folds = cv_folds
+        self.seed = seed
+        self.show_progress = show_progress
+        self.loader = AMLBDatasetLoader()
+        self.on_record = on_record
+        self.fold_executor = EnsembleFoldBenchmarkExecutor(
+            logger=self.logger,
+            loader=self.loader,
+            cv_folds=self.cv_folds,
+            seed=self.seed,
+            show_progress=self.show_progress,
+        )
+
+    def run_dataset(
+        self,
+        dataset: RawDatasetBundle,
+        strategy_configs: Mapping[str, Mapping[str, Any]],
+        model_pool: Mapping[str, Callable[[], Any]],
+    ) -> List[Dict[str, Any]]:
+        openml_split_data = self._load_openml_split(dataset)
         try:
-            if force_chunking and len(y_val) == 0:
-                X_train, X_val, y_train, y_val = self._split_small_train_val(
-                    X_train=X_train,
-                    y_train=y_train,
-                    problem_type=dataset.problem_type,
-                    random_state=self.seed + fold_idx,
-                )
-                train_size = len(y_train)
+            return self._run_model_strategy_grid(
+                dataset=dataset,
+                strategy_configs=strategy_configs,
+                model_pool=model_pool,
+                openml_split_data=openml_split_data,
+            )
+        finally:
+            self._release_openml_split(openml_split_data)
 
-            X_train_df = self._ensure_dataframe(X_train, dataset)
-            X_val_df = self._ensure_dataframe(X_val, dataset)
-            X_test_df = self._ensure_dataframe(X_test, dataset)
+    def _load_openml_split(
+        self,
+        dataset: RawDatasetBundle,
+    ) -> Optional[tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series, list[str], list[str], list[str]]]:
+        if not isinstance(dataset, OpenMLRawDatasetBundle):
+            return None
+        with progress_bar(
+            enabled=self.show_progress,
+            desc=f"Load OpenML split ({dataset.name})",
+            total=1,
+        ) as stage:
+            openml_split_data = dataset.load_split_data(show_progress=self.show_progress)
+            stage.update(1)
+        return openml_split_data
 
-            if use_direct_model:
-                fit_started = perf_counter()
-                model = model_factory()
-                model.fit(X_train_df, y_train)
-                fit_time = perf_counter() - fit_started
-
-                infer_started = perf_counter()
-                if dataset.problem_type == "classification":
-                    y_proba = model.predict_proba(X_test_df) if hasattr(model, "predict_proba") else None
-                    if y_proba is not None and getattr(y_proba, "ndim", 0) == 2 and y_proba.shape[1] > 0:
-                        classes = np.asarray(getattr(model, "classes_", np.arange(y_proba.shape[1])))
-                        if classes.shape[0] == y_proba.shape[1]:
-                            predictions = classes[np.argmax(y_proba, axis=1)]
-                        else:
-                            predictions = model.predict(X_test_df)
-                    else:
-                        predictions = model.predict(X_test_df)
-                else:
-                    y_proba = None
-                    predictions = model.predict(X_test_df)
-                infer_time = perf_counter() - infer_started
-
-                model_metrics = calculate_metrics(
-                    y_true=y_test,
-                    y_labels=predictions,
-                    y_proba=y_proba if dataset.problem_type == "classification" else None,
-                    problem_type=dataset.problem_type,
-                )
-
-                sample_stats = self._build_train_sample_stats(
-                    y_train=y_train,
-                    problem_type=dataset.problem_type,
-                    total_train_size=len(y_train),
-                )
-                sample_stats["chunk_count"] = 1
-                sample_stats["chunk_size_mean"] = float(len(y_train))
-
-                fold_value = fold_idx if split_label.startswith("fold_") else None
-                return self.logger.log_strategy_run(
-                    dataset_name=dataset.name,
-                    strategy_name=f"{strategy_name}__{model_name}__{split_label}",
-                    strategy_params={
-                        **dict(partitioner_config),
-                        "model": model_name,
-                        "cv_fold": fold_value,
-                        "split_label": split_label,
-                        "chunking_skipped": True,
-                    },
-                    model_metrics=model_metrics,
-                    timings={"fit": fit_time, "sample": 0.0, "inference": infer_time},
-                    sample_stats=sample_stats,
-                    extra={
-                        "problem_type": dataset.problem_type,
-                        "strategy": strategy_name,
-                        "model": model_name,
-                        "cv_fold": fold_value,
-                        "split_label": split_label,
-                        "effective_partitions": 1,
-                        "chunks_percent": 100.0,
-                        "n_chunks": 1,
-                        "chunk_sizes": [int(len(y_train))],
-                        "partition_metrics": [],
-                        "source_path": dataset.source_path,
-                        "n_train": int(len(X_train)),
-                        "n_val": int(len(X_val)),
-                        "n_test": int(len(X_test)),
-                        "task_id": getattr(dataset, "task_id", None),
-                        "task_name": getattr(dataset, "task_name", None),
-                        "suite_id": getattr(dataset, "suite_id", None),
-                        "chunking_skipped": True,
-                        "chunking_skip_reason": "train_size_below_20000",
-                    },
-                )
-
-            class_samples = None
-            if dataset.problem_type == "classification":
-                class_samples = self._class_representatives(X_train_df, y_train, seed=self.seed + fold_idx)
-
-            tuned_partitioner_config = dict(partitioner_config)
-            tuned_partitioner_config["n_partitions"] = effective_partitions
-            tuned_partitioner_config["chunks_percent"] = chunks_percent
-
-            ensemble = SamplingEnsemble(
-                problem=dataset.problem_type,
-                partitioner_config=tuned_partitioner_config,
+    def _run_model_strategy_grid(
+        self,
+        dataset: RawDatasetBundle,
+        strategy_configs: Mapping[str, Mapping[str, Any]],
+        model_pool: Mapping[str, Callable[[], Any]],
+        openml_split_data: Optional[tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series, list[str], list[str], list[str]]],
+    ) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        for model_name, model_factory in self._iter_models(dataset, model_pool):
+            self._run_strategies_for_model(
+                records=records,
+                dataset=dataset,
+                strategy_configs=strategy_configs,
+                model_name=model_name,
                 model_factory=model_factory,
-                ensemble_method=tuned_partitioner_config.get("ensemble_method", "voting"),
+                openml_split_data=openml_split_data,
             )
+        return records
 
-            fit_started = perf_counter()
-            ensemble.train_partition_models(
-                X_train=X_train_df,
-                y_train=y_train,
-                X_val=X_val_df,
-                y_val=y_val,
-                class_samples=class_samples,
-                cv_fold=fold_idx,
-                validation_metric="f1_weighted" if dataset.problem_type == "classification" else "rmse",
-                train_all_chunks=True,
-                save_models_to_disk=False,
-            )
-            fit_time = perf_counter() - fit_started
+    def _iter_models(
+        self,
+        dataset: RawDatasetBundle,
+        model_pool: Mapping[str, Callable[[], Any]],
+    ) -> Iterable[tuple[str, Callable[[], Any]]]:
+        return tqdm(
+            model_pool.items(),
+            total=len(model_pool),
+            disable=not self.show_progress,
+            desc=f"Models ({dataset.name})",
+            leave=False,
+        )
 
-            infer_started = perf_counter()
-            predictions = ensemble.ensemble_predict_batch(X_test_df, batch_size=10000)
-            infer_time = perf_counter() - infer_started
+    def _run_strategies_for_model(
+        self,
+        records: list[dict[str, Any]],
+        dataset: RawDatasetBundle,
+        strategy_configs: Mapping[str, Mapping[str, Any]],
+        model_name: str,
+        model_factory: Callable[[], Any],
+        openml_split_data: Optional[tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series, list[str], list[str], list[str]]],
+    ) -> None:
+        for strategy_name, partitioner_config in self._iter_strategies(dataset, model_name, strategy_configs):
+            fold_records = self.fold_executor.run_strategy_folds(
+                dataset=dataset,
+                strategy_name=strategy_name,
+                partitioner_config=partitioner_config,
+                model_name=model_name,
+                model_factory=model_factory,
+                openml_split_data=openml_split_data,
+            )
+            for record in fold_records:
+                self._record_run(records, record)
 
-            model_metrics = calculate_metrics(
-                y_true=y_test,
-                y_labels=predictions,
-                y_proba=None,
-                problem_type=dataset.problem_type,
-            )
+    def _iter_strategies(
+        self,
+        dataset: RawDatasetBundle,
+        model_name: str,
+        strategy_configs: Mapping[str, Mapping[str, Any]],
+    ) -> Iterable[tuple[str, Mapping[str, Any]]]:
+        return tqdm(
+            strategy_configs.items(),
+            total=len(strategy_configs),
+            disable=not self.show_progress,
+            desc=f"Strategies ({dataset.name}/{model_name})",
+            leave=False,
+        )
 
-            chunk_sizes = [int(model_info.get("data_size", 0)) for model_info in ensemble.models]
-            sample_stats = self._build_train_sample_stats(
-                y_train=y_train,
-                problem_type=dataset.problem_type,
-                total_train_size=len(y_train),
-            )
-            trained_rows = int(sum(chunk_sizes))
-            sample_stats["sample_size"] = trained_rows
-            sample_stats["coverage_ratio"] = float(trained_rows / max(len(y_train), 1))
-            sample_stats["chunk_count"] = int(len(chunk_sizes))
-            sample_stats["chunk_size_mean"] = float(np.mean(chunk_sizes)) if chunk_sizes else 0.0
+    def _record_run(self, records: list[dict[str, Any]], record: dict[str, Any]) -> None:
+        if self.on_record is not None:
+            self.on_record(record)
+        records.append(record)
 
-            fold_value = fold_idx if split_label.startswith("fold_") else None
-            return self.logger.log_strategy_run(
-                dataset_name=dataset.name,
-                strategy_name=f"{strategy_name}__{model_name}__{split_label}",
-                strategy_params={
-                    **tuned_partitioner_config,
-                    "model": model_name,
-                    "cv_fold": fold_value,
-                    "split_label": split_label,
-                },
-                model_metrics=model_metrics,
-                timings={"fit": fit_time, "sample": 0.0, "inference": infer_time},
-                sample_stats=sample_stats,
-                extra={
-                    "problem_type": dataset.problem_type,
-                    "strategy": strategy_name,
-                    "model": model_name,
-                    "cv_fold": fold_value,
-                    "split_label": split_label,
-                    "effective_partitions": effective_partitions,
-                    "chunks_percent": chunks_percent,
-                    "n_chunks": len(ensemble.models),
-                    "chunk_sizes": chunk_sizes,
-                    "partition_metrics": ensemble.partition_metrics,
-                    "sampler_diagnostics": getattr(ensemble.partitioner, "diagnostics_", {}),
-                    "budget_policy": getattr(ensemble, "budget_policy_", {}),
-                    "source_path": dataset.source_path,
-                    "n_train": int(len(X_train)),
-                    "n_val": int(len(X_val)),
-                    "n_test": int(len(X_test)),
-                    "task_id": getattr(dataset, "task_id", None),
-                    "task_name": getattr(dataset, "task_name", None),
-                    "suite_id": getattr(dataset, "suite_id", None),
-                },
-            )
-        except Exception as ex:
-            fold_value = fold_idx if split_label.startswith("fold_") else None
-            return self.logger.log_strategy_run(
-                dataset_name=dataset.name,
-                strategy_name=f"{strategy_name}__{model_name}__{split_label}",
-                strategy_params={
-                    **dict(partitioner_config),
-                    "model": model_name,
-                    "cv_fold": fold_value,
-                    "split_label": split_label,
-                },
-                model_metrics={},
-                timings={"fit": 0.0, "sample": 0.0, "inference": 0.0},
-                sample_stats=build_sample_stats(
-                    y_sampled=np.array([], dtype=float),
-                    total_train_size=max(len(y_train), 1),
-                ),
-                extra={
-                    "problem_type": dataset.problem_type,
-                    "strategy": strategy_name,
-                    "model": model_name,
-                    "cv_fold": fold_value,
-                    "split_label": split_label,
-                    "effective_partitions": effective_partitions,
-                    "chunks_percent": chunks_percent,
-                    "source_path": dataset.source_path,
-                    "task_id": getattr(dataset, "task_id", None),
-                    "task_name": getattr(dataset, "task_name", None),
-                    "suite_id": getattr(dataset, "suite_id", None),
-                    "error": str(ex),
-                },
-            )
+    @staticmethod
+    def _release_openml_split(openml_split_data: Optional[Any]) -> None:
+        if openml_split_data is not None:
+            del openml_split_data
+            gc.collect()
 
 def _apply_budget_policy(
     informative_indices: Sequence[int],
