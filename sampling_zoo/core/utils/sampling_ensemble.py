@@ -59,6 +59,9 @@ class SamplingEnsemble:
         self.partitioner = None
         self.models = []
         self.partition_metrics = {}
+        self.partition_diagnostics_ = {}
+        self.validation_diagnostics_ = {}
+        self.test_routing_diagnostics_ = {}
 
     def _log(self, message: str) -> None:
         progress_write(message, enabled=self.show_progress)
@@ -93,6 +96,7 @@ class SamplingEnsemble:
                 )
                 stage.update(1)
 
+            self.partition_diagnostics_ = self._build_partition_target_diagnostics(self.partitions, target)
             self._log_partition_summary(self.partitions)
             return self.partitions
 
@@ -309,6 +313,149 @@ class SamplingEnsemble:
             'partition_sizes': {name: int(count) for name, count in counts.items()},
         }
         return budgeted
+
+    def _build_partition_target_diagnostics(self, partitions: Dict[str, Any], target: pd.Series) -> Dict[str, Any]:
+        global_values = self._numeric_target_values(target)
+        global_summary = self._target_summary(global_values)
+        global_quantiles = global_summary.get('quantiles', {})
+        chunk_diagnostics: Dict[str, Any] = {}
+        sizes: List[int] = []
+        mean_drifts: List[float] = []
+        standardized_mean_drifts: List[float] = []
+        quantile_drifts: List[float] = []
+
+        for name, partition_data in partitions.items():
+            chunk_values = self._partition_target_values(partition_data)
+            chunk_summary = self._target_summary(chunk_values)
+            size = int(chunk_summary.get('count', 0))
+            sizes.append(size)
+
+            drift = self._target_drift_summary(chunk_summary, global_summary, global_quantiles)
+            if drift.get('mean_abs_drift') is not None:
+                mean_drifts.append(float(drift['mean_abs_drift']))
+            if drift.get('mean_std_units') is not None:
+                standardized_mean_drifts.append(float(drift['mean_std_units']))
+            if drift.get('quantile_l1_drift') is not None:
+                quantile_drifts.append(float(drift['quantile_l1_drift']))
+
+            chunk_diagnostics[name] = {
+                **chunk_summary,
+                **drift,
+            }
+
+        return {
+            'global_target': global_summary,
+            'chunk_size_imbalance': self._chunk_size_imbalance(sizes),
+            'target_drift_summary': {
+                'mean_abs_drift_avg': float(np.mean(mean_drifts)) if mean_drifts else None,
+                'mean_abs_drift_max': float(np.max(mean_drifts)) if mean_drifts else None,
+                'mean_std_units_avg': float(np.mean(standardized_mean_drifts)) if standardized_mean_drifts else None,
+                'mean_std_units_max': float(np.max(standardized_mean_drifts)) if standardized_mean_drifts else None,
+                'quantile_l1_drift_avg': float(np.mean(quantile_drifts)) if quantile_drifts else None,
+                'quantile_l1_drift_max': float(np.max(quantile_drifts)) if quantile_drifts else None,
+            },
+            'chunks': chunk_diagnostics,
+        }
+
+    @staticmethod
+    def _numeric_target_values(target: Any) -> np.ndarray:
+        values = pd.to_numeric(pd.Series(target), errors='coerce').to_numpy(dtype=float)
+        return values[np.isfinite(values)]
+
+    @staticmethod
+    def _partition_target_values(partition_data: Any) -> np.ndarray:
+        if isinstance(partition_data, dict) and 'target' in partition_data:
+            return SamplingEnsemble._numeric_target_values(partition_data['target'])
+        return np.asarray([], dtype=float)
+
+    @staticmethod
+    def _target_summary(values: np.ndarray) -> Dict[str, Any]:
+        values = np.asarray(values, dtype=float)
+        values = values[np.isfinite(values)]
+        summary: Dict[str, Any] = {
+            'count': int(values.size),
+        }
+        if values.size == 0:
+            summary.update({
+                'mean': None,
+                'std': None,
+                'min': None,
+                'max': None,
+                'quantiles': {},
+            })
+            return summary
+
+        quantile_levels = (0.1, 0.25, 0.5, 0.75, 0.9)
+        quantile_values = np.quantile(values, quantile_levels)
+        summary.update({
+            'mean': float(np.mean(values)),
+            'std': float(np.std(values)),
+            'min': float(np.min(values)),
+            'max': float(np.max(values)),
+            'quantiles': {
+                f"q{int(level * 100):02d}": float(value)
+                for level, value in zip(quantile_levels, quantile_values)
+            },
+        })
+        return summary
+
+    @staticmethod
+    def _target_drift_summary(
+        chunk_summary: Dict[str, Any],
+        global_summary: Dict[str, Any],
+        global_quantiles: Dict[str, float],
+    ) -> Dict[str, Any]:
+        chunk_mean = chunk_summary.get('mean')
+        global_mean = global_summary.get('mean')
+        global_std = global_summary.get('std')
+        if chunk_mean is None or global_mean is None:
+            return {
+                'mean_abs_drift': None,
+                'mean_std_units': None,
+                'quantile_l1_drift': None,
+            }
+
+        mean_abs_drift = abs(float(chunk_mean) - float(global_mean))
+        mean_std_units = (
+            mean_abs_drift / max(float(global_std), 1e-12)
+            if global_std is not None and np.isfinite(float(global_std))
+            else None
+        )
+        chunk_quantiles = chunk_summary.get('quantiles', {}) or {}
+        common_keys = [key for key in global_quantiles if key in chunk_quantiles]
+        quantile_l1_drift = (
+            float(np.mean([abs(float(chunk_quantiles[key]) - float(global_quantiles[key])) for key in common_keys]))
+            if common_keys
+            else None
+        )
+        return {
+            'mean_abs_drift': float(mean_abs_drift),
+            'mean_std_units': float(mean_std_units) if mean_std_units is not None else None,
+            'quantile_l1_drift': quantile_l1_drift,
+        }
+
+    @staticmethod
+    def _chunk_size_imbalance(sizes: List[int]) -> Dict[str, Any]:
+        if not sizes:
+            return {
+                'min': 0,
+                'max': 0,
+                'mean': 0.0,
+                'std': 0.0,
+                'max_to_min_ratio': None,
+                'coefficient_of_variation': None,
+            }
+        arr = np.asarray(sizes, dtype=float)
+        mean = float(np.mean(arr))
+        min_size = int(np.min(arr))
+        return {
+            'min': min_size,
+            'max': int(np.max(arr)),
+            'mean': mean,
+            'std': float(np.std(arr)),
+            'max_to_min_ratio': float(np.max(arr) / min_size) if min_size > 0 else None,
+            'coefficient_of_variation': float(np.std(arr) / mean) if mean > 0 else None,
+        }
 
     def _create_model_instance(self):
         """Создает экземпляр модели с заданными параметрами"""
@@ -685,6 +832,14 @@ class SamplingEnsemble:
         reduced_metrics = self._evaluate_current_ensemble(X_val, y_val)
         self._log(f"Ensemble metrics after pruning: {reduced_metrics}")
         self._log(f"Best validation metric after pruning ({validation_metric}): {best_score}")
+        self.validation_diagnostics_ = self._build_validation_diagnostics(
+            X_val=X_val,
+            y_val=y_val,
+            full_metrics=full_metrics,
+            reduced_metrics=reduced_metrics,
+            best_score=best_score,
+            validation_metric=validation_metric,
+        )
 
     def select_best_models_forward(
             self,
@@ -772,6 +927,72 @@ class SamplingEnsemble:
             weights = np.ones(len(active_models), dtype=float)
         return weights / weights.sum()
 
+    def _build_validation_diagnostics(
+        self,
+        X_val: pd.DataFrame,
+        y_val: pd.Series,
+        full_metrics: Dict[str, Any],
+        reduced_metrics: Dict[str, Any],
+        best_score: Any,
+        validation_metric: str,
+    ) -> Dict[str, Any]:
+        active_models = list(self.models)
+        return {
+            'validation_metric': validation_metric,
+            'best_validation_metric': self._safe_float(best_score),
+            'active_model_names': [str(model_info.get('name')) for model_info in active_models],
+            'full_ensemble_metrics_before_pruning': dict(full_metrics),
+            'ensemble_metrics_after_pruning': dict(reduced_metrics),
+            'routing': self.build_routing_diagnostics(X_val, active_models=active_models),
+            'local_partition_metrics': self._build_local_validation_metrics(X_val, y_val, active_models),
+        }
+
+    @staticmethod
+    def _safe_float(value: Any) -> Any:
+        if value is None:
+            return None
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return value
+        return value if np.isfinite(value) else None
+
+    def _build_local_validation_metrics(
+        self,
+        X_val: pd.DataFrame,
+        y_val: pd.Series,
+        active_models: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        if not active_models or len(X_val) == 0:
+            return {}
+        routing_weights = self._routing_weights(X_val, active_models)
+        assignments = np.argmax(routing_weights, axis=1)
+        y_values = pd.Series(y_val).reset_index(drop=True)
+        local_metrics: Dict[str, Any] = {}
+        for model_idx, model_info in enumerate(active_models):
+            name = str(model_info.get('name', f'chunk_{model_idx}'))
+            mask = assignments == model_idx
+            assigned_count = int(np.sum(mask))
+            if assigned_count == 0:
+                local_metrics[name] = {
+                    'assigned_count': 0,
+                    'metrics': {},
+                }
+                continue
+            val_predictions = np.asarray(model_info.get('val_predictions'))
+            metrics = calculate_metrics(
+                y_true=y_values.iloc[mask].to_numpy(),
+                y_labels=val_predictions[mask],
+                y_proba=None,
+                problem_type=self.problem,
+            )
+            local_metrics[name] = {
+                'assigned_count': assigned_count,
+                'mean_routing_probability': float(np.mean(routing_weights[mask, model_idx])),
+                'metrics': metrics,
+            }
+        return local_metrics
+
     def _routing_weights(self, features: pd.DataFrame, active_models: List[Dict[str, Any]]) -> np.ndarray:
         """
         Returns row-wise routing probabilities aligned with active_models.
@@ -814,6 +1035,48 @@ class SamplingEnsemble:
             pass
 
         return np.full((n_samples, n_models), 1.0 / max(n_models, 1))
+
+    def build_routing_diagnostics(
+        self,
+        features: pd.DataFrame,
+        active_models: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        active_models = active_models if active_models is not None else list(self.models)
+        n_samples = len(features)
+        n_models = len(active_models)
+        if n_samples == 0 or n_models == 0:
+            return {
+                'n_rows': int(n_samples),
+                'n_models': int(n_models),
+                'hard_assignment_counts': {},
+                'soft_assignment_mass': {},
+            }
+
+        routing_weights = self._routing_weights(features, active_models)
+        model_names = [str(model_info.get('name', f'chunk_{idx}')) for idx, model_info in enumerate(active_models)]
+        max_probability = np.max(routing_weights, axis=1)
+        entropy = -np.sum(routing_weights * np.log(routing_weights + 1e-12), axis=1)
+        normalized_entropy = entropy / max(np.log(n_models), 1e-12)
+        assignments = np.argmax(routing_weights, axis=1)
+
+        hard_counts = {
+            name: int(np.sum(assignments == idx))
+            for idx, name in enumerate(model_names)
+        }
+        soft_mass = {
+            name: float(np.sum(routing_weights[:, idx]))
+            for idx, name in enumerate(model_names)
+        }
+        return {
+            'n_rows': int(n_samples),
+            'n_models': int(n_models),
+            'mean_max_probability': float(np.mean(max_probability)),
+            'median_max_probability': float(np.median(max_probability)),
+            'mean_entropy': float(np.mean(entropy)),
+            'mean_normalized_entropy': float(np.mean(normalized_entropy)),
+            'hard_assignment_counts': hard_counts,
+            'soft_assignment_mass': soft_mass,
+        }
 
     def ensemble_predict(self, features: pd.DataFrame, stage: str = 'inference', models: Optional[List[Dict[str, Any]]] = None) -> np.ndarray:
         """

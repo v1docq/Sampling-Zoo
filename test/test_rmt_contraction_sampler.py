@@ -6,6 +6,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from sampling_zoo.core.sampling_strategies.spectral.backend.matrix_backend import MatrixRMTBackend
+from sampling_zoo.core.sampling_strategies.spectral.backend.tensor_backend import TensorRMTBackend
 from sampling_zoo.core.sampling_strategies.spectral.rmt_contraction_sampler import (
     RMTContractionConfig,
     RMTContractionTensorSampler,
@@ -28,7 +30,6 @@ def test_numpy_backend_predict_partition_proba_rows_sum_to_one() -> None:
         n_partitions=4,
         n_views=5,
         projection_dim=3,
-        approx_rank=3,
         max_encoded_features=10,
         backend="numpy",
         random_state=7,
@@ -41,6 +42,76 @@ def test_numpy_backend_predict_partition_proba_rows_sum_to_one() -> None:
     assert proba.shape == (10, len(sampler.partition_names_))
     assert np.allclose(proba.sum(axis=1), 1.0)
     assert sampler.diagnostics_["backend"] == "numpy"
+    assert sampler.diagnostics_["selected_rank"] <= sampler.diagnostics_["initial_rank"]
+    assert "approx_rank" not in sampler.diagnostics_
+
+
+def test_auto_n_views_subsample_uses_feature_coverage_policy() -> None:
+    rng = np.random.default_rng(123)
+    X = pd.DataFrame(rng.normal(size=(50, 20)), columns=[f"x_{idx}" for idx in range(20)])
+    sampler = RMTContractionTensorSampler(
+        n_partitions=3,
+        n_views="auto",
+        view_strategy="subsample",
+        view_size=4,
+        projection_dim=2,
+        target_feature_coverage=0.9,
+        min_views=2,
+        max_views=50,
+        backend="numpy",
+        random_state=23,
+        show_progress=False,
+    )
+
+    sampler.fit(X)
+
+    expected_views = int(np.ceil(np.log(1.0 - 0.9) / np.log(1.0 - 4 / 20)))
+    assert sampler.diagnostics_["n_views_policy"] == "coverage"
+    assert sampler.diagnostics_["n_views"] == expected_views
+    assert sampler.diagnostics_["estimated_feature_coverage"] >= 0.9
+
+
+def test_auto_n_views_gaussian_uses_spectrum_stability_policy() -> None:
+    rng = np.random.default_rng(321)
+    X = pd.DataFrame(rng.normal(size=(36, 8)), columns=[f"x_{idx}" for idx in range(8)])
+    sampler = RMTContractionTensorSampler(
+        n_partitions=3,
+        n_views="auto",
+        view_strategy="gaussian",
+        projection_dim=2,
+        min_views=2,
+        max_views=4,
+        spectrum_stability_tolerance=10.0,
+        backend="numpy",
+        random_state=29,
+        show_progress=False,
+    )
+
+    sampler.fit(X)
+
+    assert sampler.diagnostics_["n_views_policy"] == "spectrum_stability"
+    assert sampler.diagnostics_["n_views"] in {2, 4}
+    assert sampler.diagnostics_["spectrum_stability_candidates"] == [2, 4]
+
+
+def test_sv_scaled_embedding_mode_changes_embedding_geometry() -> None:
+    rng = np.random.default_rng(222)
+    X = pd.DataFrame(rng.normal(size=(48, 7)), columns=[f"x_{idx}" for idx in range(7)])
+    shared_kwargs = dict(
+        n_partitions=3,
+        n_views=3,
+        projection_dim=3,
+        backend="numpy",
+        random_state=31,
+        show_progress=False,
+    )
+    scaled = RMTContractionTensorSampler(embedding_mode="sv_scaled", **shared_kwargs).fit(X)
+    whitened = RMTContractionTensorSampler(embedding_mode="whitened", **shared_kwargs).fit(X)
+
+    assert scaled.diagnostics_["embedding_mode"] == "sv_scaled"
+    assert whitened.diagnostics_["embedding_mode"] == "whitened"
+    assert scaled.sample_embedding_.shape == whitened.sample_embedding_.shape
+    assert not np.allclose(scaled.sample_embedding_, whitened.sample_embedding_)
 
 
 def test_config_constructor_and_legacy_positional_arguments() -> None:
@@ -62,13 +133,73 @@ def test_config_constructor_and_legacy_positional_arguments() -> None:
     assert from_positionals.n_views == 4
 
 
+def test_removed_approx_rank_is_rejected() -> None:
+    with pytest.raises(ValueError, match="approx_rank is no longer supported"):
+        RMTContractionTensorSampler(approx_rank=3)
+
+
+def test_explained_variance_rank_selection() -> None:
+    sampler = RMTContractionTensorSampler(backend="numpy", show_progress=False)
+
+    rank, explained_variance = sampler._select_rank_from_spectrum(np.asarray([4.0, 3.0, 1.0]))
+
+    assert rank == 2
+    assert explained_variance >= 0.95
+
+
+def test_zero_spectrum_rank_selection_uses_min_rank() -> None:
+    sampler = RMTContractionTensorSampler(min_rank=2, backend="numpy", show_progress=False)
+
+    rank, explained_variance = sampler._select_rank_from_spectrum(np.zeros(5))
+
+    assert rank == 2
+    assert explained_variance == 0.0
+
+
+def test_matrix_rmt_backend_returns_expected_shapes() -> None:
+    X = np.random.default_rng(123).normal(size=(40, 6))
+    sampler = RMTContractionTensorSampler(
+        n_views=2,
+        projection_dim=3,
+        backend="numpy",
+        show_progress=False,
+        random_state=42,
+    )
+    specs = sampler._make_view_specs(n_features=X.shape[1], rng=np.random.default_rng(42))
+    backend = MatrixRMTBackend(oversample_factor=2, power_iterations=1, random_state=42)
+
+    M = backend.build_mode0_unfolding(X, specs)
+    basis = backend.compute_spectral_basis(M, rank=2)
+
+    assert M.shape == (40, 6)
+    assert basis.U.shape == (40, 2)
+    assert basis.singular_values.shape == (2,)
+    assert basis.Vt.shape == (2, 6)
+    assert np.isclose(basis.leverage_scores.sum(), 1.0)
+
+
+@pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch is optional")
+def test_tensor_rmt_backend_routing_probability_rows_sum_to_one() -> None:
+    backend = TensorRMTBackend(device="cpu", dtype="float32", random_state=42)
+    embedding = np.asarray([[0.0, 1.0], [1.0, 0.0], [0.5, 0.5]], dtype=np.float32)
+    centroids = np.asarray([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32)
+
+    proba = backend.routing_probability(embedding, centroids, temperature=1.0)
+
+    assert proba.shape == (3, 2)
+    assert np.allclose(proba.sum(axis=1), 1.0)
+
+
+def test_sampler_no_longer_owns_torch_randomized_svd() -> None:
+    assert not hasattr(RMTContractionTensorSampler, "_torch_randomized_svd")
+
+
 def test_auto_backend_resolves_to_available_backend() -> None:
     X = _frame()
     sampler = RMTContractionTensorSampler(
         n_partitions=3,
         n_views=4,
         projection_dim=2,
-        approx_rank=2,
         backend="auto",
         random_state=11,
         show_progress=False,
@@ -87,7 +218,6 @@ def test_sparse_encoded_features_are_capped_before_dense_math() -> None:
         n_partitions=3,
         n_views=3,
         projection_dim=2,
-        approx_rank=2,
         max_one_hot_cardinality=20,
         max_encoded_features=5,
         backend="numpy",
@@ -109,7 +239,6 @@ def test_partition_probability_columns_align_with_partition_names() -> None:
         n_partitions=5,
         n_views=4,
         projection_dim=3,
-        approx_rank=3,
         chunks_percent=60,
         backend="numpy",
         random_state=17,
@@ -130,7 +259,6 @@ def test_torch_backend_if_available() -> None:
         n_partitions=3,
         n_views=4,
         projection_dim=2,
-        approx_rank=2,
         backend="torch",
         device="cpu",
         random_state=19,

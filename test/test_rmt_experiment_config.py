@@ -6,10 +6,15 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
 
 from examples.benchmark.benchmark_sampling_strategies import make_chunking_strategy_configs
+from examples.benchmark.rmt_regression_medium_datasets import (
+    make_rmt_experiment_strategy_configs as make_medium_rmt_experiment_strategy_configs,
+    make_rmt_strategy_grid as make_medium_rmt_strategy_grid,
+)
 from examples.benchmark.run_rmt_contraction_regression_experiment import (
     RMTRegressionExperimentConfig,
     RMTRegressionExperimentOrchestrator,
     build_rmt_report_tables,
+    make_rmt_experiment_strategy_configs,
     make_rmt_strategy_grid,
 )
 from sampling_zoo.core.utils.sampling_ensemble import SamplingEnsemble
@@ -29,6 +34,14 @@ def test_chunking_configs_support_rmt_and_experiment_metadata() -> None:
 
     assert configs["rmt_contraction"]["chunk_fraction"] == 0.5
     assert configs["rmt_contraction"]["backend"] == "auto"
+    assert configs["rmt_contraction"]["n_views"] == "auto"
+    assert configs["rmt_contraction"]["n_views_policy"] == "auto"
+    assert configs["rmt_contraction"]["view_strategy"] == "gaussian"
+    assert configs["rmt_contraction"]["embedding_mode"] == "sv_scaled"
+    assert "approx_rank" not in configs["rmt_contraction"]
+    assert configs["rmt_contraction"]["initial_rank_fraction"] == 0.25
+    assert configs["rmt_contraction"]["rank_selection_method"] == "explained_variance"
+    assert configs["rmt_contraction"]["explained_variance_threshold"] == 0.95
     assert configs["feature_clustering"]["experiment_chunk_fraction"] == 0.5
     assert "chunk_fraction" not in configs["feature_clustering"]
     assert configs["random"]["budget_ratio"] == 0.1
@@ -69,22 +82,77 @@ def test_routed_weighted_falls_back_for_non_routing_sampler() -> None:
 
     assert predictions.shape[0] == len(X_val)
     assert np.all(np.isfinite(predictions))
+    assert ensemble.partition_diagnostics_["chunk_size_imbalance"]["max"] > 0
+    assert "target_drift_summary" in ensemble.partition_diagnostics_
+    assert "routing" in ensemble.validation_diagnostics_
+    assert "local_partition_metrics" in ensemble.validation_diagnostics_
+    routing_diagnostics = ensemble.build_routing_diagnostics(X_val.reset_index(drop=True))
+    assert routing_diagnostics["n_rows"] == len(X_val)
+    assert routing_diagnostics["n_models"] == len(ensemble.models)
 
 
 def test_rmt_strategy_grid_points_are_stable() -> None:
     grid = make_rmt_strategy_grid(
         strategies=("rmt_contraction",),
         ensemble_methods=("voting", "routed_weighted"),
-        chunk_fractions=(1.0, 0.25),
         budget_ratios=(0.01,),
     )
 
     assert [point.config_name for point in grid] == [
-        "rmt_contraction__voting__cf_1p0__budget_01",
-        "rmt_contraction__voting__cf_0p25__budget_01",
-        "rmt_contraction__routed_weighted__cf_1p0__budget_01",
-        "rmt_contraction__routed_weighted__cf_0p25__budget_01",
+        "rmt_contraction__voting__budget_01",
+        "rmt_contraction__routed_weighted__budget_01",
     ]
+
+
+def test_rmt_runner_strategy_configs_vary_only_budget_ratio() -> None:
+    configs = make_rmt_experiment_strategy_configs(
+        problem_type="regression",
+        strategies=("rmt_contraction",),
+        ensemble_methods=("voting",),
+        budget_ratios=(0.1, 0.2),
+        n_partitions=3,
+        seed=42,
+        show_progress=False,
+    )
+
+    assert [name for name in configs if name != "full_dataset"] == [
+        "rmt_contraction__voting__budget_10",
+        "rmt_contraction__voting__budget_20",
+    ]
+    assert configs["full_dataset"]["force_direct_model"] is True
+    assert configs["rmt_contraction__voting__budget_10"]["budget_ratio"] == 0.1
+    assert "chunk_fraction" not in configs["rmt_contraction__voting__budget_10"]
+    assert "experiment_chunk_fraction" not in configs["rmt_contraction__voting__budget_10"]
+
+
+def test_medium_rmt_runner_strategy_configs_vary_view_strategy_for_rmt_only() -> None:
+    grid = make_medium_rmt_strategy_grid(
+        strategies=("rmt_contraction", "random"),
+        ensemble_methods=("voting",),
+        budget_ratios=(0.1,),
+        view_strategies=("subsample", "gaussian"),
+    )
+
+    assert [point.config_name for point in grid] == [
+        "rmt_contraction__view_subsample__voting__budget_10",
+        "rmt_contraction__view_gaussian__voting__budget_10",
+        "random__voting__budget_10",
+    ]
+
+    configs = make_medium_rmt_experiment_strategy_configs(
+        problem_type="regression",
+        strategies=("rmt_contraction", "random"),
+        ensemble_methods=("voting",),
+        budget_ratios=(0.1,),
+        view_strategies=("subsample", "gaussian"),
+        n_partitions=3,
+        seed=42,
+        show_progress=False,
+    )
+
+    assert configs["rmt_contraction__view_subsample__voting__budget_10"]["view_strategy"] == "subsample"
+    assert configs["rmt_contraction__view_gaussian__voting__budget_10"]["view_strategy"] == "gaussian"
+    assert "view_strategy" not in configs["random__voting__budget_10"]
 
 
 def test_rmt_orchestrator_run_is_thin_sequence(tmp_path) -> None:
@@ -210,6 +278,11 @@ def test_sample_efficiency_summary_selects_minimal_budget(tmp_path) -> None:
 
     row = minimal[(minimal["delta"] == 0.05) & (minimal["sampler"] == "rmt_contraction")].iloc[0]
     assert row["budget_ratio"] == 0.1
+    assert "chunk_fraction" not in tables["efficiency"].columns
+    assert "embedding_mode" in tables["raw"].columns
+    assert "target_mean_abs_drift_avg" in tables["raw"].columns
+    assert "validation_mean_max_routing_proba" in tables["raw"].columns
+    assert "test_mean_max_routing_proba" in tables["raw"].columns
     assert (tmp_path / "rmt_raw_runs.csv").exists()
     assert (tmp_path / "sample_efficiency_curve.csv").exists()
     assert (tmp_path / "minimal_effective_budget.csv").exists()

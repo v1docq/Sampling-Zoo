@@ -250,9 +250,19 @@ def make_chunking_strategy_configs(
             strategy_config["method"] = "kmeans"
         elif normalized_name == "rmt_contraction":
             strategy_config.update({
-                "n_views": 16,
+                "n_views": "auto",
+                "n_views_policy": "auto",
+                "min_views": 4,
+                "max_views": 32,
+                "target_feature_coverage": 0.95,
+                "spectrum_stability_tolerance": 0.05,
+                "view_strategy": "gaussian",
+                "embedding_mode": "sv_scaled",
                 "projection_dim": 8,
-                "approx_rank": 16,
+                "initial_rank_fraction": 0.25,
+                "rank_selection_method": "explained_variance",
+                "explained_variance_threshold": 0.95,
+                "min_rank": 1,
                 "selection_method": "hybrid",
                 "routing_temperature": 1.0,
                 "routing_shrinkage": 0.05,

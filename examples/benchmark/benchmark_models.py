@@ -46,11 +46,10 @@ except Exception:  # pragma: no cover - optional
 try:
     from tabpfn import TabPFNClassifier, TabPFNRegressor
     from tabpfn.constants import ModelVersion
-
-    os.environ['HF_TOKEN'] = 'your_hf_token_with_tabpfn_v2.5_access'
 except Exception:  # pragma: no cover - optional
     TabPFNClassifier = None
     TabPFNRegressor = None
+    ModelVersion = None
 
 try:
     from tabicl import TabICLClassifier, TabICLRegressor
@@ -171,6 +170,51 @@ def _make_pytorch_classifier(seed: int) -> ClassifierMixin:
     return TorchMLPClassifier()
 
 
+def _env_flag_enabled(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _torch_cuda_is_available() -> bool:
+    if torch is None:
+        return False
+    try:
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def _resolve_tabpfn_device() -> str:
+    """Prefer CUDA for TabPFN when the active torch backend can see it."""
+    explicit_device = os.getenv("TABPFN_DEVICE")
+    if explicit_device:
+        return explicit_device.strip()
+    return "cuda" if _torch_cuda_is_available() else "cpu"
+
+
+def _make_tabpfn_kwargs(seed: int, n_estimators: int = 12) -> Dict[str, Any]:
+    device = _resolve_tabpfn_device()
+    kwargs: Dict[str, Any] = {
+        "n_estimators": n_estimators,
+        "device": device,
+        "random_state": seed,
+    }
+    if device == "cpu" and (
+        _env_flag_enabled("TABPFN_ALLOW_CPU_LARGE_DATASET")
+        or _env_flag_enabled("TABPFN_IGNORE_PRETRAINING_LIMITS")
+    ):
+        kwargs["ignore_pretraining_limits"] = True
+    return kwargs
+
+
+def _create_tabpfn_model(model_cls: Any, seed: int) -> Any:
+    if ModelVersion is None:
+        raise ValueError("tabpfn is not available. Install tabpfn to use this model.")
+    return model_cls.create_default_for_version(
+        ModelVersion.V2_5,
+        **_make_tabpfn_kwargs(seed),
+    )
+
+
 
 
 def make_model_pool(
@@ -250,15 +294,9 @@ def make_model_pool(
         if TabPFNClassifier is None or TabPFNRegressor is None:
             raise ValueError("tabpfn is not available. Install tabpfn to use this model.")
         if normalized_problem == "classification":
-            model_pool["tabpfn"] = lambda: TabPFNClassifier.create_default_for_version(
-                ModelVersion.V2_5,
-                n_estimators=12,
-            )
+            model_pool["tabpfn"] = lambda: _create_tabpfn_model(TabPFNClassifier, seed)
         else:
-            model_pool["tabpfn"] = lambda: TabPFNRegressor.create_default_for_version(
-                ModelVersion.V2_5,
-                n_estimators=12,
-            )
+            model_pool["tabpfn"] = lambda: _create_tabpfn_model(TabPFNRegressor, seed)
 
     if "tabicl" in requested:
         if TabICLClassifier is None or TabICLRegressor is None:

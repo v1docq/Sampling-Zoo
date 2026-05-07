@@ -62,7 +62,10 @@ class RMTReportTableBuilder:
                 "model": value_series(df, "strategy_params.model"),
                 "sampler": value_series(df, "strategy_params.strategy"),
                 "ensemble_method": value_series(df, "strategy_params.ensemble_method"),
-                "chunk_fraction": self._chunk_fraction_series(df),
+                "view_strategy": value_series(df, "strategy_params.view_strategy", default=None),
+                "n_views": self._numeric_series(df, "extra.sampler_diagnostics.n_views"),
+                "n_views_policy": value_series(df, "extra.sampler_diagnostics.n_views_policy", default=None),
+                "embedding_mode": value_series(df, "extra.sampler_diagnostics.embedding_mode", default=None),
                 "budget_ratio": self._numeric_series(df, "strategy_params.budget_ratio"),
                 "total_train_rows": self._numeric_series(df, "sample_stats.sample_size"),
                 "rmse": self._numeric_series(df, "model_metrics.rmse"),
@@ -70,6 +73,42 @@ class RMTReportTableBuilder:
                 "inference_time": self._numeric_series(df, "timings_sec.inference"),
                 "leverage_entropy": self._numeric_series(df, "extra.sampler_diagnostics.leverage_entropy"),
                 "effective_sample_count": self._numeric_series(df, "extra.sampler_diagnostics.effective_sample_count"),
+                "chunk_size_imbalance_ratio": self._numeric_series(
+                    df,
+                    "extra.partition_diagnostics.chunk_size_imbalance.max_to_min_ratio",
+                ),
+                "chunk_size_cv": self._numeric_series(
+                    df,
+                    "extra.partition_diagnostics.chunk_size_imbalance.coefficient_of_variation",
+                ),
+                "target_mean_abs_drift_avg": self._numeric_series(
+                    df,
+                    "extra.partition_diagnostics.target_drift_summary.mean_abs_drift_avg",
+                ),
+                "target_mean_std_units_avg": self._numeric_series(
+                    df,
+                    "extra.partition_diagnostics.target_drift_summary.mean_std_units_avg",
+                ),
+                "target_quantile_l1_drift_avg": self._numeric_series(
+                    df,
+                    "extra.partition_diagnostics.target_drift_summary.quantile_l1_drift_avg",
+                ),
+                "validation_mean_max_routing_proba": self._numeric_series(
+                    df,
+                    "extra.validation_diagnostics.routing.mean_max_probability",
+                ),
+                "validation_mean_routing_entropy": self._numeric_series(
+                    df,
+                    "extra.validation_diagnostics.routing.mean_normalized_entropy",
+                ),
+                "test_mean_max_routing_proba": self._numeric_series(
+                    df,
+                    "extra.test_routing_diagnostics.mean_max_probability",
+                ),
+                "test_mean_routing_entropy": self._numeric_series(
+                    df,
+                    "extra.test_routing_diagnostics.mean_normalized_entropy",
+                ),
                 "singular_values": value_series(df, "extra.sampler_diagnostics.singular_values", default=None),
                 "chunk_sizes": value_series(df, "extra.sampler_diagnostics.chunk_sizes", default=None),
             }
@@ -78,15 +117,6 @@ class RMTReportTableBuilder:
     @staticmethod
     def _numeric_series(df: pd.DataFrame, column: str) -> pd.Series:
         return pd.to_numeric(value_series(df, column), errors="coerce")
-
-    @staticmethod
-    def _chunk_fraction_series(df: pd.DataFrame) -> pd.Series:
-        return pd.to_numeric(
-            value_series(df, "strategy_params.chunk_fraction").fillna(
-                value_series(df, "strategy_params.experiment_chunk_fraction")
-            ),
-            errors="coerce",
-        )
 
     def _attach_rmse_baseline(self, raw: pd.DataFrame) -> pd.DataFrame:
         baseline = self._full_dataset_baseline(raw)
@@ -134,9 +164,14 @@ class RMTReportTableBuilder:
     def _build_efficiency_table(raw: pd.DataFrame) -> pd.DataFrame:
         return (
             raw[raw["sampler"] != "full_dataset"]
-            .groupby(["dataset", "model", "sampler", "ensemble_method", "chunk_fraction", "budget_ratio"], as_index=False)
+            .groupby(
+                ["dataset", "model", "sampler", "ensemble_method", "view_strategy", "budget_ratio"],
+                as_index=False,
+                dropna=False,
+            )
             .agg(
                 {
+                    "n_views": "mean",
                     "total_train_rows": "mean",
                     "rmse": "mean",
                     "rmse_ref": "mean",
@@ -145,9 +180,18 @@ class RMTReportTableBuilder:
                     "inference_time": "mean",
                     "leverage_entropy": "mean",
                     "effective_sample_count": "mean",
+                    "chunk_size_imbalance_ratio": "mean",
+                    "chunk_size_cv": "mean",
+                    "target_mean_abs_drift_avg": "mean",
+                    "target_mean_std_units_avg": "mean",
+                    "target_quantile_l1_drift_avg": "mean",
+                    "validation_mean_max_routing_proba": "mean",
+                    "validation_mean_routing_entropy": "mean",
+                    "test_mean_max_routing_proba": "mean",
+                    "test_mean_routing_entropy": "mean",
                 }
             )
-            .sort_values(["dataset", "sampler", "ensemble_method", "chunk_fraction", "budget_ratio"])
+            .sort_values(["dataset", "sampler", "view_strategy", "ensemble_method", "budget_ratio"])
         )
 
     def _build_minimal_budget_table(self, efficiency: pd.DataFrame) -> pd.DataFrame:
@@ -156,8 +200,12 @@ class RMTReportTableBuilder:
             eligible = efficiency[efficiency["rmse"] <= efficiency["rmse_ref"] * (1.0 + delta)].copy()
             if eligible.empty:
                 continue
-            eligible = eligible.sort_values(["budget_ratio", "chunk_fraction"])
-            grouped = eligible.groupby(["dataset", "model", "sampler", "ensemble_method"], as_index=False).first()
+            eligible = eligible.sort_values(["budget_ratio"])
+            grouped = eligible.groupby(
+                ["dataset", "model", "sampler", "ensemble_method", "view_strategy"],
+                as_index=False,
+                dropna=False,
+            ).first()
             grouped["delta"] = delta
             minimal_rows.extend(grouped.to_dict(orient="records"))
         return pd.DataFrame(minimal_rows)

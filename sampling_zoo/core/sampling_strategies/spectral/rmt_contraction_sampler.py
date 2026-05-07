@@ -7,16 +7,12 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 from sklearn.cluster import KMeans
-from sklearn.utils.extmath import randomized_svd
 
+from .backend.matrix_backend import MatrixRMTBackend
+from .backend.tensor_backend import TensorRMTBackend
 from .base_sampler import SpectralSamplerBase
 from ...utils.progress import progress_bar
 from ...utils.utils import safe_index
-
-try:  # optional backend
-    import torch
-except Exception:  # pragma: no cover - torch is optional
-    torch = None
 
 
 ArrayLike = Union[np.ndarray, pd.DataFrame]
@@ -36,10 +32,19 @@ class RMTContractionConfig:
     """Normalized construction parameters for RMT contraction sampling."""
 
     n_partitions: int = 5
-    n_views: int = 16
+    n_views: Union[int, str] = "auto"
+    n_views_policy: str = "auto"
+    min_views: int = 4
+    max_views: int = 64
+    target_feature_coverage: float = 0.95
+    spectrum_stability_tolerance: float = 0.05
+    embedding_mode: str = "sv_scaled"
     view_size: Optional[Union[int, float]] = None
     projection_dim: Optional[int] = None
-    approx_rank: Union[int, float] = 16
+    initial_rank_fraction: float = 0.25
+    rank_selection_method: str = "explained_variance"
+    explained_variance_threshold: float = 0.95
+    min_rank: int = 1
     view_strategy: str = "gaussian"
     chunk_fraction: float = 1.0
     chunks_percent: float = 100.0
@@ -66,10 +71,38 @@ class RMTContractionConfig:
         config: Optional["RMTContractionConfig"],
         overrides: Dict[str, Any],
     ) -> "RMTContractionConfig":
+        if "approx_rank" in overrides:
+            raise ValueError(
+                "approx_rank is no longer supported by RMTContractionTensorSampler. "
+                "Use initial_rank_fraction, rank_selection_method, and "
+                "explained_variance_threshold instead."
+            )
         base = config or cls()
         valid_fields = cls.__dataclass_fields__
         accepted = {key: value for key, value in overrides.items() if key in valid_fields}
         return replace(base, **accepted)
+
+
+@dataclass(frozen=True)
+class RankSelectionInfo:
+    initial_rank: int
+    selected_rank: int
+    rank_selection_method: str
+    explained_variance_threshold: float
+    explained_variance_at_selected_rank: float
+
+
+@dataclass(frozen=True)
+class NViewsSelectionInfo:
+    requested_n_views: Union[int, str]
+    resolved_n_views: int
+    n_views_policy: str
+    target_feature_coverage: Optional[float]
+    estimated_feature_coverage: Optional[float]
+    max_views_by_unfolding: Optional[int]
+    spectrum_stability_tolerance: Optional[float]
+    spectrum_stability_change: Optional[float]
+    spectrum_stability_candidates: Tuple[int, ...]
 
 
 class RMTContractionTensorSampler(SpectralSamplerBase):
@@ -94,6 +127,87 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         *args: Any,
         **kwargs: Any,
     ) -> None:
+        cfg = self._normalize_config_inputs(config, args, kwargs)
+        requested_n_views = self._normalize_n_views_request(cfg.n_views)
+        base_n_views = cfg.min_views if requested_n_views == "auto" else int(requested_n_views)
+        super().__init__(
+            sample_size=None,
+            approx_rank=1.0,
+            random_state=cfg.random_state,
+            n_partitions=cfg.n_partitions,
+            n_views=base_n_views,
+            view_strategy=cfg.view_strategy,
+            chunk_fraction=cfg.chunk_fraction,
+            chunks_percent=cfg.chunks_percent,
+            min_chunk_size=cfg.min_chunk_size,
+            max_chunk_size=cfg.max_chunk_size,
+            selection_method=cfg.selection_method,
+            routing_temperature=cfg.routing_temperature,
+            routing_shrinkage=cfg.routing_shrinkage,
+            backend=cfg.backend,
+            device=cfg.device,
+            dtype=cfg.dtype,
+            include_categorical=cfg.include_categorical,
+            max_one_hot_cardinality=cfg.max_one_hot_cardinality,
+            max_encoded_features=cfg.max_encoded_features,
+            show_progress=cfg.show_progress,
+        )
+        self.config = cfg
+        self.n_views_requested = requested_n_views
+        self.n_views_policy = self._validate_choice(
+            "n_views_policy",
+            cfg.n_views_policy,
+            ("auto", "coverage", "spectrum_stability"),
+        )
+        self.min_views = self._validate_positive_int("min_views", cfg.min_views)
+        self.max_views = self._validate_positive_int("max_views", cfg.max_views)
+        if self.max_views < self.min_views:
+            raise ValueError("max_views must be greater than or equal to min_views")
+        self.target_feature_coverage = self._validate_fraction(
+            "target_feature_coverage",
+            cfg.target_feature_coverage,
+        )
+        self.spectrum_stability_tolerance = self._validate_positive_float(
+            "spectrum_stability_tolerance",
+            cfg.spectrum_stability_tolerance,
+        )
+        self.embedding_mode = self._validate_choice(
+            "embedding_mode",
+            cfg.embedding_mode,
+            ("sv_scaled", "whitened"),
+        )
+        if self.n_views_requested != "auto":
+            self.n_views = int(self.n_views_requested)
+        self.view_size = cfg.view_size
+        self.projection_dim = cfg.projection_dim
+        self.initial_rank_fraction = self._validate_fraction(
+            "initial_rank_fraction",
+            cfg.initial_rank_fraction,
+        )
+        self.rank_selection_method = self._validate_choice(
+            "rank_selection_method",
+            cfg.rank_selection_method,
+            ("explained_variance",),
+        )
+        self.explained_variance_threshold = self._validate_fraction(
+            "explained_variance_threshold",
+            cfg.explained_variance_threshold,
+        )
+        self.min_rank = self._validate_positive_int("min_rank", cfg.min_rank)
+        self.oversample_factor = int(cfg.oversample_factor)
+        self.power_iterations = int(cfg.power_iterations)
+        self.max_unfolding_elements = cfg.max_unfolding_elements
+        self._rmt_backend: Optional[Union[MatrixRMTBackend, TensorRMTBackend]] = None
+        self.rank_selection_info_: Optional[RankSelectionInfo] = None
+        self.n_views_selection_info_: Optional[NViewsSelectionInfo] = None
+
+    @staticmethod
+    def _normalize_config_inputs(
+        config: Optional[RMTContractionConfig],
+        args: Tuple[Any, ...],
+        kwargs: Dict[str, Any],
+    ) -> RMTContractionConfig:
+        kwargs = dict(kwargs)
         if config is not None and not isinstance(config, RMTContractionConfig):
             positional_names = (
                 "n_partitions",
@@ -118,6 +232,12 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
                 "device",
                 "dtype",
                 "max_unfolding_elements",
+                "n_views_policy",
+                "min_views",
+                "max_views",
+                "target_feature_coverage",
+                "spectrum_stability_tolerance",
+                "embedding_mode",
                 "show_progress",
                 "random_state",
             )
@@ -129,35 +249,29 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             config = None
         elif args:
             raise TypeError("Positional overrides require positional n_partitions as the first argument")
-        cfg = RMTContractionConfig.from_overrides(config, kwargs)
-        super().__init__(
-            sample_size=None,
-            approx_rank=cfg.approx_rank,
-            random_state=cfg.random_state,
-            n_partitions=cfg.n_partitions,
-            n_views=cfg.n_views,
-            view_strategy=cfg.view_strategy,
-            chunk_fraction=cfg.chunk_fraction,
-            chunks_percent=cfg.chunks_percent,
-            min_chunk_size=cfg.min_chunk_size,
-            max_chunk_size=cfg.max_chunk_size,
-            selection_method=cfg.selection_method,
-            routing_temperature=cfg.routing_temperature,
-            routing_shrinkage=cfg.routing_shrinkage,
-            backend=cfg.backend,
-            device=cfg.device,
-            dtype=cfg.dtype,
-            include_categorical=cfg.include_categorical,
-            max_one_hot_cardinality=cfg.max_one_hot_cardinality,
-            max_encoded_features=cfg.max_encoded_features,
-            show_progress=cfg.show_progress,
-        )
-        self.config = cfg
-        self.view_size = cfg.view_size
-        self.projection_dim = cfg.projection_dim
-        self.oversample_factor = int(cfg.oversample_factor)
-        self.power_iterations = int(cfg.power_iterations)
-        self.max_unfolding_elements = cfg.max_unfolding_elements
+        return RMTContractionConfig.from_overrides(config, kwargs)
+
+    @staticmethod
+    def _normalize_n_views_request(value: Union[int, str]) -> Union[int, str]:
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized != "auto":
+                raise ValueError("n_views must be a positive integer or 'auto'")
+            return "auto"
+        try:
+            n_views = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("n_views must be a positive integer or 'auto'") from exc
+        if n_views < 1:
+            raise ValueError("n_views must be positive")
+        return n_views
+
+    @staticmethod
+    def _validate_positive_float(name: str, value: float) -> float:
+        value = float(value)
+        if value <= 0:
+            raise ValueError(f"{name} must be positive")
+        return value
 
     def fit(
         self,
@@ -186,22 +300,88 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
 
     def _start_fit(self) -> np.random.Generator:
         self.backend_ = self._resolve_backend()
+        self._rmt_backend = self._make_rmt_backend()
+        self.view_specs_ = []
+        self.rank_selection_info_ = None
+        self.n_views_selection_info_ = None
+        if self.n_views_requested == "auto":
+            self.n_views = self.min_views
         return np.random.default_rng(self.random_state)
 
+    def _make_rmt_backend(self) -> Union[MatrixRMTBackend, TensorRMTBackend]:
+        if self.backend_ == "torch":
+            return TensorRMTBackend(
+                oversample_factor=self.oversample_factor,
+                power_iterations=self.power_iterations,
+                random_state=self.random_state,
+                device=self.device,
+                dtype=self.dtype,
+            )
+        return MatrixRMTBackend(
+            oversample_factor=self.oversample_factor,
+            power_iterations=self.power_iterations,
+            random_state=self.random_state,
+        )
+
+    def _get_rmt_backend(self) -> Union[MatrixRMTBackend, TensorRMTBackend]:
+        if self._rmt_backend is None:
+            raise RuntimeError("RMT backend is not initialized")
+        return self._rmt_backend
+
     def _build_fit_unfolding(self, X_num: np.ndarray, rng: np.random.Generator) -> Any:
+        if self.n_views_requested == "auto":
+            policy = self._resolve_n_views_policy()
+            if policy == "spectrum_stability":
+                return self._build_spectrum_stable_fit_unfolding(X_num, rng)
+            self.n_views = self._resolve_coverage_n_views(*X_num.shape)
         return self._build_mode0_unfolding(X_num, fit=True, rng=rng)
 
     def _fit_spectral_basis(
         self,
         M: Any,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, RankSelectionInfo]:
         n_samples, n_features = self._matrix_shape(M)
-        rank = self._resolve_rank(self.approx_rank, n_samples, n_features)
-        n_components = min(n_samples, n_features, rank + self.oversample_factor)
-        if n_components < 1:
-            raise ValueError("Cannot compute randomized SVD: empty transformed matrix")
-        U, S, Vt, scores = self._compute_spectral_basis(M, rank, n_components)
-        return U, S, Vt, scores, rank
+        initial_rank = self._resolve_initial_rank(n_samples, n_features)
+        basis = self._get_rmt_backend().compute_spectral_basis(M, rank=initial_rank)
+        selected_rank, explained_variance = self._select_rank_from_spectrum(basis.singular_values)
+        selected_basis = basis.truncate(selected_rank)
+        rank_info = RankSelectionInfo(
+            initial_rank=initial_rank,
+            selected_rank=selected_rank,
+            rank_selection_method=self.rank_selection_method,
+            explained_variance_threshold=self.explained_variance_threshold,
+            explained_variance_at_selected_rank=explained_variance,
+        )
+        self.rank_selection_info_ = rank_info
+        return (
+            selected_basis.U,
+            selected_basis.singular_values,
+            selected_basis.Vt,
+            selected_basis.leverage_scores,
+            rank_info,
+        )
+
+    def _resolve_initial_rank(self, n_samples: int, n_features: int) -> int:
+        max_rank = max(1, min(n_samples, n_features))
+        initial_rank = int(math.ceil(self.initial_rank_fraction * max_rank))
+        initial_rank = max(self.min_rank, initial_rank)
+        return max(1, min(initial_rank, max_rank))
+
+    def _select_rank_from_spectrum(self, singular_values: np.ndarray) -> Tuple[int, float]:
+        if self.rank_selection_method != "explained_variance":
+            raise ValueError(f"Unsupported rank_selection_method: {self.rank_selection_method}")
+        values = np.asarray(singular_values, dtype=np.float64)
+        if values.size == 0:
+            return self.min_rank, 0.0
+        energy = values * values
+        total_energy = float(np.sum(energy))
+        if not np.isfinite(total_energy) or total_energy <= 0:
+            rank = min(self.min_rank, values.size)
+            return rank, 0.0
+        cumulative = np.cumsum(energy) / total_energy
+        idx = int(np.searchsorted(cumulative, self.explained_variance_threshold, side="left"))
+        rank = min(max(self.min_rank, idx + 1), values.size)
+        return rank, float(cumulative[rank - 1])
 
     def _store_spectral_basis(
         self,
@@ -212,7 +392,10 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
     ) -> None:
         self.singular_values_ = S
         self.right_basis_ = Vt
-        self.sample_embedding_ = U
+        if self.embedding_mode == "sv_scaled":
+            self.sample_embedding_ = U * S.reshape(1, -1)
+        else:
+            self.sample_embedding_ = U
         self.leverage_scores_ = scores
 
     def _fit_clusters_and_partitions(
@@ -315,61 +498,25 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         if fit:
             if rng is None:
                 rng = np.random.default_rng(self.random_state)
-            self.view_specs_ = self._make_view_specs(n_features, rng)
+            self.view_specs_ = self._make_view_specs(n_features, rng, n_views=self.n_views)
+            self._store_static_or_coverage_n_views_info(n_samples, n_features)
 
         self._check_unfolding_size(n_samples, sum(spec.output_dim for spec in self.view_specs_))
-        if self.backend_ == "torch":
-            return self._build_mode0_unfolding_torch(X)
+        return self._get_rmt_backend().build_mode0_unfolding(X, self.view_specs_)
 
-        views: List[np.ndarray] = []
-        for spec in self.view_specs_:
-            if spec.columns is None:
-                base = X
-            else:
-                base = X[:, spec.columns]
-            if spec.projection is None:
-                Z = base
-            else:
-                Z = base @ spec.projection
-            if Z.shape[1] != spec.output_dim:
-                raise RuntimeError("View output dimension mismatch")
-            views.append(Z)
-        if not views:
-            raise RuntimeError("No random contraction views were generated")
-        return np.concatenate(views, axis=1)
-
-    def _build_mode0_unfolding_torch(self, X: np.ndarray) -> Any:
-        X_tensor = self._to_torch_matrix(X)
-        views: List[Any] = []
-        for spec in self.view_specs_:
-            if spec.columns is None:
-                base = X_tensor
-            else:
-                columns = torch.as_tensor(spec.columns, dtype=torch.long, device=X_tensor.device)
-                base = torch.index_select(X_tensor, dim=1, index=columns)
-            if spec.projection is None:
-                Z = base
-            else:
-                projection = torch.as_tensor(
-                    spec.projection,
-                    dtype=X_tensor.dtype,
-                    device=X_tensor.device,
-                )
-                Z = base @ projection
-            if int(Z.shape[1]) != spec.output_dim:
-                raise RuntimeError("View output dimension mismatch")
-            views.append(Z)
-        if not views:
-            raise RuntimeError("No random contraction views were generated")
-        return torch.cat(views, dim=1)
-
-    def _make_view_specs(self, n_features: int, rng: np.random.Generator) -> List[ViewSpec]:
+    def _make_view_specs(
+        self,
+        n_features: int,
+        rng: np.random.Generator,
+        n_views: Optional[int] = None,
+    ) -> List[ViewSpec]:
+        n_views = int(self.n_views if n_views is None else n_views)
         view_size = self._resolve_view_size(n_features)
         projection_dim = self.projection_dim or view_size
         projection_dim = max(1, int(min(projection_dim, view_size if self.view_strategy == "subsample" else projection_dim)))
 
         specs: List[ViewSpec] = []
-        for _ in range(self.n_views):
+        for _ in range(n_views):
             if self.view_strategy == "subsample":
                 replace = view_size > n_features
                 cols = np.sort(rng.choice(n_features, size=view_size, replace=replace))
@@ -383,6 +530,142 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
                 specs.append(ViewSpec(columns=None, projection=proj, output_dim=projection_dim))
         return specs
 
+    def _resolve_n_views_policy(self) -> str:
+        if self.n_views_policy != "auto":
+            return self.n_views_policy
+        if self.view_strategy == "subsample":
+            return "coverage"
+        return "spectrum_stability"
+
+    def _resolve_coverage_n_views(self, n_samples: int, n_features: int) -> int:
+        view_size = min(self._resolve_view_size(n_features), n_features)
+        if view_size >= n_features:
+            needed = 1
+        elif self.target_feature_coverage >= 1.0:
+            needed = self.max_views
+        else:
+            miss_probability = 1.0 - (view_size / max(n_features, 1))
+            needed = int(math.ceil(math.log(1.0 - self.target_feature_coverage) / math.log(miss_probability)))
+        output_dim = self._output_dim_per_view(n_features)
+        cap = self._max_views_by_unfolding_elements(n_samples, output_dim)
+        upper = self.max_views if cap is None else min(self.max_views, cap)
+        return max(1, min(max(self.min_views, needed), upper))
+
+    def _build_spectrum_stable_fit_unfolding(self, X: np.ndarray, rng: np.random.Generator) -> Any:
+        n_samples, n_features = X.shape
+        output_dim = self._output_dim_per_view(n_features)
+        cap = self._max_views_by_unfolding_elements(n_samples, output_dim)
+        upper = self.max_views if cap is None else min(self.max_views, cap)
+        upper = max(1, upper)
+        lower = max(1, min(self.min_views, upper))
+        candidates = self._spectrum_candidate_views(lower, upper)
+
+        max_specs = self._make_view_specs(n_features, rng, n_views=max(candidates))
+        previous_spectrum: Optional[np.ndarray] = None
+        selected_specs = max_specs[: candidates[-1]]
+        selected_M = None
+        selected_change: Optional[float] = None
+
+        for candidate in candidates:
+            specs = max_specs[:candidate]
+            width = sum(spec.output_dim for spec in specs)
+            self._check_unfolding_size(n_samples, width)
+            M = self._get_rmt_backend().build_mode0_unfolding(X, specs)
+            initial_rank = self._resolve_initial_rank(*self._matrix_shape(M))
+            basis = self._get_rmt_backend().compute_spectral_basis(M, rank=initial_rank)
+            spectrum = np.asarray(basis.singular_values, dtype=np.float64)
+            change = None
+            if previous_spectrum is not None:
+                change = self._spectrum_relative_change(previous_spectrum, spectrum)
+            selected_specs = specs
+            selected_M = M
+            selected_change = change
+            if change is not None and change <= self.spectrum_stability_tolerance:
+                break
+            previous_spectrum = spectrum
+
+        if selected_M is None:
+            raise RuntimeError("Spectrum-stability n_views selection did not build an unfolding")
+
+        self.view_specs_ = selected_specs
+        self.n_views = len(selected_specs)
+        self.n_views_selection_info_ = NViewsSelectionInfo(
+            requested_n_views=self.n_views_requested,
+            resolved_n_views=int(self.n_views),
+            n_views_policy="spectrum_stability",
+            target_feature_coverage=None,
+            estimated_feature_coverage=1.0,
+            max_views_by_unfolding=cap,
+            spectrum_stability_tolerance=float(self.spectrum_stability_tolerance),
+            spectrum_stability_change=selected_change,
+            spectrum_stability_candidates=tuple(candidates),
+        )
+        return selected_M
+
+    @staticmethod
+    def _spectrum_relative_change(previous: np.ndarray, current: np.ndarray) -> float:
+        previous = np.asarray(previous, dtype=np.float64)
+        current = np.asarray(current, dtype=np.float64)
+        k = int(min(previous.size, current.size))
+        if k == 0:
+            return 0.0
+        previous = previous[:k]
+        current = current[:k]
+        previous_norm = previous / (np.linalg.norm(previous) + 1e-12)
+        current_norm = current / (np.linalg.norm(current) + 1e-12)
+        return float(np.linalg.norm(current_norm - previous_norm) / (np.linalg.norm(previous_norm) + 1e-12))
+
+    @staticmethod
+    def _spectrum_candidate_views(min_views: int, max_views: int) -> List[int]:
+        candidates = [int(min_views)]
+        while candidates[-1] < max_views:
+            candidates.append(min(max_views, candidates[-1] * 2))
+        return sorted(set(candidates))
+
+    def _store_static_or_coverage_n_views_info(self, n_samples: int, n_features: int) -> None:
+        if self.n_views_selection_info_ is not None:
+            return
+        output_dim = self._output_dim_per_view(n_features)
+        cap = self._max_views_by_unfolding_elements(n_samples, output_dim)
+        policy = "static" if self.n_views_requested != "auto" else self._resolve_n_views_policy()
+        coverage = None
+        target = None
+        if policy == "coverage":
+            target = float(self.target_feature_coverage)
+            coverage = self._estimate_feature_coverage(n_features, int(self.n_views))
+        self.n_views_selection_info_ = NViewsSelectionInfo(
+            requested_n_views=self.n_views_requested,
+            resolved_n_views=int(self.n_views),
+            n_views_policy=policy,
+            target_feature_coverage=target,
+            estimated_feature_coverage=coverage,
+            max_views_by_unfolding=cap,
+            spectrum_stability_tolerance=None,
+            spectrum_stability_change=None,
+            spectrum_stability_candidates=(),
+        )
+
+    def _estimate_feature_coverage(self, n_features: int, n_views: int) -> float:
+        if n_features <= 0:
+            return 0.0
+        view_size = min(self._resolve_view_size(n_features), n_features)
+        if view_size >= n_features:
+            return 1.0
+        return float(1.0 - (1.0 - view_size / n_features) ** n_views)
+
+    def _output_dim_per_view(self, n_features: int) -> int:
+        view_size = self._resolve_view_size(n_features)
+        projection_dim = self.projection_dim or view_size
+        if self.view_strategy == "subsample":
+            projection_dim = min(int(projection_dim), view_size)
+        return max(1, int(projection_dim))
+
+    def _max_views_by_unfolding_elements(self, n_samples: int, output_dim_per_view: int) -> Optional[int]:
+        if self.max_unfolding_elements is None:
+            return None
+        denominator = max(1, int(n_samples) * int(output_dim_per_view))
+        return max(1, int(self.max_unfolding_elements) // denominator)
+
     def _resolve_view_size(self, n_features: int) -> int:
         if self.view_strategy == "gaussian":
             if self.view_size is None:
@@ -394,72 +677,6 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
                 raise ValueError("float view_size must be in (0, 1]")
             return max(1, int(math.ceil(self.view_size * n_features)))
         return max(1, int(self.view_size))
-
-    @staticmethod
-    def _resolve_rank(rank: Union[int, float], n_samples: int, n_features: int) -> int:
-        max_rank = max(1, min(n_samples, n_features))
-        if isinstance(rank, float):
-            if not (0 < rank <= 1):
-                raise ValueError("float approx_rank must be in (0, 1]")
-            rank = int(math.ceil(rank * max_rank))
-        return max(1, min(int(rank), max_rank))
-
-    def _compute_spectral_basis(
-        self,
-        M: Any,
-        rank: int,
-        n_components: int,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        if self.backend_ == "torch":
-            U_t, S_t, Vt_t = self._torch_randomized_svd(M, rank=rank, n_components=n_components)
-            scores_t = torch.sum(U_t * U_t, dim=1)
-            score_sum = torch.sum(scores_t)
-            if not bool(torch.isfinite(score_sum)) or float(score_sum.detach().cpu()) <= 0.0:
-                scores = np.full(int(U_t.shape[0]), 1.0 / int(U_t.shape[0]))
-            else:
-                scores = (scores_t / score_sum).detach().cpu().numpy()
-            return (
-                U_t.detach().cpu().numpy(),
-                S_t.detach().cpu().numpy(),
-                Vt_t.detach().cpu().numpy(),
-                scores,
-            )
-
-        U, S, Vt = randomized_svd(
-            M,
-            n_components=n_components,
-            n_iter=self.power_iterations,
-            random_state=self.random_state,
-        )
-        U = U[:, :rank]
-        S = S[:rank]
-        Vt = Vt[:rank, :]
-        scores = np.sum(U * U, axis=1)
-        score_sum = float(np.sum(scores))
-        if not np.isfinite(score_sum) or score_sum <= 0:
-            scores = np.full(M.shape[0], 1.0 / M.shape[0])
-        else:
-            scores = scores / score_sum
-        return U, S, Vt, scores
-
-    def _torch_randomized_svd(self, M: Any, rank: int, n_components: int) -> Tuple[Any, Any, Any]:
-        if torch is None:
-            raise RuntimeError("Torch backend selected but torch is unavailable")
-        torch.manual_seed(self.random_state)
-        omega = torch.randn(
-            (int(M.shape[1]), int(n_components)),
-            dtype=M.dtype,
-            device=M.device,
-        )
-        Y = M @ omega
-        for _ in range(max(0, self.power_iterations)):
-            Q_iter, _ = torch.linalg.qr(Y, mode="reduced")
-            Y = M @ (M.T @ Q_iter)
-        Q, _ = torch.linalg.qr(Y, mode="reduced")
-        B = Q.T @ M
-        U_hat, S, Vh = torch.linalg.svd(B, full_matrices=False)
-        U = Q @ U_hat
-        return U[:, :rank], S[:rank], Vh[:rank, :]
 
     def _make_kmeans(self, n_clusters: int) -> KMeans:
         try:
@@ -564,48 +781,23 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
     def _project_new_unfolding(self, M_new: np.ndarray) -> np.ndarray:
         if self.right_basis_ is None or self.singular_values_ is None:
             raise RuntimeError("Spectral basis is not fitted")
-        if self.backend_ == "torch":
-            if torch is None:
-                raise RuntimeError("Torch backend selected but torch is unavailable")
-            if not torch.is_tensor(M_new):
-                M_new = self._to_torch_matrix(M_new)
-            right_basis = torch.as_tensor(
-                self.right_basis_,
-                dtype=M_new.dtype,
-                device=M_new.device,
-            )
-            singular_values = torch.as_tensor(
-                self.singular_values_,
-                dtype=M_new.dtype,
-                device=M_new.device,
-            )
-            embedding = M_new @ right_basis.T
-            embedding = embedding / torch.clamp(singular_values, min=1e-12)
-            return embedding.detach().cpu().numpy()
-        embedding = M_new @ self.right_basis_.T
-        embedding = embedding / np.maximum(self.singular_values_, 1e-12)
+        embedding = self._get_rmt_backend().project_new_unfolding(
+            M_new,
+            self.right_basis_,
+            self.singular_values_,
+        )
+        if self.embedding_mode == "sv_scaled":
+            embedding = embedding * self.singular_values_.reshape(1, -1)
         return embedding
 
     def _routing_probability(self, embedding: np.ndarray, active_centroids: np.ndarray) -> np.ndarray:
-        if self.backend_ == "torch":
-            if torch is None:
-                raise RuntimeError("Torch backend selected but torch is unavailable")
-            emb = self._to_torch_matrix(embedding)
-            centroids = torch.as_tensor(active_centroids, dtype=emb.dtype, device=emb.device)
-            d2 = torch.sum((emb[:, None, :] - centroids[None, :, :]) ** 2, dim=2)
-            logits = -d2 / max(self.routing_temperature, 1e-8)
-            logits = logits - torch.max(logits, dim=1, keepdim=True).values
-            proba = torch.softmax(logits, dim=1)
-            return proba.detach().cpu().numpy()
+        return self._get_rmt_backend().routing_probability(
+            embedding,
+            active_centroids,
+            self.routing_temperature,
+        )
 
-        d2 = np.sum((embedding[:, None, :] - active_centroids[None, :, :]) ** 2, axis=2)
-        temp = max(self.routing_temperature, 1e-8)
-        logits = -d2 / temp
-        logits = logits - np.max(logits, axis=1, keepdims=True)
-        proba = np.exp(logits)
-        return proba / np.maximum(np.sum(proba, axis=1, keepdims=True), 1e-12)
-
-    def _build_diagnostics(self, M: Any, rank: int) -> None:
+    def _build_diagnostics(self, M: Any, rank_info: RankSelectionInfo) -> None:
         scores = self.leverage_scores_
         entropy = None
         eff_n = None
@@ -620,8 +812,22 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             "raw_encoded_feature_count": self.raw_encoded_feature_count_,
             "encoded_feature_count": self.encoded_feature_count_,
             "encoded_feature_cap_applied": self.encoded_feature_subset_ is not None,
+            "view_strategy": self.view_strategy,
+            "embedding_mode": self.embedding_mode,
+            "n_views_requested": self.n_views_requested,
             "n_views": int(self.n_views),
-            "approx_rank": int(rank),
+            "n_views_policy": self.n_views_selection_info_.n_views_policy if self.n_views_selection_info_ else None,
+            "target_feature_coverage": self.n_views_selection_info_.target_feature_coverage if self.n_views_selection_info_ else None,
+            "estimated_feature_coverage": self.n_views_selection_info_.estimated_feature_coverage if self.n_views_selection_info_ else None,
+            "max_views_by_unfolding": self.n_views_selection_info_.max_views_by_unfolding if self.n_views_selection_info_ else None,
+            "spectrum_stability_tolerance": self.n_views_selection_info_.spectrum_stability_tolerance if self.n_views_selection_info_ else None,
+            "spectrum_stability_change": self.n_views_selection_info_.spectrum_stability_change if self.n_views_selection_info_ else None,
+            "spectrum_stability_candidates": list(self.n_views_selection_info_.spectrum_stability_candidates) if self.n_views_selection_info_ else [],
+            "initial_rank": int(rank_info.initial_rank),
+            "selected_rank": int(rank_info.selected_rank),
+            "rank_selection_method": rank_info.rank_selection_method,
+            "explained_variance_threshold": rank_info.explained_variance_threshold,
+            "explained_variance_at_selected_rank": rank_info.explained_variance_at_selected_rank,
             "singular_values": self.singular_values_.tolist() if self.singular_values_ is not None else [],
             "leverage_entropy": entropy,
             "effective_sample_count": eff_n,

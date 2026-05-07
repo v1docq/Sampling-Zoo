@@ -704,6 +704,7 @@ class EnsembleFoldBenchmarkExecutor:
         infer_started = perf_counter()
         predictions = ensemble.ensemble_predict_batch(X_test_df, batch_size=10000)
         infer_time = perf_counter() - infer_started
+        test_routing_diagnostics = ensemble.build_routing_diagnostics(X_test_df)
         fold_stage.update(1)
 
         model_metrics = calculate_metrics(
@@ -730,6 +731,7 @@ class EnsembleFoldBenchmarkExecutor:
             infer_time=infer_time,
             sample_stats=sample_stats,
             chunk_sizes=chunk_sizes,
+            test_routing_diagnostics=test_routing_diagnostics,
         )
         fold_stage.update(1)
         return payload
@@ -858,6 +860,7 @@ class EnsembleFoldBenchmarkExecutor:
         infer_time: float,
         sample_stats: Mapping[str, Any],
         chunk_sizes: Sequence[int],
+        test_routing_diagnostics: Mapping[str, Any],
     ) -> dict[str, Any]:
         fold_value = self._fold_value(fold)
         return self.logger.log_strategy_run(
@@ -879,6 +882,9 @@ class EnsembleFoldBenchmarkExecutor:
                 "n_chunks": len(ensemble.models),
                 "chunk_sizes": list(chunk_sizes),
                 "partition_metrics": ensemble.partition_metrics,
+                "partition_diagnostics": getattr(ensemble, "partition_diagnostics_", {}),
+                "validation_diagnostics": getattr(ensemble, "validation_diagnostics_", {}),
+                "test_routing_diagnostics": dict(test_routing_diagnostics),
                 "sampler_diagnostics": getattr(ensemble.partitioner, "diagnostics_", {}),
                 "budget_policy": getattr(ensemble, "budget_policy_", {}),
             },

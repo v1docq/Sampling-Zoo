@@ -29,20 +29,28 @@ from rmt_experiment_utils import json_ready, load_reference_metrics  # noqa: E40
 from rmt_report_tables import EFFICIENCY_DELTAS, RMTReportTableBuilder, build_rmt_report_tables  # noqa: E402
 from run_big_datasets_ensemble import EnsembleReportBuilder  # noqa: E402
 
-
 DEFAULT_RMT_REGRESSION_TASKS: tuple[str, ...] = (
-    #"elevators",
-    #"diamonds",
-    #"Allstate_Claims_Severity",
-    "Yolanda",
+    "diamonds",
+    "house_16H",
+    "house_sales",
+    "elevators",
+    "pol",
+    "Brazilian_houses",
+    "OnlineNewsPopularity",
+
 )
 DEFAULT_BUDGET_RATIOS: tuple[float, ...] = (0.1, 0.3, 0.5, 0.75, 0.9)
 DEFAULT_ENSEMBLE_METHODS: tuple[str, ...] = ("voting", "routed_weighted")
+DEFAULT_VIEW_STRATEGY: tuple[str, ...] = (
+    #"subsample",
+    "gaussian",
+)
+DEFAULT_VIEW_STRATEGIES: tuple[str, ...] = DEFAULT_VIEW_STRATEGY
 DEFAULT_STRATEGIES: tuple[str, ...] = (
     "rmt_contraction",
     "random",
     "difficulty",
-    #"feature_clustering",
+    # "feature_clustering",
 )
 
 
@@ -54,6 +62,7 @@ class RMTRegressionExperimentConfig:
     models: Sequence[str] = ("lightgbm",)
     ensemble_methods: Sequence[str] = DEFAULT_ENSEMBLE_METHODS
     budget_ratios: Sequence[float] = DEFAULT_BUDGET_RATIOS
+    view_strategies: Sequence[str] = DEFAULT_VIEW_STRATEGIES
     n_partitions: int = 5
     max_train_rows: int | None = 300_000
     seed: int = 42
@@ -66,21 +75,24 @@ class RMTStrategyGridPoint:
     strategy: str
     ensemble_method: str
     budget_ratio: float
+    view_strategy: str | None = None
 
     @property
     def config_name(self) -> str:
         ratio_tag = f"{int(round(self.budget_ratio * 100)):02d}"
-        return f"{self.strategy}__{self.ensemble_method}__budget_{ratio_tag}"
+        view_tag = f"__view_{self.view_strategy}" if self.view_strategy is not None else ""
+        return f"{self.strategy}{view_tag}__{self.ensemble_method}__budget_{ratio_tag}"
 
 
 def make_rmt_experiment_strategy_configs(
-    problem_type: str,
-    strategies: Sequence[str],
-    ensemble_methods: Sequence[str],
-    budget_ratios: Sequence[float],
-    n_partitions: int,
-    seed: int,
-    show_progress: bool = True,
+        problem_type: str,
+        strategies: Sequence[str],
+        ensemble_methods: Sequence[str],
+        budget_ratios: Sequence[float],
+        view_strategies: Sequence[str],
+        n_partitions: int,
+        seed: int,
+        show_progress: bool = True,
 ) -> dict[str, dict[str, Any]]:
     configs: dict[str, dict[str, Any]] = {
         "full_dataset": {
@@ -95,12 +107,13 @@ def make_rmt_experiment_strategy_configs(
         strategies=strategies,
         ensemble_methods=ensemble_methods,
         budget_ratios=budget_ratios,
+        view_strategies=view_strategies,
     )
     for grid_point in tqdm(
-        grid,
-        desc="Build RMT strategy grid",
-        disable=not show_progress,
-        leave=False,
+            grid,
+            desc="Build RMT strategy grid",
+            disable=not show_progress,
+            leave=False,
     ):
         base_config = make_chunking_strategy_configs(
             problem_type=problem_type,
@@ -111,26 +124,45 @@ def make_rmt_experiment_strategy_configs(
             budget_ratio=grid_point.budget_ratio,
             force_chunking=True,
         )[grid_point.strategy]
+        if grid_point.view_strategy is not None:
+            base_config["view_strategy"] = grid_point.view_strategy
         configs[grid_point.config_name] = base_config
-    #del configs['full_dataset']
+    # del configs['full_dataset']
     return configs
 
 
 def make_rmt_strategy_grid(
-    strategies: Sequence[str],
-    ensemble_methods: Sequence[str],
-    budget_ratios: Sequence[float],
+        strategies: Sequence[str],
+        ensemble_methods: Sequence[str],
+        budget_ratios: Sequence[float],
+        view_strategies: Sequence[str] = DEFAULT_VIEW_STRATEGIES,
 ) -> list[RMTStrategyGridPoint]:
-    return [
-        RMTStrategyGridPoint(
-            strategy=strategy,
-            ensemble_method=ensemble_method,
-            budget_ratio=float(budget_ratio),
-        )
-        for strategy in strategies
-        for ensemble_method in ensemble_methods
-        for budget_ratio in budget_ratios
-    ]
+    view_strategies = _normalize_view_strategies(view_strategies)
+    grid: list[RMTStrategyGridPoint] = []
+    for strategy in strategies:
+        strategy_view_strategies: Sequence[str | None]
+        if strategy == "rmt_contraction":
+            strategy_view_strategies = tuple(view_strategies)
+        else:
+            strategy_view_strategies = (None,)
+        for view_strategy in strategy_view_strategies:
+            for ensemble_method in ensemble_methods:
+                for budget_ratio in budget_ratios:
+                    grid.append(
+                        RMTStrategyGridPoint(
+                            strategy=strategy,
+                            ensemble_method=ensemble_method,
+                            budget_ratio=float(budget_ratio),
+                            view_strategy=view_strategy,
+                        )
+                    )
+    return grid
+
+
+def _normalize_view_strategies(view_strategies: Sequence[str] | str) -> tuple[str, ...]:
+    if isinstance(view_strategies, str):
+        return (view_strategies,)
+    return tuple(view_strategies)
 
 
 class RMTRegressionExperimentOrchestrator:
@@ -151,8 +183,8 @@ class RMTRegressionExperimentOrchestrator:
         return BenchmarkLogger(run_id=run_id, artifacts_root=base_dir / "results")
 
     def _create_incremental_recorder(
-        self,
-        logger: BenchmarkLogger,
+            self,
+            logger: BenchmarkLogger,
     ) -> Callable[[Mapping[str, Any]], None]:
         self.incremental_saver = self._create_incremental_saver(logger)
         self.incremental_saver.start()
@@ -221,23 +253,24 @@ class RMTRegressionExperimentOrchestrator:
             strategies=self.config.strategies,
             ensemble_methods=self.config.ensemble_methods,
             budget_ratios=self.config.budget_ratios,
+            view_strategies=self.config.view_strategies,
             n_partitions=self.config.n_partitions,
             seed=self.config.seed,
             show_progress=self.config.show_progress,
         )
 
     def _run_experiment(
-        self,
-        datasets: Sequence[RawDatasetBundle],
-        strategy_configs: Mapping[str, Mapping[str, Any]],
-        runner: EnsembleChunkBenchmarkRunner,
+            self,
+            datasets: Sequence[RawDatasetBundle],
+            strategy_configs: Mapping[str, Mapping[str, Any]],
+            runner: EnsembleChunkBenchmarkRunner,
     ) -> list[dict[str, Any]]:
         run_records: list[dict[str, Any]] = []
         for dataset in tqdm(
-            datasets,
-            desc="Run RMT datasets",
-            disable=not self.config.show_progress,
-            leave=False,
+                datasets,
+                desc="Run RMT datasets",
+                disable=not self.config.show_progress,
+                leave=False,
         ):
             model_pool = make_model_pool(
                 seed=self.config.seed,
@@ -256,10 +289,10 @@ class RMTRegressionExperimentOrchestrator:
         logger.create_markdown_report(run_records)
 
     def _build_run_meta(
-        self,
-        logger: BenchmarkLogger,
-        run_records: Sequence[Mapping[str, Any]],
-        status: str = "completed",
+            self,
+            logger: BenchmarkLogger,
+            run_records: Sequence[Mapping[str, Any]],
+            status: str = "completed",
     ) -> dict[str, Any]:
         return {
             "run_id": logger.run_id,
@@ -270,6 +303,7 @@ class RMTRegressionExperimentOrchestrator:
             "models": list(self.config.models),
             "ensemble_methods": list(self.config.ensemble_methods),
             "budget_ratios": list(self.config.budget_ratios),
+            "view_strategies": list(self.config.view_strategies),
             "max_train_rows": self.config.max_train_rows,
             "synthetic_smoke": self.config.synthetic_smoke,
             "status": status,
@@ -308,10 +342,10 @@ class RMTRegressionExperimentOrchestrator:
 
 
 def run_rmt_contraction_regression_experiment(
-    regression_tasks: Sequence[str] | None = None,
-    models: Sequence[str] = ("lightgbm",),
-    max_train_rows: int | None = 300_000,
-    show_progress: bool = True
+        regression_tasks: Sequence[str] | None = None,
+        models: Sequence[str] = ("lightgbm",),
+        max_train_rows: int | None = 300_000,
+        show_progress: bool = True
 ) -> Path:
     config = RMTRegressionExperimentConfig(
         regression_tasks=regression_tasks or DEFAULT_RMT_REGRESSION_TASKS,
