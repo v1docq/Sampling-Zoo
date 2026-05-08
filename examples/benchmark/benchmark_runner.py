@@ -20,6 +20,14 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from sampling_zoo.core.metrics.eval_metrics import calculate_metrics
+from sampling_zoo.core.experiment.contracts import StrategyGridContract
+from sampling_zoo.core.experiment.morphisms import (
+    dataset_to_contract,
+    evaluation_to_contract,
+    fold_to_contract,
+    materialize_strategy_grid,
+    normalize_strategy_grid,
+)
 from sampling_zoo.core.utils.sampling_ensemble import SamplingEnsemble
 from sampling_zoo.core.utils.amlb_dataloader import AMLBDatasetLoader
 from sampling_zoo.core.utils.progress import progress_bar
@@ -836,6 +844,13 @@ class EnsembleFoldBenchmarkExecutor:
             sample_stats=dict(sample_stats),
             extra={
                 **self._base_fold_extra(dataset, strategy_name, model_name, fold),
+                "contracts": self._build_fold_contract_payload(
+                    dataset=dataset,
+                    fold=fold,
+                    model_metrics=model_metrics,
+                    timings={"fit": fit_time, "sample": 0.0, "inference": infer_time},
+                    sample_stats=sample_stats,
+                ),
                 "effective_partitions": 1,
                 "chunks_percent": 100.0,
                 "n_chunks": 1,
@@ -877,6 +892,13 @@ class EnsembleFoldBenchmarkExecutor:
             sample_stats=dict(sample_stats),
             extra={
                 **self._base_fold_extra(dataset, strategy_name, model_name, fold),
+                "contracts": self._build_fold_contract_payload(
+                    dataset=dataset,
+                    fold=fold,
+                    model_metrics=model_metrics,
+                    timings={"fit": fit_time, "sample": 0.0, "inference": infer_time},
+                    sample_stats=sample_stats,
+                ),
                 "effective_partitions": plan.effective_partitions,
                 "chunks_percent": plan.chunks_percent,
                 "n_chunks": len(ensemble.models),
@@ -918,6 +940,15 @@ class EnsembleFoldBenchmarkExecutor:
             ),
             extra={
                 **self._base_fold_extra(dataset, strategy_name, model_name, fold),
+                "contracts": {
+                    "dataset": dataset_to_contract(dataset).to_dict(),
+                    "fold": fold_to_contract(fold).to_dict(),
+                    "evaluation": evaluation_to_contract(
+                        metrics={},
+                        timings={"fit": 0.0, "sample": 0.0, "inference": 0.0},
+                        sample_stats={},
+                    ).to_dict(),
+                },
                 "effective_partitions": plan.effective_partitions,
                 "chunks_percent": plan.chunks_percent,
                 "error": str(error),
@@ -950,6 +981,24 @@ class EnsembleFoldBenchmarkExecutor:
     def _fold_value(fold: FoldSplit) -> Optional[int]:
         return fold.fold_idx if fold.split_label.startswith("fold_") else None
 
+    @staticmethod
+    def _build_fold_contract_payload(
+        dataset: RawDatasetBundle,
+        fold: FoldSplit,
+        model_metrics: Mapping[str, Any],
+        timings: Mapping[str, float],
+        sample_stats: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "dataset": dataset_to_contract(dataset).to_dict(),
+            "fold": fold_to_contract(fold).to_dict(),
+            "evaluation": evaluation_to_contract(
+                metrics=model_metrics,
+                timings=timings,
+                sample_stats=sample_stats,
+            ).to_dict(),
+        }
+
 
 class EnsembleChunkBenchmarkRunner:
     """Runner for chunk-based SamplingEnsemble benchmarks on raw AMLB datasets."""
@@ -979,14 +1028,19 @@ class EnsembleChunkBenchmarkRunner:
     def run_dataset(
         self,
         dataset: RawDatasetBundle,
-        strategy_configs: Mapping[str, Mapping[str, Any]],
+        strategy_configs: StrategyGridContract | Mapping[str, Mapping[str, Any]],
         model_pool: Mapping[str, Callable[[], Any]],
     ) -> List[Dict[str, Any]]:
+        strategy_grid = (
+            strategy_configs
+            if isinstance(strategy_configs, StrategyGridContract)
+            else normalize_strategy_grid(strategy_configs)
+        )
         openml_split_data = self._load_openml_split(dataset)
         try:
             return self._run_model_strategy_grid(
                 dataset=dataset,
-                strategy_configs=strategy_configs,
+                strategy_configs=strategy_grid,
                 model_pool=model_pool,
                 openml_split_data=openml_split_data,
             )
@@ -1011,7 +1065,7 @@ class EnsembleChunkBenchmarkRunner:
     def _run_model_strategy_grid(
         self,
         dataset: RawDatasetBundle,
-        strategy_configs: Mapping[str, Mapping[str, Any]],
+        strategy_configs: StrategyGridContract | Mapping[str, Mapping[str, Any]],
         model_pool: Mapping[str, Callable[[], Any]],
         openml_split_data: Optional[tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series, list[str], list[str], list[str]]],
     ) -> list[dict[str, Any]]:
@@ -1044,7 +1098,7 @@ class EnsembleChunkBenchmarkRunner:
         self,
         records: list[dict[str, Any]],
         dataset: RawDatasetBundle,
-        strategy_configs: Mapping[str, Mapping[str, Any]],
+        strategy_configs: StrategyGridContract | Mapping[str, Mapping[str, Any]],
         model_name: str,
         model_factory: Callable[[], Any],
         openml_split_data: Optional[tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series, list[str], list[str], list[str]]],
@@ -1065,11 +1119,12 @@ class EnsembleChunkBenchmarkRunner:
         self,
         dataset: RawDatasetBundle,
         model_name: str,
-        strategy_configs: Mapping[str, Mapping[str, Any]],
+        strategy_configs: StrategyGridContract | Mapping[str, Mapping[str, Any]],
     ) -> Iterable[tuple[str, Mapping[str, Any]]]:
+        materialized = materialize_strategy_grid(strategy_configs)
         return tqdm(
-            strategy_configs.items(),
-            total=len(strategy_configs),
+            materialized.items(),
+            total=len(materialized),
             disable=not self.show_progress,
             desc=f"Strategies ({dataset.name}/{model_name})",
             leave=False,

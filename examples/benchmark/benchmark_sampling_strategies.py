@@ -28,13 +28,6 @@ try:
 except Exception:  # pragma: no cover - optional
     LGBMClassifier = None
 
-try:
-    import torch
-    import torch.nn as nn
-    import torch.optim as optim
-except Exception:  # pragma: no cover - optional
-    torch = None
-
 def make_strategies(seed: int = 42) -> Dict[str, Any]:
     def _bounded_sample_size(n_rows: int, target_ratio: float = 0.2, min_target: int = 500) -> int:
         target = max(min_target, int(target_ratio * n_rows))
@@ -258,6 +251,20 @@ def make_chunking_strategy_configs(
                 "spectrum_stability_tolerance": 0.05,
                 "view_strategy": "gaussian",
                 "embedding_mode": "sv_scaled",
+                "partition_selection_method": "auto",
+                "cluster_algorithms": ["kmeans", "bisecting_kmeans", "gmm", "hdbscan"],
+                "cluster_selection_metric": "balanced_silhouette",
+                "cluster_ensemble_method": "weighted_vote",
+                "min_partitions": 2,
+                "max_partitions": max(8, n_partitions),
+                "min_auto_partition_size": 256,
+                "partition_selection_sample_size": 5000,
+                "max_cluster_imbalance_ratio": 5.0,
+                "min_cluster_fraction": 0.05,
+                "imbalance_penalty_weight": 0.15,
+                "tiny_cluster_penalty_weight": 0.30,
+                "target_contrast_weight": 0.0,
+                "cluster_vote_temperature": 0.05,
                 "projection_dim": 8,
                 "initial_rank_fraction": 0.25,
                 "rank_selection_method": "explained_variance",

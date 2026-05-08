@@ -62,10 +62,35 @@ class RMTReportTableBuilder:
                 "model": value_series(df, "strategy_params.model"),
                 "sampler": value_series(df, "strategy_params.strategy"),
                 "ensemble_method": value_series(df, "strategy_params.ensemble_method"),
+                "router": value_series(df, "strategy_params.router", default=None),
                 "view_strategy": value_series(df, "strategy_params.view_strategy", default=None),
                 "n_views": self._numeric_series(df, "extra.sampler_diagnostics.n_views"),
                 "n_views_policy": value_series(df, "extra.sampler_diagnostics.n_views_policy", default=None),
                 "embedding_mode": value_series(df, "extra.sampler_diagnostics.embedding_mode", default=None),
+                "partition_selection_method": value_series(
+                    df,
+                    "extra.sampler_diagnostics.partition_selection_method",
+                    default=None,
+                ),
+                "selected_cluster_algorithm": value_series(
+                    df,
+                    "extra.sampler_diagnostics.selected_cluster_algorithm",
+                    default=None,
+                ),
+                "cluster_selection_metric": value_series(
+                    df,
+                    "extra.sampler_diagnostics.cluster_selection_metric",
+                    default=None,
+                ),
+                "cluster_ensemble_method": value_series(
+                    df,
+                    "extra.sampler_diagnostics.cluster_ensemble_method",
+                    default=None,
+                ),
+                "selected_n_partitions": self._numeric_series(
+                    df,
+                    "extra.sampler_diagnostics.selected_n_partitions",
+                ),
                 "budget_ratio": self._numeric_series(df, "strategy_params.budget_ratio"),
                 "total_train_rows": self._numeric_series(df, "sample_stats.sample_size"),
                 "rmse": self._numeric_series(df, "model_metrics.rmse"),
@@ -100,6 +125,54 @@ class RMTReportTableBuilder:
                 "validation_mean_routing_entropy": self._numeric_series(
                     df,
                     "extra.validation_diagnostics.routing.mean_normalized_entropy",
+                ),
+                "router_status": value_series(
+                    df,
+                    "extra.validation_diagnostics.router.status",
+                    default=None,
+                ),
+                "router_training_rmse": self._numeric_series(
+                    df,
+                    "extra.validation_diagnostics.router.training_rmse",
+                ),
+                "router_prior_rmse": self._numeric_series(
+                    df,
+                    "extra.validation_diagnostics.router.prior_rmse",
+                ),
+                "router_rmse_delta_vs_prior": self._numeric_series(
+                    df,
+                    "extra.validation_diagnostics.router.rmse_delta_vs_prior",
+                ),
+                "router_head_status": value_series(
+                    df,
+                    "extra.validation_diagnostics.router_head.status",
+                    default=None,
+                ),
+                "router_head_training_accuracy": self._numeric_series(
+                    df,
+                    "extra.validation_diagnostics.router_head.training_accuracy",
+                ),
+                "routing_refinement_status": value_series(
+                    df,
+                    "extra.validation_diagnostics.routing_refinement.status",
+                    default=None,
+                ),
+                "routing_refinement_stop_reason": value_series(
+                    df,
+                    "extra.validation_diagnostics.routing_refinement.stop_reason",
+                    default=None,
+                ),
+                "routing_refinement_best_iteration": self._numeric_series(
+                    df,
+                    "extra.validation_diagnostics.routing_refinement.best_iteration",
+                ),
+                "routing_refinement_metric_improvement": self._numeric_series(
+                    df,
+                    "extra.validation_diagnostics.routing_refinement.metric_improvement",
+                ),
+                "routing_refinement_final_imbalance": self._numeric_series(
+                    df,
+                    "extra.validation_diagnostics.routing_refinement.final_imbalance_ratio",
                 ),
                 "test_mean_max_routing_proba": self._numeric_series(
                     df,
@@ -165,13 +238,26 @@ class RMTReportTableBuilder:
         return (
             raw[raw["sampler"] != "full_dataset"]
             .groupby(
-                ["dataset", "model", "sampler", "ensemble_method", "view_strategy", "budget_ratio"],
+                [
+                    "dataset",
+                    "model",
+                    "sampler",
+                    "ensemble_method",
+                    "router",
+                    "view_strategy",
+                    "partition_selection_method",
+                    "selected_cluster_algorithm",
+                    "cluster_selection_metric",
+                    "cluster_ensemble_method",
+                    "budget_ratio",
+                ],
                 as_index=False,
                 dropna=False,
             )
             .agg(
                 {
                     "n_views": "mean",
+                    "selected_n_partitions": "mean",
                     "total_train_rows": "mean",
                     "rmse": "mean",
                     "rmse_ref": "mean",
@@ -187,11 +273,29 @@ class RMTReportTableBuilder:
                     "target_quantile_l1_drift_avg": "mean",
                     "validation_mean_max_routing_proba": "mean",
                     "validation_mean_routing_entropy": "mean",
+                    "router_training_rmse": "mean",
+                    "router_prior_rmse": "mean",
+                    "router_rmse_delta_vs_prior": "mean",
+                    "router_head_training_accuracy": "mean",
+                    "routing_refinement_best_iteration": "mean",
+                    "routing_refinement_metric_improvement": "mean",
+                    "routing_refinement_final_imbalance": "mean",
                     "test_mean_max_routing_proba": "mean",
                     "test_mean_routing_entropy": "mean",
                 }
             )
-            .sort_values(["dataset", "sampler", "view_strategy", "ensemble_method", "budget_ratio"])
+            .sort_values([
+                "dataset",
+                "sampler",
+                "view_strategy",
+                "partition_selection_method",
+                "selected_cluster_algorithm",
+                "cluster_selection_metric",
+                "cluster_ensemble_method",
+                "ensemble_method",
+                "router",
+                "budget_ratio",
+            ])
         )
 
     def _build_minimal_budget_table(self, efficiency: pd.DataFrame) -> pd.DataFrame:
@@ -202,7 +306,18 @@ class RMTReportTableBuilder:
                 continue
             eligible = eligible.sort_values(["budget_ratio"])
             grouped = eligible.groupby(
-                ["dataset", "model", "sampler", "ensemble_method", "view_strategy"],
+                [
+                    "dataset",
+                    "model",
+                    "sampler",
+                    "ensemble_method",
+                    "router",
+                    "view_strategy",
+                    "partition_selection_method",
+                    "selected_cluster_algorithm",
+                    "cluster_selection_metric",
+                    "cluster_ensemble_method",
+                ],
                 as_index=False,
                 dropna=False,
             ).first()

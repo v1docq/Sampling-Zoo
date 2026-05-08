@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -28,6 +28,12 @@ from benchmark_sampling_strategies import make_chunking_strategy_configs  # noqa
 from rmt_experiment_utils import json_ready, load_reference_metrics  # noqa: E402
 from rmt_report_tables import EFFICIENCY_DELTAS, RMTReportTableBuilder, build_rmt_report_tables  # noqa: E402
 from run_big_datasets_ensemble import EnsembleReportBuilder  # noqa: E402
+from sampling_zoo.core.experiment.contracts import StrategyGridContract  # noqa: E402
+from sampling_zoo.core.experiment.morphisms import (  # noqa: E402
+    build_standard_rmt_experiment_plan,
+    normalize_strategy_grid,
+)
+from sampling_zoo.core.experiment.stages import ExperimentPlan, ExperimentStageId  # noqa: E402
 
 DEFAULT_RMT_REGRESSION_TASKS: tuple[str, ...] = (
     "diamonds",
@@ -46,6 +52,17 @@ DEFAULT_VIEW_STRATEGY: tuple[str, ...] = (
     "gaussian",
 )
 DEFAULT_VIEW_STRATEGIES: tuple[str, ...] = DEFAULT_VIEW_STRATEGY
+DEFAULT_ROUTER_MODES: tuple[str, ...] = ("spectral", "constrained_gating")
+DEFAULT_CONSTRAINED_GATING_CONFIG: dict[str, Any] = {
+    "gating_hidden_dim": 64,
+    "gating_epochs": 200,
+    "gating_lr": 1e-3,
+    "gating_kl_weight": 0.10,
+    "gating_balance_weight": 0.01,
+    "gating_weight_decay": 1e-4,
+    "gating_batch_size": 2048,
+    "gating_device": "auto",
+}
 DEFAULT_STRATEGIES: tuple[str, ...] = (
     "rmt_contraction",
     "random",
@@ -63,6 +80,7 @@ class RMTRegressionExperimentConfig:
     ensemble_methods: Sequence[str] = DEFAULT_ENSEMBLE_METHODS
     budget_ratios: Sequence[float] = DEFAULT_BUDGET_RATIOS
     view_strategies: Sequence[str] = DEFAULT_VIEW_STRATEGIES
+    router_modes: Sequence[str] = DEFAULT_ROUTER_MODES
     n_partitions: int = 5
     max_train_rows: int | None = 300_000
     seed: int = 42
@@ -76,12 +94,14 @@ class RMTStrategyGridPoint:
     ensemble_method: str
     budget_ratio: float
     view_strategy: str | None = None
+    router: str | None = None
 
     @property
     def config_name(self) -> str:
         ratio_tag = f"{int(round(self.budget_ratio * 100)):02d}"
         view_tag = f"__view_{self.view_strategy}" if self.view_strategy is not None else ""
-        return f"{self.strategy}{view_tag}__{self.ensemble_method}__budget_{ratio_tag}"
+        router_tag = f"__router_{self.router}" if self.router is not None else ""
+        return f"{self.strategy}{view_tag}__{self.ensemble_method}{router_tag}__budget_{ratio_tag}"
 
 
 def make_rmt_experiment_strategy_configs(
@@ -93,6 +113,7 @@ def make_rmt_experiment_strategy_configs(
         n_partitions: int,
         seed: int,
         show_progress: bool = True,
+        router_modes: Sequence[str] = DEFAULT_ROUTER_MODES,
 ) -> dict[str, dict[str, Any]]:
     configs: dict[str, dict[str, Any]] = {
         "full_dataset": {
@@ -108,6 +129,7 @@ def make_rmt_experiment_strategy_configs(
         ensemble_methods=ensemble_methods,
         budget_ratios=budget_ratios,
         view_strategies=view_strategies,
+        router_modes=router_modes,
     )
     for grid_point in tqdm(
             grid,
@@ -126,6 +148,10 @@ def make_rmt_experiment_strategy_configs(
         )[grid_point.strategy]
         if grid_point.view_strategy is not None:
             base_config["view_strategy"] = grid_point.view_strategy
+        if grid_point.router is not None:
+            base_config["router"] = grid_point.router
+        if grid_point.router == "constrained_gating":
+            base_config.update(DEFAULT_CONSTRAINED_GATING_CONFIG)
         configs[grid_point.config_name] = base_config
     # del configs['full_dataset']
     return configs
@@ -136,8 +162,10 @@ def make_rmt_strategy_grid(
         ensemble_methods: Sequence[str],
         budget_ratios: Sequence[float],
         view_strategies: Sequence[str] = DEFAULT_VIEW_STRATEGIES,
+        router_modes: Sequence[str] = DEFAULT_ROUTER_MODES,
 ) -> list[RMTStrategyGridPoint]:
     view_strategies = _normalize_view_strategies(view_strategies)
+    router_modes = _normalize_router_modes(router_modes)
     grid: list[RMTStrategyGridPoint] = []
     for strategy in strategies:
         strategy_view_strategies: Sequence[str | None]
@@ -147,15 +175,22 @@ def make_rmt_strategy_grid(
             strategy_view_strategies = (None,)
         for view_strategy in strategy_view_strategies:
             for ensemble_method in ensemble_methods:
+                strategy_router_modes: Sequence[str | None]
+                if strategy == "rmt_contraction" and ensemble_method == "routed_weighted":
+                    strategy_router_modes = tuple(router_modes)
+                else:
+                    strategy_router_modes = (None,)
                 for budget_ratio in budget_ratios:
-                    grid.append(
-                        RMTStrategyGridPoint(
-                            strategy=strategy,
-                            ensemble_method=ensemble_method,
-                            budget_ratio=float(budget_ratio),
-                            view_strategy=view_strategy,
+                    for router in strategy_router_modes:
+                        grid.append(
+                            RMTStrategyGridPoint(
+                                strategy=strategy,
+                                ensemble_method=ensemble_method,
+                                budget_ratio=float(budget_ratio),
+                                view_strategy=view_strategy,
+                                router=router,
+                            )
                         )
-                    )
     return grid
 
 
@@ -165,12 +200,19 @@ def _normalize_view_strategies(view_strategies: Sequence[str] | str) -> tuple[st
     return tuple(view_strategies)
 
 
+def _normalize_router_modes(router_modes: Sequence[str] | str) -> tuple[str, ...]:
+    if isinstance(router_modes, str):
+        return (router_modes,)
+    return tuple(router_modes)
+
+
 class RMTRegressionExperimentOrchestrator:
     def __init__(self, config: RMTRegressionExperimentConfig) -> None:
         self.config = config
         self.report_builder = EnsembleReportBuilder()
         self.rmt_report_table_builder = RMTReportTableBuilder()
         self.incremental_saver: IncrementalExperimentSaver | None = None
+        self.experiment_plan: ExperimentPlan | None = None
 
     def _prepare_runtime(self) -> None:
         if self.config.synthetic_smoke:
@@ -247,8 +289,13 @@ class RMTRegressionExperimentOrchestrator:
             raise RuntimeError("No regression datasets available for RMT contraction experiment.")
         return datasets
 
-    def _build_strategy_configs(self) -> dict[str, dict[str, Any]]:
-        return make_rmt_experiment_strategy_configs(
+    def _build_experiment_plan(self) -> ExperimentPlan:
+        plan = build_standard_rmt_experiment_plan(asdict(self.config))
+        self.experiment_plan = plan
+        return plan
+
+    def _build_strategy_grid(self) -> StrategyGridContract:
+        configs = make_rmt_experiment_strategy_configs(
             problem_type="regression",
             strategies=self.config.strategies,
             ensemble_methods=self.config.ensemble_methods,
@@ -257,12 +304,14 @@ class RMTRegressionExperimentOrchestrator:
             n_partitions=self.config.n_partitions,
             seed=self.config.seed,
             show_progress=self.config.show_progress,
+            router_modes=self.config.router_modes,
         )
+        return normalize_strategy_grid(configs)
 
     def _run_experiment(
             self,
             datasets: Sequence[RawDatasetBundle],
-            strategy_configs: Mapping[str, Mapping[str, Any]],
+            strategy_configs: StrategyGridContract | Mapping[str, Mapping[str, Any]],
             runner: EnsembleChunkBenchmarkRunner,
     ) -> list[dict[str, Any]]:
         run_records: list[dict[str, Any]] = []
@@ -308,6 +357,7 @@ class RMTRegressionExperimentOrchestrator:
             "synthetic_smoke": self.config.synthetic_smoke,
             "status": status,
             "records": len(run_records),
+            "experiment_plan": None if self.experiment_plan is None else self.experiment_plan.to_dict(),
         }
 
     def _write_run_metadata(self, logger: BenchmarkLogger, run_records: Sequence[Mapping[str, Any]]) -> None:
@@ -324,17 +374,39 @@ class RMTRegressionExperimentOrchestrator:
         print(f"RMT contraction regression experiment completed. Artifacts: {logger.paths.root}")
         return logger.paths.root
 
+    def _execute_experiment_plan(self, plan: ExperimentPlan) -> Path:
+        context: dict[str, Any] = {}
+        for stage_id in plan.stage_ids():
+            if stage_id == ExperimentStageId.PREPARE_RUNTIME:
+                self._prepare_runtime()
+            elif stage_id == ExperimentStageId.CREATE_LOGGER:
+                context["logger"] = self._create_logger()
+            elif stage_id == ExperimentStageId.CREATE_RUNNER:
+                context["runner"] = self._create_runner(context["logger"])
+            elif stage_id == ExperimentStageId.LOAD_DATASETS:
+                context["datasets"] = self._load_available_datasets()
+            elif stage_id == ExperimentStageId.BUILD_STRATEGY_GRID:
+                context["strategy_grid"] = self._build_strategy_grid()
+            elif stage_id == ExperimentStageId.RUN_DATASETS:
+                context["run_records"] = self._run_experiment(
+                    context["datasets"],
+                    context["strategy_grid"],
+                    context["runner"],
+                )
+            elif stage_id == ExperimentStageId.BUILD_REPORTS:
+                self._build_report_artifacts(context["run_records"], context["logger"])
+            elif stage_id == ExperimentStageId.WRITE_METADATA:
+                self._write_run_metadata(context["logger"], context["run_records"])
+            elif stage_id == ExperimentStageId.FINALIZE:
+                context["result_path"] = self._announce_completion(context["logger"])
+            else:
+                raise RuntimeError(f"Unsupported experiment stage: {stage_id}")
+        return context["result_path"]
+
     def run(self) -> Path:
-        self._prepare_runtime()
-        logger = self._create_logger()
+        plan = self._build_experiment_plan()
         try:
-            runner = self._create_runner(logger)
-            datasets = self._load_available_datasets()
-            strategy_configs = self._build_strategy_configs()
-            run_records = self._run_experiment(datasets, strategy_configs, runner)
-            self._build_report_artifacts(run_records, logger)
-            self._write_run_metadata(logger, run_records)
-            return self._announce_completion(logger)
+            return self._execute_experiment_plan(plan)
         except Exception as ex:
             if self.incremental_saver is not None:
                 self.incremental_saver.mark_failed(ex)

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -28,6 +28,12 @@ from benchmark_sampling_strategies import make_chunking_strategy_configs  # noqa
 from rmt_experiment_utils import json_ready, load_reference_metrics  # noqa: E402
 from rmt_report_tables import EFFICIENCY_DELTAS, RMTReportTableBuilder, build_rmt_report_tables  # noqa: E402
 from run_big_datasets_ensemble import EnsembleReportBuilder  # noqa: E402
+from sampling_zoo.core.experiment.contracts import StrategyGridContract  # noqa: E402
+from sampling_zoo.core.experiment.morphisms import (  # noqa: E402
+    build_standard_rmt_experiment_plan,
+    normalize_strategy_grid,
+)
+from sampling_zoo.core.experiment.stages import ExperimentPlan, ExperimentStageId  # noqa: E402
 
 
 DEFAULT_RMT_REGRESSION_TASKS: tuple[str, ...] = (
@@ -139,6 +145,7 @@ class RMTRegressionExperimentOrchestrator:
         self.report_builder = EnsembleReportBuilder()
         self.rmt_report_table_builder = RMTReportTableBuilder()
         self.incremental_saver: IncrementalExperimentSaver | None = None
+        self.experiment_plan: ExperimentPlan | None = None
 
     def _prepare_runtime(self) -> None:
         if self.config.synthetic_smoke:
@@ -215,8 +222,13 @@ class RMTRegressionExperimentOrchestrator:
             raise RuntimeError("No regression datasets available for RMT contraction experiment.")
         return datasets
 
-    def _build_strategy_configs(self) -> dict[str, dict[str, Any]]:
-        return make_rmt_experiment_strategy_configs(
+    def _build_experiment_plan(self) -> ExperimentPlan:
+        plan = build_standard_rmt_experiment_plan(asdict(self.config))
+        self.experiment_plan = plan
+        return plan
+
+    def _build_strategy_grid(self) -> StrategyGridContract:
+        configs = make_rmt_experiment_strategy_configs(
             problem_type="regression",
             strategies=self.config.strategies,
             ensemble_methods=self.config.ensemble_methods,
@@ -225,11 +237,12 @@ class RMTRegressionExperimentOrchestrator:
             seed=self.config.seed,
             show_progress=self.config.show_progress,
         )
+        return normalize_strategy_grid(configs)
 
     def _run_experiment(
         self,
         datasets: Sequence[RawDatasetBundle],
-        strategy_configs: Mapping[str, Mapping[str, Any]],
+        strategy_configs: StrategyGridContract | Mapping[str, Mapping[str, Any]],
         runner: EnsembleChunkBenchmarkRunner,
     ) -> list[dict[str, Any]]:
         run_records: list[dict[str, Any]] = []
@@ -274,6 +287,7 @@ class RMTRegressionExperimentOrchestrator:
             "synthetic_smoke": self.config.synthetic_smoke,
             "status": status,
             "records": len(run_records),
+            "experiment_plan": None if self.experiment_plan is None else self.experiment_plan.to_dict(),
         }
 
     def _write_run_metadata(self, logger: BenchmarkLogger, run_records: Sequence[Mapping[str, Any]]) -> None:
@@ -290,17 +304,39 @@ class RMTRegressionExperimentOrchestrator:
         print(f"RMT contraction regression experiment completed. Artifacts: {logger.paths.root}")
         return logger.paths.root
 
+    def _execute_experiment_plan(self, plan: ExperimentPlan) -> Path:
+        context: dict[str, Any] = {}
+        for stage_id in plan.stage_ids():
+            if stage_id == ExperimentStageId.PREPARE_RUNTIME:
+                self._prepare_runtime()
+            elif stage_id == ExperimentStageId.CREATE_LOGGER:
+                context["logger"] = self._create_logger()
+            elif stage_id == ExperimentStageId.CREATE_RUNNER:
+                context["runner"] = self._create_runner(context["logger"])
+            elif stage_id == ExperimentStageId.LOAD_DATASETS:
+                context["datasets"] = self._load_available_datasets()
+            elif stage_id == ExperimentStageId.BUILD_STRATEGY_GRID:
+                context["strategy_grid"] = self._build_strategy_grid()
+            elif stage_id == ExperimentStageId.RUN_DATASETS:
+                context["run_records"] = self._run_experiment(
+                    context["datasets"],
+                    context["strategy_grid"],
+                    context["runner"],
+                )
+            elif stage_id == ExperimentStageId.BUILD_REPORTS:
+                self._build_report_artifacts(context["run_records"], context["logger"])
+            elif stage_id == ExperimentStageId.WRITE_METADATA:
+                self._write_run_metadata(context["logger"], context["run_records"])
+            elif stage_id == ExperimentStageId.FINALIZE:
+                context["result_path"] = self._announce_completion(context["logger"])
+            else:
+                raise RuntimeError(f"Unsupported experiment stage: {stage_id}")
+        return context["result_path"]
+
     def run(self) -> Path:
-        self._prepare_runtime()
-        logger = self._create_logger()
+        plan = self._build_experiment_plan()
         try:
-            runner = self._create_runner(logger)
-            datasets = self._load_available_datasets()
-            strategy_configs = self._build_strategy_configs()
-            run_records = self._run_experiment(datasets, strategy_configs, runner)
-            self._build_report_artifacts(run_records, logger)
-            self._write_run_metadata(logger, run_records)
-            return self._announce_completion(logger)
+            return self._execute_experiment_plan(plan)
         except Exception as ex:
             if self.incremental_saver is not None:
                 self.incremental_saver.mark_failed(ex)

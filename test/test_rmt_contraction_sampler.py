@@ -114,6 +114,71 @@ def test_sv_scaled_embedding_mode_changes_embedding_geometry() -> None:
     assert not np.allclose(scaled.sample_embedding_, whitened.sample_embedding_)
 
 
+def test_auto_partition_selection_records_diagnostics() -> None:
+    rng = np.random.default_rng(333)
+    centers = np.asarray([
+        [-3.0, 0.0, 0.0, 0.0],
+        [0.0, 3.0, 0.0, 0.0],
+        [3.0, 0.0, 0.0, 0.0],
+    ])
+    X = np.vstack([
+        center + rng.normal(scale=0.2, size=(24, centers.shape[1]))
+        for center in centers
+    ])
+    frame = pd.DataFrame(X, columns=[f"x_{idx}" for idx in range(X.shape[1])])
+    sampler = RMTContractionTensorSampler(
+        n_partitions=2,
+        partition_selection_method="auto",
+        min_partitions=2,
+        max_partitions=4,
+        min_auto_partition_size=5,
+        partition_selection_sample_size=100,
+        n_views=3,
+        projection_dim=2,
+        backend="numpy",
+        random_state=37,
+        show_progress=False,
+    )
+
+    sampler.fit(frame)
+
+    assert sampler.diagnostics_["partition_selection_method"] == "auto"
+    assert sampler.diagnostics_["selected_cluster_algorithm"] == "kmeans"
+    assert sampler.diagnostics_["cluster_selection_metric"] == "balanced_silhouette"
+    assert 2 <= sampler.diagnostics_["selected_n_partitions"] <= 4
+    assert sampler.diagnostics_["partition_selection_candidates"] == [2, 3, 4]
+    assert sampler.diagnostics_["partition_selection_candidate_details"]
+    assert len(sampler.partitions) == sampler.diagnostics_["selected_n_partitions"]
+
+
+def test_auto_partition_selection_skips_unavailable_optional_algorithms() -> None:
+    X = _frame(n_samples=48).select_dtypes(include=[np.number])
+    sampler = RMTContractionTensorSampler(
+        n_partitions=3,
+        partition_selection_method="auto",
+        cluster_algorithms=("kmeans", "bisecting_kmeans", "gmm", "hdbscan"),
+        cluster_ensemble_method="weighted_vote",
+        min_partitions=2,
+        max_partitions=4,
+        min_auto_partition_size=1,
+        n_views=2,
+        projection_dim=2,
+        backend="numpy",
+        random_state=41,
+        show_progress=False,
+    )
+
+    sampler.fit(X)
+
+    assert sampler.diagnostics_["selected_cluster_algorithm"] in {
+        "kmeans",
+        "bisecting_kmeans",
+        "gmm",
+        "hdbscan",
+    }
+    assert sampler.predict_partition_proba(X.iloc[:5]).shape[1] == len(sampler.partition_names_)
+
+
 def test_config_constructor_and_legacy_positional_arguments() -> None:
     config = RMTContractionConfig(
         n_partitions=2,

@@ -9,7 +9,15 @@ from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 
 from sampling_zoo.core.api.api_main import SamplingStrategyFactory
 from sampling_zoo.core.metrics.eval_metrics import calculate_metrics, get_metric_comparator
+from sampling_zoo.core.experiment.contracts import PartitionTrainingRequest, PartitionTrainingResult
+from sampling_zoo.core.experiment.morphisms import (
+    chunk_models_to_contracts,
+    partitions_to_contract,
+    routing_to_contract,
+)
+from sampling_zoo.core.utils.ensemble_routing import RoutedWeightedRouter
 from sampling_zoo.core.utils.progress import progress_bar, progress_iter, progress_write
+from sampling_zoo.core.utils.routed_em_refiner import RoutedEMModelRefiner
 
 try:
     from lightgbm import LGBMRegressor, LGBMClassifier
@@ -54,6 +62,12 @@ class SamplingEnsemble:
         self.model_factory = model_factory
         self.ensemble_method = ensemble_method
         self.show_progress = show_progress
+        self.router = RoutedWeightedRouter(
+            problem=self.problem,
+            config=self.partitioner_config,
+            show_progress=self.show_progress,
+        )
+        self.router_mode = self.router.router_mode
         self.bs_size = 1000
         self.partitions = None
         self.partitioner = None
@@ -62,6 +76,7 @@ class SamplingEnsemble:
         self.partition_diagnostics_ = {}
         self.validation_diagnostics_ = {}
         self.test_routing_diagnostics_ = {}
+        self.partition_training_contract_ = None
 
     def _log(self, message: str) -> None:
         progress_write(message, enabled=self.show_progress)
@@ -122,7 +137,32 @@ class SamplingEnsemble:
             'force_chunking',
             'force_direct_model',
             'show_progress',
+            'router',
+            'router_n_estimators',
+            'router_max_depth',
+            'gating_hidden_dim',
+            'gating_epochs',
+            'gating_lr',
+            'gating_kl_weight',
+            'gating_balance_weight',
+            'gating_weight_decay',
+            'gating_batch_size',
+            'gating_device',
+            'routing_refinement',
+            'em_max_iterations',
+            'em_min_improvement',
+            'em_assignment_policy',
+            'em_min_partition_size',
+            'em_refit_router',
+            'em_keep_best',
         }
+
+    @staticmethod
+    def _normalize_router_mode(router_mode: Any) -> str:
+        normalized = str(router_mode or 'spectral').strip().lower()
+        if normalized not in {'spectral', 'learned_head', 'constrained_gating'}:
+            raise ValueError("router must be one of: spectral, learned_head, constrained_gating")
+        return normalized
 
     def _build_partitioner_kwargs(self, strategy_name: str, random_state: int) -> Dict[str, Any]:
         strategy_kwargs = {
@@ -571,6 +611,7 @@ class SamplingEnsemble:
         )
         validation_metric = self._normalize_validation_metric(validation_metric)
         metric_is_better = get_metric_comparator(validation_metric)
+        training_request = self._build_partition_training_request(partitions, validation_metric)
 
         self._train_partition_loop(
             partitions=partitions,
@@ -584,10 +625,41 @@ class SamplingEnsemble:
             save_models_to_disk=save_models_to_disk,
         )
         self._finalize_partition_training(
+            partitions=partitions,
             X_val=X_val,
             y_val=y_val,
             metric_is_better=metric_is_better,
             validation_metric=validation_metric,
+        )
+        self.partition_training_contract_ = self._build_partition_training_result(
+            request=training_request,
+            partitions=partitions,
+        )
+
+    def _build_partition_training_request(
+        self,
+        partitions: Dict[str, Any],
+        validation_metric: str,
+    ) -> PartitionTrainingRequest:
+        return PartitionTrainingRequest(
+            problem=self.problem,
+            ensemble_method=self.ensemble_method,
+            validation_metric=validation_metric,
+            n_partitions=len(partitions),
+            routing_refinement=str(self.partitioner_config.get('routing_refinement', 'none')),
+        )
+
+    def _build_partition_training_result(
+        self,
+        request: PartitionTrainingRequest,
+        partitions: Dict[str, Any],
+    ) -> PartitionTrainingResult:
+        return PartitionTrainingResult(
+            request=request,
+            partitions=partitions_to_contract(partitions, self.partition_diagnostics_),
+            chunk_models=chunk_models_to_contracts(self.models),
+            routing=routing_to_contract(self.router),
+            validation_diagnostics=dict(self.validation_diagnostics_),
         )
 
     def _load_or_prepare_partitions(
@@ -811,12 +883,22 @@ class SamplingEnsemble:
 
     def _finalize_partition_training(
         self,
+        partitions: Dict[str, Any],
         X_val: pd.DataFrame,
         y_val: pd.Series,
         metric_is_better: Callable,
         validation_metric: str,
     ) -> None:
         if not self.models:
+            return
+
+        if self._uses_moe_routing():
+            self._finalize_moe_partition_training(
+                partitions=partitions,
+                X_val=X_val,
+                y_val=y_val,
+                validation_metric=validation_metric,
+            )
             return
 
         full_metrics = self._evaluate_current_ensemble(X_val, y_val)
@@ -839,7 +921,95 @@ class SamplingEnsemble:
             reduced_metrics=reduced_metrics,
             best_score=best_score,
             validation_metric=validation_metric,
+            selection_policy='forward_pruning',
         )
+
+    def _uses_moe_routing(self) -> bool:
+        return (
+            self.ensemble_method == 'routed_weighted'
+            and self.router.can_route(self.partitioner)
+        )
+
+    def _finalize_moe_partition_training(
+        self,
+        partitions: Dict[str, Any],
+        X_val: pd.DataFrame,
+        y_val: pd.Series,
+        validation_metric: str,
+    ) -> None:
+        full_metrics = self._evaluate_current_ensemble(X_val, y_val)
+        self._log(f"Routed MoE metrics before local calibration: {full_metrics}")
+
+        local_metrics = self._build_local_validation_metrics(
+            X_val,
+            y_val,
+            list(self.models),
+            use_base_router=True,
+        )
+        self._attach_local_validation_metrics(self.models, local_metrics)
+        self.router.fit(
+            X_val=X_val,
+            y_val=y_val,
+            active_models=list(self.models),
+            partitioner=self.partitioner,
+        )
+        if self.router.weights_are_final() or self.router.router_mode == 'learned_head':
+            local_metrics = self._build_local_validation_metrics(X_val, y_val, list(self.models))
+            self._attach_local_validation_metrics(self.models, local_metrics)
+
+        routed_metrics = self._evaluate_current_ensemble(X_val, y_val)
+        routing_refinement = self._run_routing_refinement(
+            partitions=partitions,
+            X_val=X_val,
+            y_val=y_val,
+            validation_metric=validation_metric,
+        )
+        if routing_refinement.get('status') == 'completed':
+            routed_metrics = self._evaluate_current_ensemble(X_val, y_val)
+        best_score = routed_metrics.get(validation_metric)
+        self._log(f"Routed MoE metrics after local calibration: {routed_metrics}")
+        self._log(f"Routed MoE validation metric ({validation_metric}): {best_score}")
+        self.validation_diagnostics_ = self._build_validation_diagnostics(
+            X_val=X_val,
+            y_val=y_val,
+            full_metrics=full_metrics,
+            reduced_metrics=routed_metrics,
+            best_score=best_score,
+            validation_metric=validation_metric,
+            selection_policy='moe_keep_routed_experts',
+            routing_refinement_diagnostics=routing_refinement,
+        )
+
+    def _run_routing_refinement(
+        self,
+        partitions: Dict[str, Any],
+        X_val: pd.DataFrame,
+        y_val: pd.Series,
+        validation_metric: str,
+    ) -> Dict[str, Any]:
+        refiner = RoutedEMModelRefiner(
+            ensemble=self,
+            config=self.partitioner_config,
+            show_progress=self.show_progress,
+        )
+        return refiner.refine(
+            partitions=partitions,
+            X_val=X_val,
+            y_val=y_val,
+            validation_metric=validation_metric,
+        )
+
+    @staticmethod
+    def _attach_local_validation_metrics(
+        active_models: List[Dict[str, Any]],
+        local_metrics: Dict[str, Any],
+    ) -> None:
+        for model_info in active_models:
+            name = str(model_info.get('name'))
+            chunk_metrics = local_metrics.get(name, {})
+            model_info['local_metrics'] = chunk_metrics.get('metrics', {})
+            model_info['local_assigned_count'] = int(chunk_metrics.get('assigned_count', 0) or 0)
+            model_info['local_mean_routing_probability'] = chunk_metrics.get('mean_routing_probability')
 
     def select_best_models_forward(
             self,
@@ -907,25 +1077,10 @@ class SamplingEnsemble:
         Converts validation metrics into non-negative model priors.
         For regression lower RMSE/MAE is better; for classification higher F1/accuracy is better.
         """
-        raw_weights = []
-        eps = 1e-8
-        for model_info in active_models:
-            metrics = model_info.get('metrics', {}) or {}
-            if self.problem == 'regression':
-                if 'rmse' in metrics and np.isfinite(metrics['rmse']):
-                    raw_weights.append(1.0 / (float(metrics['rmse']) + eps))
-                elif 'mae' in metrics and np.isfinite(metrics['mae']):
-                    raw_weights.append(1.0 / (float(metrics['mae']) + eps))
-                else:
-                    raw_weights.append(1.0)
-            else:
-                value = metrics.get('f1_weighted', metrics.get('accuracy', 1.0))
-                raw_weights.append(max(float(value), eps) if np.isfinite(value) else 1.0)
-
-        weights = np.asarray(raw_weights, dtype=float)
-        if not np.all(np.isfinite(weights)) or weights.sum() <= 0:
-            weights = np.ones(len(active_models), dtype=float)
-        return weights / weights.sum()
+        return self.router.validation_prior_weights(
+            active_models,
+            ensemble_method=self.ensemble_method,
+        )
 
     def _build_validation_diagnostics(
         self,
@@ -935,16 +1090,22 @@ class SamplingEnsemble:
         reduced_metrics: Dict[str, Any],
         best_score: Any,
         validation_metric: str,
+        selection_policy: str,
+        routing_refinement_diagnostics: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         active_models = list(self.models)
         return {
             'validation_metric': validation_metric,
             'best_validation_metric': self._safe_float(best_score),
+            'selection_policy': selection_policy,
             'active_model_names': [str(model_info.get('name')) for model_info in active_models],
             'full_ensemble_metrics_before_pruning': dict(full_metrics),
             'ensemble_metrics_after_pruning': dict(reduced_metrics),
             'routing': self.build_routing_diagnostics(X_val, active_models=active_models),
             'local_partition_metrics': self._build_local_validation_metrics(X_val, y_val, active_models),
+            'router': dict(self.router.diagnostics_),
+            'router_head': dict(self.router.diagnostics_),
+            'routing_refinement': routing_refinement_diagnostics or {'mode': 'none', 'status': 'disabled'},
         }
 
     @staticmethod
@@ -962,79 +1123,31 @@ class SamplingEnsemble:
         X_val: pd.DataFrame,
         y_val: pd.Series,
         active_models: List[Dict[str, Any]],
+        use_base_router: bool = False,
     ) -> Dict[str, Any]:
         if not active_models or len(X_val) == 0:
             return {}
-        routing_weights = self._routing_weights(X_val, active_models)
-        assignments = np.argmax(routing_weights, axis=1)
-        y_values = pd.Series(y_val).reset_index(drop=True)
-        local_metrics: Dict[str, Any] = {}
-        for model_idx, model_info in enumerate(active_models):
-            name = str(model_info.get('name', f'chunk_{model_idx}'))
-            mask = assignments == model_idx
-            assigned_count = int(np.sum(mask))
-            if assigned_count == 0:
-                local_metrics[name] = {
-                    'assigned_count': 0,
-                    'metrics': {},
-                }
-                continue
-            val_predictions = np.asarray(model_info.get('val_predictions'))
-            metrics = calculate_metrics(
-                y_true=y_values.iloc[mask].to_numpy(),
-                y_labels=val_predictions[mask],
-                y_proba=None,
-                problem_type=self.problem,
-            )
-            local_metrics[name] = {
-                'assigned_count': assigned_count,
-                'mean_routing_probability': float(np.mean(routing_weights[mask, model_idx])),
-                'metrics': metrics,
-            }
-        return local_metrics
+        return self.router.build_local_validation_metrics(
+            X_val=X_val,
+            y_val=y_val,
+            active_models=active_models,
+            partitioner=self.partitioner,
+            use_base_router=use_base_router,
+        )
 
     def _routing_weights(self, features: pd.DataFrame, active_models: List[Dict[str, Any]]) -> np.ndarray:
-        """
-        Returns row-wise routing probabilities aligned with active_models.
-        If the sampler cannot route new points, falls back to uniform routing.
-        """
-        n_samples = len(features)
-        n_models = len(active_models)
-        if self.partitioner is None:
-            return np.full((n_samples, n_models), 1.0 / max(n_models, 1))
+        return self.router.weights(
+            features=features,
+            active_models=active_models,
+            partitioner=self.partitioner,
+        )
 
-        model_names = [model_info.get('name') for model_info in active_models]
-        try:
-            if hasattr(self.partitioner, 'predict_partition_proba'):
-                proba = np.asarray(self.partitioner.predict_partition_proba(features), dtype=float)
-                partition_names = list(getattr(self.partitioner, 'partition_names_', []))
-                if partition_names and proba.shape[1] == len(partition_names):
-                    name_to_col = {name: idx for idx, name in enumerate(partition_names)}
-                    aligned = np.zeros((proba.shape[0], n_models), dtype=float)
-                    for model_idx, name in enumerate(model_names):
-                        if name in name_to_col:
-                            aligned[:, model_idx] = proba[:, name_to_col[name]]
-                    if aligned.sum() > 0:
-                        row_sums = aligned.sum(axis=1, keepdims=True)
-                        aligned = np.where(row_sums > 0, aligned / row_sums, 1.0 / n_models)
-                        return aligned
-
-            if hasattr(self.partitioner, 'predict_partitions'):
-                labels = np.asarray(self.partitioner.predict_partitions(features))
-                aligned = np.full((labels.shape[0], n_models), 0.0, dtype=float)
-                for model_idx, name in enumerate(model_names):
-                    try:
-                        label_id = int(str(name).split('_')[-1])
-                    except Exception:
-                        label_id = model_idx
-                    aligned[:, model_idx] = (labels == label_id).astype(float)
-                row_sums = aligned.sum(axis=1, keepdims=True)
-                aligned = np.where(row_sums > 0, aligned / row_sums, 1.0 / n_models)
-                return aligned
-        except Exception:
-            pass
-
-        return np.full((n_samples, n_models), 1.0 / max(n_models, 1))
+    def _base_routing_weights(self, features: pd.DataFrame, active_models: List[Dict[str, Any]]) -> np.ndarray:
+        return self.router.base_weights(
+            features=features,
+            active_models=active_models,
+            partitioner=self.partitioner,
+        )
 
     def build_routing_diagnostics(
         self,
@@ -1042,41 +1155,11 @@ class SamplingEnsemble:
         active_models: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         active_models = active_models if active_models is not None else list(self.models)
-        n_samples = len(features)
-        n_models = len(active_models)
-        if n_samples == 0 or n_models == 0:
-            return {
-                'n_rows': int(n_samples),
-                'n_models': int(n_models),
-                'hard_assignment_counts': {},
-                'soft_assignment_mass': {},
-            }
-
-        routing_weights = self._routing_weights(features, active_models)
-        model_names = [str(model_info.get('name', f'chunk_{idx}')) for idx, model_info in enumerate(active_models)]
-        max_probability = np.max(routing_weights, axis=1)
-        entropy = -np.sum(routing_weights * np.log(routing_weights + 1e-12), axis=1)
-        normalized_entropy = entropy / max(np.log(n_models), 1e-12)
-        assignments = np.argmax(routing_weights, axis=1)
-
-        hard_counts = {
-            name: int(np.sum(assignments == idx))
-            for idx, name in enumerate(model_names)
-        }
-        soft_mass = {
-            name: float(np.sum(routing_weights[:, idx]))
-            for idx, name in enumerate(model_names)
-        }
-        return {
-            'n_rows': int(n_samples),
-            'n_models': int(n_models),
-            'mean_max_probability': float(np.mean(max_probability)),
-            'median_max_probability': float(np.median(max_probability)),
-            'mean_entropy': float(np.mean(entropy)),
-            'mean_normalized_entropy': float(np.mean(normalized_entropy)),
-            'hard_assignment_counts': hard_counts,
-            'soft_assignment_mass': soft_mass,
-        }
+        return self.router.diagnostics(
+            features=features,
+            active_models=active_models,
+            partitioner=self.partitioner,
+        )
 
     def ensemble_predict(self, features: pd.DataFrame, stage: str = 'inference', models: Optional[List[Dict[str, Any]]] = None) -> np.ndarray:
         """
@@ -1133,7 +1216,10 @@ class SamplingEnsemble:
         elif self.ensemble_method == 'routed_weighted':
             validation_weights = self._validation_weights(active_models)
             routing_weights = self._routing_weights(features, active_models)
-            combined_weights = routing_weights * validation_weights.reshape(1, -1)
+            if self.router.weights_are_final():
+                combined_weights = routing_weights
+            else:
+                combined_weights = routing_weights * validation_weights.reshape(1, -1)
             row_sums = combined_weights.sum(axis=1, keepdims=True)
             combined_weights = np.where(row_sums > 0, combined_weights / row_sums, 1.0 / len(active_models))
 

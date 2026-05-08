@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -11,6 +11,7 @@ from sklearn.cluster import KMeans
 from .backend.matrix_backend import MatrixRMTBackend
 from .backend.tensor_backend import TensorRMTBackend
 from .base_sampler import SpectralSamplerBase
+from .cluster_selection import ClusterSelectionResult, SpectralClusterSelector
 from ...utils.progress import progress_bar
 from ...utils.utils import safe_index
 
@@ -32,6 +33,20 @@ class RMTContractionConfig:
     """Normalized construction parameters for RMT contraction sampling."""
 
     n_partitions: int = 5
+    partition_selection_method: str = "fixed"
+    cluster_algorithms: Tuple[str, ...] = ("kmeans",)
+    cluster_selection_metric: str = "balanced_silhouette"
+    cluster_ensemble_method: str = "best_score"
+    min_partitions: int = 2
+    max_partitions: Optional[int] = None
+    min_auto_partition_size: int = 256
+    partition_selection_sample_size: int = 5000
+    max_cluster_imbalance_ratio: float = 5.0
+    min_cluster_fraction: float = 0.05
+    imbalance_penalty_weight: float = 0.15
+    tiny_cluster_penalty_weight: float = 0.30
+    target_contrast_weight: float = 0.0
+    cluster_vote_temperature: float = 0.05
     n_views: Union[int, str] = "auto"
     n_views_policy: str = "auto"
     min_views: int = 4
@@ -105,6 +120,22 @@ class NViewsSelectionInfo:
     spectrum_stability_candidates: Tuple[int, ...]
 
 
+@dataclass(frozen=True)
+class PartitionSelectionInfo:
+    requested_n_partitions: int
+    selected_n_partitions: int
+    partition_selection_method: str
+    selected_algorithm: Optional[str]
+    cluster_algorithms: Tuple[str, ...]
+    cluster_selection_metric: str
+    cluster_ensemble_method: str
+    candidates: Tuple[int, ...]
+    scores: Tuple[Tuple[int, Optional[float]], ...]
+    candidate_details: Tuple[Dict[str, Any], ...]
+    min_auto_partition_size: int
+    selection_sample_size: int
+
+
 class RMTContractionTensorSampler(SpectralSamplerBase):
     """
     Chunking sampler based on random feature contractions and sample-mode spectra.
@@ -154,6 +185,53 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         )
         self.config = cfg
         self.n_views_requested = requested_n_views
+        self.partition_selection_method = self._validate_choice(
+            "partition_selection_method",
+            cfg.partition_selection_method,
+            ("fixed", "auto"),
+        )
+        self.cluster_algorithms = self._normalize_cluster_algorithms(cfg.cluster_algorithms)
+        self.cluster_selection_metric = self._validate_choice(
+            "cluster_selection_metric",
+            cfg.cluster_selection_metric,
+            ("silhouette", "balanced_silhouette"),
+        )
+        self.cluster_ensemble_method = self._validate_choice(
+            "cluster_ensemble_method",
+            cfg.cluster_ensemble_method,
+            ("best_score", "weighted_vote"),
+        )
+        self.min_partitions = self._validate_positive_int("min_partitions", cfg.min_partitions)
+        self.max_partitions = (
+            None
+            if cfg.max_partitions is None
+            else self._validate_positive_int("max_partitions", cfg.max_partitions)
+        )
+        if self.max_partitions is not None and self.max_partitions < self.min_partitions:
+            raise ValueError("max_partitions must be greater than or equal to min_partitions")
+        self.min_auto_partition_size = self._validate_positive_int(
+            "min_auto_partition_size",
+            cfg.min_auto_partition_size,
+        )
+        self.partition_selection_sample_size = self._validate_positive_int(
+            "partition_selection_sample_size",
+            cfg.partition_selection_sample_size,
+        )
+        self.max_cluster_imbalance_ratio = self._validate_positive_float(
+            "max_cluster_imbalance_ratio",
+            cfg.max_cluster_imbalance_ratio,
+        )
+        self.min_cluster_fraction = self._validate_fraction(
+            "min_cluster_fraction",
+            cfg.min_cluster_fraction,
+        )
+        self.imbalance_penalty_weight = float(cfg.imbalance_penalty_weight)
+        self.tiny_cluster_penalty_weight = float(cfg.tiny_cluster_penalty_weight)
+        self.target_contrast_weight = float(cfg.target_contrast_weight)
+        self.cluster_vote_temperature = self._validate_positive_float(
+            "cluster_vote_temperature",
+            cfg.cluster_vote_temperature,
+        )
         self.n_views_policy = self._validate_choice(
             "n_views_policy",
             cfg.n_views_policy,
@@ -198,8 +276,11 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self.power_iterations = int(cfg.power_iterations)
         self.max_unfolding_elements = cfg.max_unfolding_elements
         self._rmt_backend: Optional[Union[MatrixRMTBackend, TensorRMTBackend]] = None
+        self.cluster_selector_ = self._make_cluster_selector()
+        self.cluster_centers_: Optional[np.ndarray] = None
         self.rank_selection_info_: Optional[RankSelectionInfo] = None
         self.n_views_selection_info_: Optional[NViewsSelectionInfo] = None
+        self.partition_selection_info_: Optional[PartitionSelectionInfo] = None
 
     @staticmethod
     def _normalize_config_inputs(
@@ -267,11 +348,40 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         return n_views
 
     @staticmethod
+    def _normalize_cluster_algorithms(value: Union[str, Sequence[str]]) -> Tuple[str, ...]:
+        if isinstance(value, str):
+            algorithms = (value,)
+        else:
+            algorithms = tuple(value)
+        if not algorithms:
+            raise ValueError("cluster_algorithms must contain at least one algorithm")
+        return tuple(str(algorithm).strip().lower() for algorithm in algorithms)
+
+    @staticmethod
     def _validate_positive_float(name: str, value: float) -> float:
         value = float(value)
         if value <= 0:
             raise ValueError(f"{name} must be positive")
         return value
+
+    def _make_cluster_selector(self) -> SpectralClusterSelector:
+        return SpectralClusterSelector(
+            algorithms=self.cluster_algorithms,
+            selection_metric=self.cluster_selection_metric,
+            ensemble_method=self.cluster_ensemble_method,
+            min_partitions=self.min_partitions,
+            max_partitions=self.max_partitions,
+            min_auto_partition_size=self.min_auto_partition_size,
+            selection_sample_size=self.partition_selection_sample_size,
+            max_cluster_imbalance_ratio=self.max_cluster_imbalance_ratio,
+            min_cluster_fraction=self.min_cluster_fraction,
+            imbalance_penalty_weight=self.imbalance_penalty_weight,
+            tiny_cluster_penalty_weight=self.tiny_cluster_penalty_weight,
+            target_contrast_weight=self.target_contrast_weight,
+            vote_temperature=self.cluster_vote_temperature,
+            random_state=self.random_state,
+            show_progress=self.show_progress,
+        )
 
     def fit(
         self,
@@ -304,6 +414,8 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self.view_specs_ = []
         self.rank_selection_info_ = None
         self.n_views_selection_info_ = None
+        self.partition_selection_info_ = None
+        self.cluster_centers_ = None
         if self.n_views_requested == "auto":
             self.n_views = self.min_views
         return np.random.default_rng(self.random_state)
@@ -405,11 +517,71 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
     ) -> None:
         if self.sample_embedding_ is None:
             raise RuntimeError("Sample embedding is not available")
-        n_clusters = min(self.n_partitions, self.sample_embedding_.shape[0])
-        self.clusterer_ = self._make_kmeans(n_clusters=n_clusters)
-        labels = self.clusterer_.fit_predict(self.sample_embedding_)
+        labels = self._fit_cluster_labels(self.sample_embedding_, target)
         self.cluster_labels_ = labels
         self._build_partitions_from_labels(labels, scores, target)
+
+    def _fit_cluster_labels(
+        self,
+        embedding: np.ndarray,
+        target: Optional[Union[np.ndarray, pd.Series]],
+    ) -> np.ndarray:
+        if self.partition_selection_method == "auto":
+            return self._fit_auto_partition_clusters(embedding, target)
+        n_clusters = min(self.n_partitions, embedding.shape[0])
+        self.clusterer_ = self._make_kmeans(n_clusters=n_clusters)
+        labels = self.clusterer_.fit_predict(embedding)
+        self.cluster_centers_ = self.clusterer_.cluster_centers_
+        self.partition_selection_info_ = PartitionSelectionInfo(
+            requested_n_partitions=int(self.n_partitions),
+            selected_n_partitions=int(n_clusters),
+            partition_selection_method="fixed",
+            selected_algorithm="kmeans",
+            cluster_algorithms=("kmeans",),
+            cluster_selection_metric="fixed",
+            cluster_ensemble_method="none",
+            candidates=(int(n_clusters),),
+            scores=((int(n_clusters), None),),
+            candidate_details=(),
+            min_auto_partition_size=int(self.min_auto_partition_size),
+            selection_sample_size=0,
+        )
+        return labels
+
+    def _fit_auto_partition_clusters(
+        self,
+        embedding: np.ndarray,
+        target: Optional[Union[np.ndarray, pd.Series]],
+    ) -> np.ndarray:
+        result = self.cluster_selector_.select(embedding, target=target)
+        self.clusterer_ = result.estimator
+        self.cluster_centers_ = result.centers
+        self.partition_selection_info_ = self._partition_info_from_selection(result)
+        return result.labels
+
+    def _partition_info_from_selection(self, result: ClusterSelectionResult) -> PartitionSelectionInfo:
+        candidate_counts = tuple(
+            sorted({int(candidate.n_clusters) for candidate in result.candidates})
+        )
+        candidate_scores = tuple(
+            (int(candidate.n_clusters), float(candidate.score))
+            for candidate in result.candidates
+        )
+        candidate_details = tuple(result.diagnostics.get("candidates", ()))
+        return PartitionSelectionInfo(
+            requested_n_partitions=int(self.n_partitions),
+            selected_n_partitions=int(result.selected_n_clusters),
+            partition_selection_method="auto",
+            selected_algorithm=result.selected_algorithm,
+            cluster_algorithms=tuple(result.diagnostics.get("cluster_algorithms", self.cluster_algorithms)),
+            cluster_selection_metric=str(result.diagnostics.get("cluster_selection_metric", self.cluster_selection_metric)),
+            cluster_ensemble_method=str(result.diagnostics.get("cluster_ensemble_method", self.cluster_ensemble_method)),
+            candidates=candidate_counts,
+            scores=candidate_scores,
+            candidate_details=candidate_details,
+            min_auto_partition_size=int(self.min_auto_partition_size),
+            selection_sample_size=int(min(self.partition_selection_sample_size, result.labels.shape[0])),
+        )
 
     def get_partitions(
         self,
@@ -448,7 +620,7 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         return np.asarray([cluster_ids[i] for i in best], dtype=int)
 
     def predict_partition_proba(self, X: ArrayLike) -> np.ndarray:
-        if self.clusterer_ is None or self.sample_embedding_ is None:
+        if self.clusterer_ is None or self.sample_embedding_ is None or self.cluster_centers_ is None:
             raise RuntimeError("Sampler not fitted. Call fit() first.")
         if not self.partition_names_:
             raise RuntimeError("No partitions available. Call fit() first.")
@@ -457,9 +629,8 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         M_new = self._build_mode0_unfolding(X_num, fit=False, rng=None)
         embedding = self._project_new_unfolding(M_new)
 
-        centroids = self.clusterer_.cluster_centers_
         active_cluster_ids = np.asarray([self.partition_to_cluster_[name] for name in self.partition_names_], dtype=int)
-        active_centroids = centroids[active_cluster_ids]
+        active_centroids = self.cluster_centers_[active_cluster_ids]
         proba = self._routing_probability(embedding, active_centroids)
 
         if self.routing_shrinkage > 0:
@@ -804,6 +975,7 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         if scores is not None:
             entropy = float(-np.sum(scores * np.log(scores + 1e-12)))
             eff_n = float(np.exp(entropy))
+        partition_info = self.partition_selection_info_
         self.diagnostics_ = {
             "backend": self.backend_,
             "device": self.device if self.backend_ == "torch" else None,
@@ -831,6 +1003,23 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             "singular_values": self.singular_values_.tolist() if self.singular_values_ is not None else [],
             "leverage_entropy": entropy,
             "effective_sample_count": eff_n,
+            "n_partitions_requested": int(self.n_partitions),
+            "selected_n_partitions": int(partition_info.selected_n_partitions) if partition_info else int(len(self.partitions)),
+            "partition_selection_method": partition_info.partition_selection_method if partition_info else "fixed",
+            "selected_cluster_algorithm": partition_info.selected_algorithm if partition_info else None,
+            "cluster_algorithms": list(partition_info.cluster_algorithms) if partition_info else [],
+            "cluster_selection_metric": partition_info.cluster_selection_metric if partition_info else None,
+            "cluster_ensemble_method": partition_info.cluster_ensemble_method if partition_info else None,
+            "partition_selection_candidates": list(partition_info.candidates) if partition_info else [],
+            "partition_selection_scores": {
+                str(candidate): score
+                for candidate, score in partition_info.scores
+            } if partition_info else {},
+            "partition_selection_candidate_details": list(partition_info.candidate_details) if partition_info else [],
+            "max_cluster_imbalance_ratio": float(self.max_cluster_imbalance_ratio),
+            "min_cluster_fraction": float(self.min_cluster_fraction),
+            "min_auto_partition_size": int(partition_info.min_auto_partition_size) if partition_info else None,
+            "partition_selection_sample_size": int(partition_info.selection_sample_size) if partition_info else None,
             "n_partitions": int(len(self.partitions)),
             "chunk_sizes": {name: int(len(idx)) for name, idx in self.partitions.items()},
         }
