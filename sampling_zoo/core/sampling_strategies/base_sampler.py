@@ -14,10 +14,26 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 from ..utils.utils import safe_index
 
-try:  # optional backend
-    import torch
-except Exception:  # pragma: no cover - torch is optional
-    torch = None
+torch = None
+_TORCH_IMPORT_ATTEMPTED = False
+
+
+def _load_torch_backend() -> Optional[Any]:
+    """Load torch lazily so base sampler imports stay lightweight."""
+
+    global torch, _TORCH_IMPORT_ATTEMPTED
+    if torch is not None:
+        return torch
+    if _TORCH_IMPORT_ATTEMPTED:
+        return None
+    _TORCH_IMPORT_ATTEMPTED = True
+    try:
+        import torch as torch_module
+    except Exception:  # pragma: no cover - torch is optional
+        torch = None
+    else:
+        torch = torch_module
+    return torch
 
 
 class BaseSampler(ABC):
@@ -268,37 +284,41 @@ class BaseSampler(ABC):
         return np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _resolve_backend(self) -> str:
+        torch_module = _load_torch_backend()
         if self.backend == "numpy":
             return "numpy"
         if self.backend == "torch":
-            if torch is None:
+            if torch_module is None:
                 raise ImportError("backend='torch' requires torch to be installed")
             self._resolve_torch_device()
             return "torch"
-        if torch is None:
+        if torch_module is None:
             return "numpy"
         self._resolve_torch_device()
         return "torch"
 
     def _resolve_torch_device(self) -> Any:
-        if torch is None:
+        torch_module = _load_torch_backend()
+        if torch_module is None:
             return None
-        device = torch.device(self.device)
-        if device.type == "cuda" and not torch.cuda.is_available():
+        device = torch_module.device(self.device)
+        if device.type == "cuda" and not torch_module.cuda.is_available():
             if self.backend == "torch":
                 raise ValueError(f"Requested torch device is not available: {self.device}")
-            device = torch.device("cpu")
+            device = torch_module.device("cpu")
         return device
 
     def _torch_dtype(self) -> Any:
-        if torch is None:
+        torch_module = _load_torch_backend()
+        if torch_module is None:
             return None
-        return torch.float32 if self.dtype == "float32" else torch.float64
+        return torch_module.float32 if self.dtype == "float32" else torch_module.float64
 
     def _to_torch_matrix(self, X: np.ndarray) -> Any:
-        if torch is None:
+        torch_module = _load_torch_backend()
+        if torch_module is None:
             raise RuntimeError("Torch backend selected but torch is unavailable")
-        return torch.as_tensor(X, dtype=self._torch_dtype(), device=self._resolve_torch_device())
+        return torch_module.as_tensor(X, dtype=self._torch_dtype(), device=self._resolve_torch_device())
 
 
 class HierarchicalStratifiedMixin:

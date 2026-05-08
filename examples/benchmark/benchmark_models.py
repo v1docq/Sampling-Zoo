@@ -36,26 +36,19 @@ except Exception:  # pragma: no cover - optional
     LGBMClassifier = None
     LGBMRegressor = None
 
-try:
-    import torch
-    import torch.nn as nn
-    import torch.optim as optim
-except Exception:  # pragma: no cover - optional
-    torch = None
+torch = None
+nn = None
+optim = None
+_TORCH_IMPORT_ATTEMPTED = False
 
-try:
-    from tabpfn import TabPFNClassifier, TabPFNRegressor
-    from tabpfn.constants import ModelVersion
-except Exception:  # pragma: no cover - optional
-    TabPFNClassifier = None
-    TabPFNRegressor = None
-    ModelVersion = None
+TabPFNClassifier = None
+TabPFNRegressor = None
+ModelVersion = None
+_TABPFN_IMPORT_ATTEMPTED = False
 
-try:
-    from tabicl import TabICLClassifier, TabICLRegressor
-except Exception:  # pragma: no cover - optional
-    TabICLClassifier = None
-    TabICLRegressor = None
+TabICLClassifier = None
+TabICLRegressor = None
+_TABICL_IMPORT_ATTEMPTED = False
 
 @dataclass
 class SearchResult:
@@ -118,8 +111,30 @@ def _search_params(
     return SearchResult(best_params=best_params, best_score=float(best_score))
 
 
+def _load_torch_modules() -> tuple[Any, Any, Any]:
+    global torch, nn, optim, _TORCH_IMPORT_ATTEMPTED
+    if torch is not None:
+        return torch, nn, optim
+    if not _TORCH_IMPORT_ATTEMPTED:
+        _TORCH_IMPORT_ATTEMPTED = True
+        try:
+            import torch as _torch
+            import torch.nn as _nn
+            import torch.optim as _optim
+        except Exception:  # pragma: no cover - optional
+            torch = None
+            nn = None
+            optim = None
+        else:
+            torch = _torch
+            nn = _nn
+            optim = _optim
+    return torch, nn, optim
+
+
 def _make_pytorch_classifier(seed: int) -> ClassifierMixin:
-    if torch is None:
+    torch_module, nn_module, optim_module = _load_torch_modules()
+    if torch_module is None or nn_module is None or optim_module is None:
         return MLPClassifier(hidden_layer_sizes=(128, 64), max_iter=100, random_state=seed)
 
     class TorchMLPClassifier(ClassifierMixin):
@@ -130,24 +145,24 @@ def _make_pytorch_classifier(seed: int) -> ClassifierMixin:
             self.lr = lr
 
         def _build_model(self, in_dim: int):
-            return nn.Sequential(
-                nn.Linear(in_dim, self.hidden_dim),
-                nn.ReLU(),
-                nn.Linear(self.hidden_dim, self.hidden_dim // 2),
-                nn.ReLU(),
-                nn.Linear(self.hidden_dim // 2, 2),
+            return nn_module.Sequential(
+                nn_module.Linear(in_dim, self.hidden_dim),
+                nn_module.ReLU(),
+                nn_module.Linear(self.hidden_dim, self.hidden_dim // 2),
+                nn_module.ReLU(),
+                nn_module.Linear(self.hidden_dim // 2, 2),
             )
 
         def fit(self, X, y):
             X = np.asarray(X, dtype=np.float32)
             y = np.asarray(y, dtype=np.int64)
-            torch.manual_seed(seed)
+            torch_module.manual_seed(seed)
             self.model_ = self._build_model(X.shape[1])
-            optimizer = optim.Adam(self.model_.parameters(), lr=self.lr)
-            criterion = nn.CrossEntropyLoss()
+            optimizer = optim_module.Adam(self.model_.parameters(), lr=self.lr)
+            criterion = nn_module.CrossEntropyLoss()
             self.model_.train()
-            x_t = torch.from_numpy(X)
-            y_t = torch.from_numpy(y)
+            x_t = torch_module.from_numpy(X)
+            y_t = torch_module.from_numpy(y)
             for _ in range(self.epochs):
                 optimizer.zero_grad()
                 logits = self.model_(x_t)
@@ -159,9 +174,9 @@ def _make_pytorch_classifier(seed: int) -> ClassifierMixin:
         def predict_proba(self, X):
             X = np.asarray(X, dtype=np.float32)
             self.model_.eval()
-            with torch.no_grad():
-                logits = self.model_(torch.from_numpy(X))
-                probs = torch.softmax(logits, dim=1).cpu().numpy()
+            with torch_module.no_grad():
+                logits = self.model_(torch_module.from_numpy(X))
+                probs = torch_module.softmax(logits, dim=1).cpu().numpy()
             return probs
 
         def predict(self, X):
@@ -175,10 +190,11 @@ def _env_flag_enabled(name: str) -> bool:
 
 
 def _torch_cuda_is_available() -> bool:
-    if torch is None:
+    torch_module, _, _ = _load_torch_modules()
+    if torch_module is None:
         return False
     try:
-        return bool(torch.cuda.is_available())
+        return bool(torch_module.cuda.is_available())
     except Exception:
         return False
 
@@ -189,6 +205,41 @@ def _resolve_tabpfn_device() -> str:
     if explicit_device:
         return explicit_device.strip()
     return "cuda" if _torch_cuda_is_available() else "cpu"
+
+
+def _load_tabpfn_classes() -> tuple[Any, Any, Any]:
+    global ModelVersion, TabPFNClassifier, TabPFNRegressor, _TABPFN_IMPORT_ATTEMPTED
+    if not _TABPFN_IMPORT_ATTEMPTED:
+        _TABPFN_IMPORT_ATTEMPTED = True
+        try:
+            from tabpfn import TabPFNClassifier as _TabPFNClassifier
+            from tabpfn import TabPFNRegressor as _TabPFNRegressor
+            from tabpfn.constants import ModelVersion as _ModelVersion
+        except Exception:  # pragma: no cover - optional
+            TabPFNClassifier = None
+            TabPFNRegressor = None
+            ModelVersion = None
+        else:
+            TabPFNClassifier = _TabPFNClassifier
+            TabPFNRegressor = _TabPFNRegressor
+            ModelVersion = _ModelVersion
+    return TabPFNClassifier, TabPFNRegressor, ModelVersion
+
+
+def _load_tabicl_classes() -> tuple[Any, Any]:
+    global TabICLClassifier, TabICLRegressor, _TABICL_IMPORT_ATTEMPTED
+    if not _TABICL_IMPORT_ATTEMPTED:
+        _TABICL_IMPORT_ATTEMPTED = True
+        try:
+            from tabicl import TabICLClassifier as _TabICLClassifier
+            from tabicl import TabICLRegressor as _TabICLRegressor
+        except Exception:  # pragma: no cover - optional
+            TabICLClassifier = None
+            TabICLRegressor = None
+        else:
+            TabICLClassifier = _TabICLClassifier
+            TabICLRegressor = _TabICLRegressor
+    return TabICLClassifier, TabICLRegressor
 
 
 def _make_tabpfn_kwargs(seed: int, n_estimators: int = 12) -> Dict[str, Any]:
@@ -207,10 +258,11 @@ def _make_tabpfn_kwargs(seed: int, n_estimators: int = 12) -> Dict[str, Any]:
 
 
 def _create_tabpfn_model(model_cls: Any, seed: int) -> Any:
-    if ModelVersion is None:
+    _, _, model_version = _load_tabpfn_classes()
+    if model_version is None:
         raise ValueError("tabpfn is not available. Install tabpfn to use this model.")
     return model_cls.create_default_for_version(
-        ModelVersion.V2_5,
+        model_version.V2_5,
         **_make_tabpfn_kwargs(seed),
     )
 
@@ -291,19 +343,21 @@ def make_model_pool(
             model_pool["ridge"] = lambda: LogisticRegression(max_iter=500, random_state=seed)
 
     if "tabpfn" in requested:
-        if TabPFNClassifier is None or TabPFNRegressor is None:
+        tabpfn_classifier, tabpfn_regressor, _model_version = _load_tabpfn_classes()
+        if tabpfn_classifier is None or tabpfn_regressor is None:
             raise ValueError("tabpfn is not available. Install tabpfn to use this model.")
         if normalized_problem == "classification":
-            model_pool["tabpfn"] = lambda: _create_tabpfn_model(TabPFNClassifier, seed)
+            model_pool["tabpfn"] = lambda: _create_tabpfn_model(tabpfn_classifier, seed)
         else:
-            model_pool["tabpfn"] = lambda: _create_tabpfn_model(TabPFNRegressor, seed)
+            model_pool["tabpfn"] = lambda: _create_tabpfn_model(tabpfn_regressor, seed)
 
     if "tabicl" in requested:
-        if TabICLClassifier is None or TabICLRegressor is None:
+        tabicl_classifier, tabicl_regressor = _load_tabicl_classes()
+        if tabicl_classifier is None or tabicl_regressor is None:
             raise ValueError("tabicl is not available. Install tabicl to use this model.")
         if normalized_problem == "classification":
-            model_pool["tabicl"] = lambda: TabICLClassifier(n_estimators=12)
+            model_pool["tabicl"] = lambda: tabicl_classifier(n_estimators=12)
         else:
-            model_pool["tabicl"] = lambda: TabICLRegressor(n_estimators=12)
+            model_pool["tabicl"] = lambda: tabicl_regressor(n_estimators=12)
 
     return model_pool

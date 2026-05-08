@@ -202,19 +202,39 @@ class RMTRegressionExperimentOrchestrator:
         if self.config.synthetic_smoke:
             return [make_synthetic_regression_smoke_dataset(self.config.seed)]
 
-        datasets = load_suite_raw_datasets(
-            classification_suite=None,
-            regression_suite=self.config.regression_suite,
-            classification_tasks=None,
-            regression_tasks=self.config.regression_tasks,
-            show_progress=self.config.show_progress,
-        )
-        return [
-            cap_openml_dataset(dataset, self.config.max_train_rows, self.config.seed)
-            if isinstance(dataset, OpenMLRawDatasetBundle)
-            else dataset
-            for dataset in datasets
-        ]
+        with tqdm(
+            total=2,
+            desc="Load OpenML datasets",
+            disable=not self.config.show_progress,
+            leave=False,
+            unit="stage",
+        ) as load_progress:
+            load_progress.set_postfix_str("resolve suite tasks")
+            datasets = load_suite_raw_datasets(
+                classification_suite=None,
+                regression_suite=self.config.regression_suite,
+                classification_tasks=None,
+                regression_tasks=self.config.regression_tasks,
+                show_progress=self.config.show_progress,
+            )
+            load_progress.update(1)
+
+            load_progress.set_postfix_str("apply row caps")
+            prepared_datasets = []
+            for dataset in tqdm(
+                datasets,
+                desc="Prepare OpenML datasets",
+                disable=not self.config.show_progress,
+                leave=False,
+            ):
+                prepared_datasets.append(
+                    cap_openml_dataset(dataset, self.config.max_train_rows, self.config.seed)
+                    if isinstance(dataset, OpenMLRawDatasetBundle)
+                    else dataset
+                )
+            load_progress.update(1)
+
+        return prepared_datasets
 
     def _load_available_datasets(self) -> list[RawDatasetBundle]:
         datasets = self._load_datasets()
