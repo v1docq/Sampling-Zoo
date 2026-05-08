@@ -68,7 +68,7 @@ $T = P + \frac{1}{\sqrt{N}}W$
 
 ## 4.1. Вход
 
-$X \in \mathbb{R}^{n \times p}$ - формат pandas или торч с числовыми и категориальными признаками.
+$X \in \mathbb{R}^{n \times p}$ - pandas DataFrame или numpy-like matrix с числовыми и категориальными признаками. Torch используется как backend для численных kernels, но публичный вход sampler-а остается табличным.
 
 ## 4.2. Препроцессинг
 
@@ -87,23 +87,77 @@ $X \in \mathbb{R}^{n \times p}$ - формат pandas или торч с чис�
 2. гауссовой случайной матрицей;
 3. выбором признаков плюс дополнительной проекцией.
 
+В текущей реализации $J$ не обязан быть статическим числом. Поддерживается `n_views="auto"`:
+
+- для `view_strategy="subsample"` используется **coverage-based policy**: выбрать столько views, чтобы покрыть заданную долю признаков `target_feature_coverage`;
+- для `view_strategy="gaussian"` используется **spectrum-stability policy**: строить candidates `min_views, 2*min_views, ... max_views` и остановиться, когда относительное изменение нормированного спектра меньше `spectrum_stability_tolerance`.
+
 ## 4.4. Тензоризация
 
 Формально - $T[i,j,k] = Z_j[i,k]$
 
 Практически нет смысла хранит полный тензор как отдельный объект, если это не нужно. Для sample-mode SVD достаточно mode-0 unfolding - $M = T_{(0)} \in \mathbb{R}^{n \times JK}$. Это экономит память.
 
-## 4.5. Randomized SVD
+## 4.5. Randomized SVD И Adaptive Rank
 
 1. Аппроксимация - $M \approx U_r \Sigma_r V_r^\top$ 
 2. Эмбединги семплов -  $E_i = U_r[i,:]$ 
 3. Скоры - $\ell_i = \|U_r[i,:]\|_2^2$.
 
+Ранг больше не задается вручную через `approx_rank`. Используется двухступенчатая policy:
+
+1. начальный ранг:
+
+$$
+r_0 = \left\lceil \rho \min(n, JK) \right\rceil,\quad \rho=\texttt{initial_rank_fraction}
+$$
+
+2. после вычисления спектра выбирается минимальный $r \le r_0$, такой что:
+
+$$
+\frac{\sum_{i=1}^{r} \sigma_i^2}{\sum_{i=1}^{r_0} \sigma_i^2} \ge \texttt{explained_variance_threshold}
+$$
+
+Default: `initial_rank_fraction=0.25`, `rank_selection_method="explained_variance"`, `explained_variance_threshold=0.95`, `min_rank=1`.
+
+По умолчанию для кластеризации используется `embedding_mode="sv_scaled"`:
+
+$$
+E_i = U_r[i,:] \Sigma_r
+$$
+
+Это помогает не терять информацию о силе спектральных направлений: две компоненты с разными singular values не должны иметь одинаковый вклад в clustering.
+
 Существующие реализации алгоритмов "свд для тензоров" напримре HOSVD/MLSVD как общий математический язык здесь уместны, но при этом важно помнить ограничение: для тензоров нет прямого полного аналога теоремы Eckart-Young а лучшая low-rank tensor approximation в общем случае сложна и это NP задача
 
 ## 4.6. Формирование чанков
 
-В пространстве $U_r$​ выполняется кластеризация - $U_r \to C_1,\dots,C_m$
+В пространстве $E$ выполняется кластеризация - $E \to C_1,\dots,C_m$.
+
+Текущая реализация поддерживает два режима выбора partitions:
+
+1. `partition_selection_method="fixed"`: классический KMeans на `n_partitions`.
+2. `partition_selection_method="auto"`: `SpectralClusterSelector` сравнивает несколько кандидатов и выбирает число clusters.
+
+Для auto режима могут сравниваться:
+
+- `kmeans`;
+- `bisecting_kmeans`;
+- `gmm`;
+- `hdbscan`, если backend доступен.
+
+Основная метрика выбора - `balanced_silhouette`:
+
+$$
+\text{score}
+= \text{silhouette}
+- \lambda_{imb}\,\text{penalty}(\text{imbalance})
+- \lambda_{tiny}\,\text{penalty}(\text{tiny clusters})
++ \lambda_y\,\text{target contrast}
+- \text{hard constraint penalty}
+$$
+
+Hard constraints включают `max_cluster_imbalance_ratio` и `min_cluster_fraction`. Это важно, потому что чистый silhouette часто выбирает слишком малое число clusters или допускает tiny chunks, на которых chunk-модель обучается плохо.
 
 Для каждого кластера можно:
 
@@ -128,7 +182,7 @@ selection_method="all"selection_method="leverage"selection_method="maxvol"select
 
 Исключение — идея в `HDBScanSampler.predict_partitions`, но она не интегрирована как полноценный роутинг.
 
-Я добавил логику:
+Реализована логика:
 
 ```
 predict_partitions(X_new)predict_partition_proba(X_new)
@@ -142,9 +196,30 @@ predict_partitions(X_new)predict_partition_proba(X_new)
 4. строятся soft routing weights - $g_c(x) = \frac{\exp(-d(e(x), \mu_c)^2 / \tau)} {\sum_{c'} \exp(-d(e(x), \mu_{c'})^2 / \tau)}$ 
 5. Далее итоговый вес модели - $w_c(x) \propto q_c^\alpha g_c(x)^\beta$
 6. $q_c$ — качество модели на валидации. 
-7. В текущей первой реализации используется произведение оценок на валидационном распределении и распределение роутинга - $w_c(x) \propto q_c \cdot g_c(x)$
-8. Для регрессии - $q_c = \frac{1}{RMSE_c + \varepsilon}$
-9. Для классификации - f1
+7. В базовом `routed_weighted` используется произведение validation weight и routing probability - $w_c(x) \propto q_c \cdot g_c(x)$.
+8. Для регрессии - $q_c = \frac{1}{RMSE_c + \varepsilon}$.
+9. Для классификации - f1.
+
+Routing теперь вынесен в отдельный `RoutedWeightedRouter`. Default router остается spectral. Если явно выбран `router="constrained_gating"`, обучается torch gating head на validation predictions с KL regularization к spectral prior и balance penalty. Torch импортируется лениво, чтобы benchmark module можно было импортировать в окружениях без torch.
+
+## 5.1. Optional EM Routed Retraining
+
+Для режима `routed_weighted` добавлен explicit opt-in:
+
+```python
+routing_refinement="em_retraining"
+```
+
+Идея:
+
+1. E-step: текущий router назначает train rows chunk-моделям.
+2. Assignment: используется hard top-1 policy.
+3. M-step: каждая chunk-модель переобучается на своем routed subset.
+4. Router refresh: при `em_refit_router=True` обновляется learned/constrained router.
+5. Acceptance: итерация принимается только если validation metric улучшилась минимум на `em_min_improvement`.
+6. Restore: при `em_keep_best=True` сохраняется лучший validation snapshot.
+
+Этот механизм не включен по умолчанию, потому что он дороже и меняет смысл эксперимента: это уже не только sampling + static ensemble, а совместная донастройка experts по маршрутизации.
 
 # 6. Вывод 
 
@@ -153,5 +228,6 @@ predict_partitions(X_new)predict_partition_proba(X_new)
 1. плоский табличный датасет переводится не в “настоящий физический тензор”, а в synthetic multi-view tensor;
 2. sample-mode spectrum даёт чанки;
 3. тот же sampler используется на инференсе как роутер;
-4. ensemble weights становятся локальными, а не только статично зависящим от результатов на валидации.
-
+4. ensemble weights становятся локальными, а не только статично зависящим от результатов на валидации;
+5. для spectral branch все тяжелые численные primitives вынесены в backend слой (`MatrixRMTBackend` / `TensorRMTBackend`), а orchestration остается в sampler-е;
+6. экспериментальная инфраструктура теперь строится вокруг typed contracts/stages: raw config -> `StrategyGridContract` -> legacy kwargs на factory boundary.

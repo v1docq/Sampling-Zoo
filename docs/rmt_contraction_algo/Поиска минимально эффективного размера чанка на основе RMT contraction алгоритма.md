@@ -7,21 +7,26 @@
 
 Где:
 
-- m — размер чанка или общий бюджет;
+- m — общий training budget, управляемый `budget_ratio`;
 - $\delta$ — допустимая деградация, например 1%, 3%, 5%;
 - $RMSE_{\text{ref}}$​ — бейзлайн. Варианты бейзлайна могут быть следующие:
     - либо foundational model на всех данных;
     - либо текущая реализация ансамбля на random/difficulty семплерах;
     - либо лучший AutoML из `regression.csv`.
 
-## Практическая реализации
+## Практическая реализация
 
-1. Сетка значения для chunk_fraction = [1.0, 0.75, 0.5, 0.3, 0.2, 0.1]
-2. budget_ratio = [0.01, 0.03, 0.05, 0.10, 0.20]
+В основной ветке `run_rmt_contraction_regression` сейчас оставлена одна главная ось бюджета:
+
+```python
+budget_ratio = [0.1, 0.3, 0.5, 0.75, 0.9]
+```
+
+`chunk_fraction` больше не используется как параллельная основная ось, потому что она дублировала смысл `budget_ratio` и усложняла интерпретацию. Ее лучше держать как отдельную RMT ablation: она отвечает за размер subset внутри уже найденного cluster-а, а не за общий budget всего ensemble.
 
 Далеем строим таблицу:
 ```
-dataset | sampler | chunk_fraction | total_train_rows | rmse | rmse_drop | fit_time | inference_time
+dataset | sampler | ensemble_method | budget_ratio | total_train_rows | rmse | rmse_drop | fit_time | inference_time
 ```
 
 Где критерий успеха:
@@ -29,6 +34,14 @@ dataset | sampler | chunk_fraction | total_train_rows | rmse | rmse_drop | fit_t
 ```
 минимальный budget_ratio, при котором RMSE не хуже baseline более чем на δ
 ```
+
+В `RMTReportTableBuilder` это соответствует таблицам:
+
+- `rmt_raw_runs.csv`;
+- `sample_efficiency_curve.csv`;
+- `minimal_effective_budget.csv`.
+
+После последних изменений в raw/efficiency таблицы также попадают RMT diagnostics axes: `view_strategy`, `n_views`, `n_views_policy`, `selected_rank`, `selected_n_partitions`, `selected_cluster_algorithm`, а также EM routing refinement columns.
 
 # Главные риски
 
@@ -63,8 +76,21 @@ sampler.diagnostics_
 
 ```
 mode0_unfolding_shape
+n_views
+n_views_policy
+spectrum_stability_change
 singular_values
+selected_rank
 leverage_entropy
 effective_sample_count
+selected_n_partitions
+selected_cluster_algorithm
+partition_selection_scores
 chunk_sizes
 ```
+
+Дополнительно для интерпретации sample efficiency нужно смотреть:
+
+- partition diagnostics: target mean/std/quantiles per chunk, drift vs global, chunk size imbalance;
+- routing diagnostics: entropy, mean max probability, validation/test assignment counts;
+- routing refinement diagnostics, если включен `routing_refinement="em_retraining"`.

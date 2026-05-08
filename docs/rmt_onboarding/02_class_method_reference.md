@@ -14,15 +14,17 @@
 
 | Метод | Назначение |
 |---|---|
-| `run()` | Публичный pipeline запуска. Выполняет подготовку, создает runner, загружает datasets, запускает эксперимент, строит artifacts и metadata. При исключении помечает incremental saver как failed. |
+| `run()` | Публичный pipeline запуска. Строит `ExperimentPlan`, передает его в `_execute_experiment_plan`, при исключении помечает incremental saver как failed. |
+| `_build_experiment_plan()` | Создает типизированный план стадий через `build_standard_rmt_experiment_plan(...)` и сохраняет его для metadata. |
+| `_execute_experiment_plan(plan)` | Последовательно исполняет stage ids: runtime, logger, runner, datasets, strategy grid, datasets run, reports, metadata, finalize. |
 | `_prepare_runtime()` | Настраивает runtime-предусловия, например фильтры warning-ов. |
 | `_create_logger()` | Создает `BenchmarkLogger` для output directory текущего запуска. |
 | `_create_incremental_recorder(logger)` | Возвращает callback, который будет вызван после каждого run record. |
 | `_create_incremental_saver(logger)` | Создает `IncrementalExperimentSaver` и регистрирует snapshot hooks для промежуточных отчетов. |
 | `_create_runner(logger)` | Создает `EnsembleChunkBenchmarkRunner`, передавая ему logger и `on_record` callback. |
-| `_load_datasets()` | Загружает доступные regression datasets с учетом row cap и списка задач. |
+| `_load_datasets()` | Загружает доступные regression datasets с учетом row cap и списка задач; OpenML discovery и cap/wrapping показываются через `tqdm`. |
 | `_load_available_datasets()` | Внутренний helper для перебора dataset specs и graceful skip недоступных datasets. |
-| `_build_strategy_configs()` | Создает словарь strategy configs для benchmark runner. |
+| `_build_strategy_grid()` | Создает raw strategy configs и нормализует их в `StrategyGridContract`. |
 | `_run_experiment(datasets, strategy_configs, runner, logger)` | Итерация по datasets; для каждого dataset запускает сетку моделей и стратегий через runner. |
 | `_build_report_artifacts(run_records, logger)` | Строит summary/report artifacts. Если активен incremental saver, делегирует snapshot rebuild. |
 | `_build_run_meta(...)` | Формирует metadata payload: config, counts, timestamps, status. |
@@ -32,6 +34,41 @@
 ### Почему Это Важно
 
 `run()` - пример “thin shell” паттерна: он описывает порядок операций, но не содержит вложенных циклов и специальных случаев. Если нужно менять поведение загрузки данных, сохранения или отчетов, изменение должно попасть в отдельный метод.
+
+## Experiment Contracts, Stages And Morphisms
+
+Файлы:
+
+- `sampling_zoo/core/experiment/contracts.py`
+- `sampling_zoo/core/experiment/stages.py`
+- `sampling_zoo/core/experiment/morphisms.py`
+- `sampling_zoo/core/experiment/errors.py`
+
+Назначение: общий framework-level слой для staged experiments. Он делает boundary между raw runtime objects и устойчивыми typed snapshots: dataset, strategy grid, model, fold, partitions, chunk models, routing, evaluation, run records и artifacts.
+
+### Ключевые Классы И Функции
+
+| Объект | Назначение |
+|---|---|
+| `ExperimentPlan` | Immutable последовательность `StageRequest`, которую исполняет orchestrator. |
+| `ExperimentStageId` | Enum стандартных стадий: `prepare_runtime`, `create_logger`, `create_runner`, `load_datasets`, `build_strategy_grid`, `run_datasets`, `build_reports`, `write_metadata`, `finalize`. |
+| `StageRequest` / `StageResult` | Типизированные вход/выход stage handler-а. |
+| `StrategySpec` / `StrategyGridContract` | Типизированная strategy grid. Raw dict configs материализуются обратно только на legacy boundary. |
+| `DatasetContract`, `FoldContract`, `PartitionContract`, `RoutingContract`, `EvaluationContract` | Compact snapshots для логирования, диагностики и invariant tests. |
+| `PartitionTrainingRequest` / `PartitionTrainingResult` | Internal contract вокруг `SamplingEnsemble.train_partition_models(...)`. |
+| `normalize_strategy_grid(...)` | Pure morphism: raw mapping configs -> `StrategyGridContract`. |
+| `materialize_strategy_grid(...)` | Pure morphism: typed grid -> legacy dict kwargs. |
+| `build_standard_rmt_experiment_plan(...)` | Pure builder стандартного RMT stage plan. |
+
+### Почему Это Важно
+
+Новые runner-ы должны идти по каноническому пути:
+
+```text
+raw config -> typed validation/spec -> pure morphism -> runtime shell -> artifacts
+```
+
+Так проще проверять invariants: порядок stage plan стабилен, нормализация configs детерминирована, а records можно сравнивать без чтения внутренних объектов sklearn/torch.
 
 ### Text2Image Prompt: Orchestrator
 
@@ -76,12 +113,12 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 
 | Метод | Назначение |
 |---|---|
-| `run_dataset(dataset, strategy_configs, models=None)` | Публичный метод для одного dataset. Загружает OpenML split при необходимости, запускает grid, освобождает OpenML split data. |
+| `run_dataset(dataset, strategy_configs, models=None)` | Публичный метод для одного dataset. Принимает legacy dict или `StrategyGridContract`, нормализует grid, загружает OpenML split при необходимости, запускает grid, освобождает OpenML split data. |
 | `_load_openml_split(dataset)` | Загружает raw train/test split для OpenML bundle один раз на dataset. |
 | `_run_model_strategy_grid(...)` | Внешний цикл по моделям. |
 | `_iter_models(models)` | Нормализует список model keys и model factories. |
 | `_run_strategies_for_model(...)` | Цикл по strategy configs для конкретной модели. |
-| `_iter_strategies(strategy_configs)` | Нормализует strategy-name/config пары. |
+| `_iter_strategies(strategy_configs)` | Материализует typed grid в legacy strategy-name/config пары только на границе runner/factory. |
 | `_record_run(records, record)` | Добавляет record в локальный список и вызывает `on_record`, если он задан. |
 | `_release_openml_split(openml_split_data)` | Освобождает большой split object после dataset. |
 
@@ -197,6 +234,9 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 | `_register_partition_model(...)` | Добавляет trained model в registry ensemble-а. |
 | `_evaluate_current_ensemble(...)` | Считает validation metrics текущего ensemble. |
 | `_should_stop_partition_training(...)` | Early stopping по degradation rounds. |
+| `_build_partition_training_request(...)` | Создает typed request snapshot для обучения chunk-моделей. |
+| `_build_partition_training_result(...)` | Создает typed result snapshot: partitions, chunk models, routing contract, validation diagnostics. |
+| `_run_routing_refinement(...)` | Запускает optional `RoutedEMModelRefiner`, если `routing_refinement="em_retraining"`. |
 | `_finalize_partition_training(...)` | Завершает обучение и выбирает active model subset. |
 | `select_best_models_forward(...)` | Forward selection: добавляет модели, которые улучшают validation metric. |
 
@@ -206,7 +246,7 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 |---|---|
 | `_run_inference(...)` | Унифицирует `predict`, `predict_proba` и regression/classification output. |
 | `_validation_weights(active_models)` | Вес chunk-моделей по validation quality. |
-| `_routing_weights(features, active_models)` | Row-wise routing weights через partitioner probabilities или fallback. |
+| `_routing_weights(features, active_models)` | Row-wise routing weights через `RoutedWeightedRouter`: spectral probabilities, learned head, constrained gating или fallback. |
 | `ensemble_predict(features, stage="inference", models=None)` | Главный inference method: `voting`, `weighted`, `routed_weighted`. |
 | `ensemble_predict_batch(...)` | Batch inference для больших test sets. |
 
@@ -220,10 +260,68 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 
 Если sampler не умеет `predict_partition_proba`, routing fallback-ится к `predict_partitions`, а затем к uniform weights.
 
+`routing_refinement="em_retraining"` является explicit opt-in режимом. По умолчанию router остается spectral, а EM refiner не запускается. Когда режим включен, `RoutedEMModelRefiner` чередует hard top-1 assignment train rows по текущему router-у и переобучение chunk-моделей, принимает итерацию только при улучшении validation metric и при `em_keep_best=True` откатывает состояние к лучшему snapshot.
+
 ### Text2Image Prompt: Sampling Ensemble
 
 ```text
 ICML-style scientific figure, clean academic vector infographic, white background, muted blue-gray palette with one accent color, minimal typography, precise arrows, thin lines, labeled panels, no photorealism, no 3D glossy rendering, no decorative background, conference-paper figure aesthetics, mathematically clean, visually balanced. SamplingEnsemble diagram: partitioner creates chunks, budget policy trims chunks, one model is trained per chunk, validation scores create model weights, routing probabilities create row-wise weights, predictions are aggregated.
+```
+
+## RoutedWeightedRouter
+
+Файл: `sampling_zoo/core/utils/ensemble_routing.py`
+
+Назначение: отдельный объект, владеющий routing weights и routing diagnostics для `routed_weighted`. Он отделяет маршрутизацию от `SamplingEnsemble`, чтобы ensemble не разрастался логикой spectral routing, learned heads и constrained gating.
+
+### Режимы
+
+| Режим | Смысл |
+|---|---|
+| `spectral` | Default: использует `partitioner.predict_partition_proba(...)`, затем fallback к one-hot/uniform. |
+| `learned_head` | Legacy RandomForest head по base routing features. Сохранен для совместимости. |
+| `constrained_gating` | Torch gating head, обучаемый на validation predictions с KL regularization к spectral prior и balance penalty. |
+
+`torch` для constrained gating импортируется лениво через `_load_torch_backend()`, поэтому импорт benchmark-кода не должен падать в окружении без torch.
+
+### Text2Image Prompt: Routed Router
+
+```text
+ICML-style scientific figure, clean academic vector infographic, white background, muted blue-gray palette with one accent color, minimal typography, precise arrows, thin lines, labeled panels, no photorealism, no 3D glossy rendering, no decorative background, conference-paper figure aesthetics, mathematically clean, visually balanced. RoutedWeightedRouter figure: base spectral probabilities from partitioner, optional learned head, optional constrained gating neural head, validation model weights, final row-wise routing weights and diagnostics panel.
+```
+
+## RoutedEMModelRefiner
+
+Файл: `sampling_zoo/core/utils/routed_em_refiner.py`
+
+Назначение: explicit opt-in collaborator для совместной донастройки chunk-моделей в режиме `routed_weighted`.
+
+### Конфигурация
+
+| Параметр | Смысл |
+|---|---|
+| `routing_refinement` | `"none"` или `"em_retraining"`. Default: `"none"`. |
+| `em_max_iterations` | Максимум EM-итераций. |
+| `em_min_improvement` | Минимальное улучшение validation metric для принятия итерации. |
+| `em_assignment_policy` | Сейчас поддерживается `hard_top1`. |
+| `em_min_partition_size` | Guardrail от слишком маленьких routed partitions. |
+| `em_refit_router` | Нужно ли обновлять router после M-step. |
+| `em_keep_best` | Откатывать ensemble к лучшему validation snapshot. |
+
+### Алгоритм
+
+1. E-step: получить train-row responsibilities через текущий router.
+2. Assignment: превратить responsibilities в hard top-1 partitions.
+3. Guardrail: остановиться, если хотя бы один routed partition меньше `em_min_partition_size`.
+4. M-step: переобучить по одной chunk-модели на каждом routed partition.
+5. Router refresh: при `em_refit_router=True` обновить learned/constrained router.
+6. Acceptance: принять итерацию только если validation metric улучшилась не меньше `em_min_improvement`.
+7. Restore: при `em_keep_best=True` вернуть лучший snapshot.
+
+### Text2Image Prompt: EM Routed Retraining
+
+```text
+ICML-style scientific figure, clean academic vector infographic, white background, muted blue-gray palette with one accent color, minimal typography, precise arrows, thin lines, labeled panels, no photorealism, no 3D glossy rendering, no decorative background, conference-paper figure aesthetics, mathematically clean, visually balanced. EM routed retraining figure: current router assigns train rows to chunk experts, hard top-1 assignment creates routed partitions, chunk models are refit, router is refreshed, validation metric decides accept or restore best. Include diagnostics: improvement, assignment change rate, entropy before and after, imbalance.
 ```
 
 ## BaseSampler
@@ -245,6 +343,7 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 | `_resolve_backend()` | Выбирает `torch` или `numpy` backend. |
 | `_resolve_torch_device()` | Выбирает torch device, включая CUDA availability. |
 | `_to_torch_matrix(X)` | Переводит dense numpy matrix в torch tensor. |
+| `_load_torch_backend()` | Модульный lazy helper: torch импортируется только при реальной необходимости, поэтому import sampler-а не ломается в окружениях без torch. |
 
 ### Text2Image Prompt: Tabular Preprocessing
 
@@ -283,7 +382,18 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 | Параметр | Смысл |
 |---|---|
 | `n_partitions` | Число кластеров/partitions до возможной фильтрации chunk budget. |
-| `n_views` | Сколько random feature views строить. Больше views дают более устойчивое представление, но увеличивают unfolding. |
+| `partition_selection_method` | `fixed` или `auto`. В `auto` число partitions выбирается через `SpectralClusterSelector`. |
+| `cluster_algorithms` | Кандидаты кластеризации: `kmeans`, `bisecting_kmeans`, `gmm`, optional `hdbscan`. |
+| `cluster_selection_metric` | Метрика выбора candidates: `silhouette` или `balanced_silhouette`. |
+| `cluster_ensemble_method` | `best_score` или `weighted_vote` по candidates. |
+| `min_partitions`, `max_partitions` | Диапазон числа кластеров для auto-selection. |
+| `max_cluster_imbalance_ratio`, `min_cluster_fraction` | Hard constraints против слишком несбалансированных или слишком маленьких clusters. |
+| `n_views` | Сколько random feature views строить. Может быть integer или `"auto"`. |
+| `n_views_policy` | `auto`, `coverage` или `spectrum_stability`. Для `subsample` auto -> coverage, для `gaussian` auto -> spectrum stability. |
+| `min_views`, `max_views` | Границы автоматического выбора числа views. |
+| `target_feature_coverage` | Целевое покрытие признаков для coverage policy. |
+| `spectrum_stability_tolerance` | Порог изменения спектра для остановки gaussian spectrum-stability policy. |
+| `embedding_mode` | `sv_scaled` масштабирует left singular vectors на singular values перед кластеризацией. |
 | `view_size` | Сколько исходных признаков использовать в одном subsample-view. |
 | `projection_dim` | Размерность random projection внутри view. |
 | `initial_rank_fraction` | Начальный rank как доля от `min(n_samples, n_unfolding_features)`. Default: `0.25`. |
@@ -331,7 +441,9 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 | `_get_rmt_backend()` | Возвращает backend и проверяет, что он создан. |
 | `_build_fit_unfolding(X_num, rng)` | Строит mode-0 unfolding на train features. |
 | `_fit_spectral_basis(M)` | Вычисляет spectral basis и adaptive rank. |
-| `_fit_clusters_and_partitions(X_num, rng, progress)` | Строит KMeans clusters и partitions. |
+| `_fit_clusters_and_partitions(scores, target)` | Делегирует выбор labels фиксированному KMeans или `SpectralClusterSelector`, затем строит partitions. |
+| `_fit_auto_partition_clusters(embedding, target)` | Выбирает алгоритм и число clusters через auto-selection. |
+| `_partition_info_from_selection(result)` | Превращает результат `SpectralClusterSelector` в diagnostics-friendly `PartitionSelectionInfo`. |
 | `_build_diagnostics(M, rank_info)` | Сохраняет RMT diagnostics. |
 
 ### Математика: Random Views И Mode-0 Unfolding
@@ -347,6 +459,9 @@ M = [phi_1(X), phi_2(X), ..., phi_V(X)]
 | Метод | Назначение |
 |---|---|
 | `_make_view_specs(n_features, rng)` | Генерирует `ViewSpec` для каждого random view. |
+| `_resolve_n_views_policy()` | Выбирает `coverage` для `subsample` и `spectrum_stability` для `gaussian`, если `n_views_policy="auto"`. |
+| `_resolve_coverage_n_views(n_samples, n_features)` | Подбирает число views по целевому покрытию признаков и guardrail `max_unfolding_elements`. |
+| `_build_spectrum_stable_fit_unfolding(X_num, rng)` | Перебирает candidates `min_views, 2*min_views, ... max_views` и останавливается, когда относительное изменение спектра меньше tolerance. |
 | `_resolve_view_size(n_features)` | Выбирает размер view с учетом числа признаков. |
 | `_check_unfolding_size(n_samples, n_features)` | Guardrail по `max_unfolding_elements`. |
 | `_build_mode0_unfolding(X_num, view_specs)` | Делегирует backend-у построение unfolding. |
@@ -431,6 +546,39 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 ICML-style scientific figure, clean academic vector infographic, white background, muted blue-gray palette with one accent color, minimal typography, precise arrows, thin lines, labeled panels, no photorealism, no 3D glossy rendering, no decorative background, conference-paper figure aesthetics, mathematically clean, visually balanced. Leverage score chunk selection diagram: spectral embedding points grouped into clusters, row leverage intensity indicated by subtle accent color, selected points inside each cluster, comparison of all, leverage, maxvol, hybrid selection methods.
 ```
 
+## SpectralClusterSelector
+
+Файл: `sampling_zoo/core/sampling_strategies/spectral/cluster_selection.py`
+
+Назначение: отдельный collaborator для кластеризации spectral embedding. Он разгружает `RMTContractionTensorSampler`: sampler строит embedding и partitions, а selector отвечает за candidates, scoring, hard constraints и выбор лучшего разбиения.
+
+### Основные Методы
+
+| Метод | Назначение |
+|---|---|
+| `select(embedding, target=None)` | Публичный метод: строит candidates, выбирает лучший и возвращает `ClusterSelectionResult`. |
+| `_build_candidates(...)` | Перебирает алгоритмы и значения `k` с tqdm `Spectral cluster candidates`. |
+| `_fit_count_based_candidate(...)` | Обучает `kmeans`, `bisecting_kmeans` или `gmm` для заданного `k`. |
+| `_fit_hdbscan_candidate(...)` | Пытается построить HDBSCAN candidate, если доступен sklearn/external backend. |
+| `_score_components(...)` | Считает silhouette, imbalance ratio, tiny cluster mass, optional target contrast и validity flag. |
+| `_candidate_score(...)` | Для `balanced_silhouette` считает `silhouette - imbalance_penalty - tiny_cluster_penalty + target_bonus - hard_constraint_penalty`. |
+| `_select_by_weighted_vote(...)` | Агрегирует candidates по числу clusters через soft weights от score. |
+
+### Balanced Silhouette
+
+`balanced_silhouette` нужен потому, что чистый silhouette часто выбирает слишком малое число clusters и не штрафует практические проблемы chunk training. В score добавлены:
+
+- penalty за `max_cluster_imbalance_ratio`;
+- penalty за tiny clusters ниже `min_cluster_fraction`;
+- optional `target_contrast`, если хочется поощрять target-различимость clusters;
+- hard constraint penalty, если cluster candidate нарушает ограничения.
+
+### Text2Image Prompt: Cluster Selection
+
+```text
+ICML-style scientific figure, clean academic vector infographic, white background, muted blue-gray palette with one accent color, minimal typography, precise arrows, thin lines, labeled panels, no photorealism, no 3D glossy rendering, no decorative background, conference-paper figure aesthetics, mathematically clean, visually balanced. Spectral cluster selection figure: sv_scaled embedding enters four candidate algorithms kmeans, bisecting kmeans, Gaussian mixture, HDBSCAN; each candidate has silhouette, imbalance, tiny cluster penalty, target contrast; weighted vote selects final number of partitions and cluster labels.
+```
+
 ## MatrixRMTBackend И TensorRMTBackend
 
 Файлы:
@@ -484,6 +632,8 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 | `_build_minimal_budget_table(efficiency)` | Находит минимальный budget для thresholds delta. |
 | `_write_table(table, path)` | Записывает CSV. |
 
+Raw RMT table дополнительно вытаскивает RMT-specific поля: `view_strategy`, `n_views`, `n_views_policy`, adaptive rank diagnostics, partition selection diagnostics и routing refinement columns (`routing_refinement_status`, `routing_refinement_stop_reason`, `routing_refinement_best_iteration`, `routing_refinement_metric_improvement`, `routing_refinement_final_imbalance`).
+
 ### Text2Image Prompt: Report Builder
 
 ```text
@@ -508,3 +658,20 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 ICML-style scientific figure, clean academic vector infographic, white background, muted blue-gray palette with one accent color, minimal typography, precise arrows, thin lines, labeled panels, no photorealism, no 3D glossy rendering, no decorative background, conference-paper figure aesthetics, mathematically clean, visually balanced. Structured benchmark logging figure: fold execution emits metrics, timings, sample stats, extra diagnostics; logger writes event JSONL and metric snapshots; incremental saver consumes the same record for durable experiment-level state.
 ```
 
+## Benchmark Model Registry
+
+Файл: `examples/benchmark/benchmark_models.py`
+
+Назначение: строит model pool для benchmark-а и изолирует optional dependencies.
+
+### Важные Helpers
+
+| Helper | Назначение |
+|---|---|
+| `_load_torch_modules()` | Лениво импортирует torch/nn/optim и кеширует результат через `_TORCH_IMPORT_ATTEMPTED`. |
+| `_load_tabpfn_classes()` | Лениво импортирует `TabPFNClassifier`, `TabPFNRegressor`, `ModelVersion`; отсутствие пакета не ломает import module. |
+| `_load_tabicl_classes()` | Лениво импортирует TabICL classes. |
+| `_resolve_tabpfn_device()` | Выбирает `cuda`, если активный torch backend видит CUDA, иначе `cpu`, с env override `TABPFN_DEVICE`. |
+| `_make_tabpfn_kwargs(...)` | Передает TabPFN `device`, `random_state`, `n_estimators`; на CPU включает `ignore_pretraining_limits` только при явном env override. |
+
+Правило: optional heavy packages нельзя импортировать на верхнем уровне benchmark module. Это особенно важно для окружений, где torch CUDA версия подбиралась вручную под конкретную GPU.

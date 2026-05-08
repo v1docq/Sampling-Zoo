@@ -12,11 +12,14 @@
 а RMT-семплер не должен знать про OpenML, модели, отчеты. Система разделена на несколько уровней:
 
 - entrypoint: собирает конфигурацию запуска;
-- orchestrator: задает порядок этапов эксперимента;
+- orchestrator: задает порядок этапов эксперимента через `ExperimentPlan`;
+- experiment contracts/morphisms: нормализуют raw configs и runtime objects в типизированные контракты;
 - benchmark runner: разворачивает сетку `dataset x model x strategy`;
 - fold executor: отвечает за split, fold-level запуск и выбор direct/ensemble режима;
 - ensemble: строит partitions, обучает модель на каждом chunk и агрегирует прогнозы;
 - sampler: строит chunks;
+- cluster selector: выбирает алгоритм кластеризации и число partitions для spectral embedding;
+- router/refiner: строит row-wise routing weights и, если явно включено, EM-переобучает chunk-модели;
 - spectral backend: выполняет вычилсения для оценки спектра;
 - logger/saver/report builder: фиксируют результаты инкрементально и собирают отчеты.
 
@@ -24,14 +27,17 @@
 flowchart TD
     A["run_rmt_contraction_regression_experiment"] --> B["RMTRegressionExperimentConfig"]
     B --> C["RMTRegressionExperimentOrchestrator.run"]
+    C --> C1["ExperimentPlan: typed stage sequence"]
+    C1 --> C2["Stage contracts + morphisms"]
     C --> D["BenchmarkLogger"]
     C --> E["IncrementalExperimentSaver"]
-    C --> F["RawDatasetBundle loaders"]
+    C --> F["RawDatasetBundle loaders + OpenML tqdm"]
     C --> G["make_rmt_experiment_strategy_configs"]
+    G --> G1["StrategyGridContract"]
     C --> H["EnsembleChunkBenchmarkRunner"]
 
     H --> I["model loop"]
-    I --> J["strategy loop"]
+    I --> J["strategy loop from StrategyGridContract"]
     J --> K["EnsembleFoldBenchmarkExecutor"]
 
     K --> L{"execution plan"}
@@ -43,9 +49,12 @@ flowchart TD
     P --> Q["BaseSampler preprocessing"]
     P --> R["MatrixRMTBackend or TensorRMTBackend"]
     R --> S["mode-0 unfolding, randomized SVD, leverage, routing"]
-    P --> T["partitions + diagnostics"]
+    P --> C3["SpectralClusterSelector"]
+    C3 --> T["partitions + diagnostics"]
     N --> U["chunk model training"]
-    N --> V["voting / weighted / routed_weighted inference"]
+    N --> V1["RoutedWeightedRouter"]
+    V1 --> V2["optional RoutedEMModelRefiner"]
+    V2 --> V["voting / weighted / routed_weighted inference"]
 
     M --> W["BenchmarkLogger.log_strategy_run"]
     V --> W
@@ -66,18 +75,21 @@ flowchart TD
 output directory, row cap, progress flags.
 
 `RMTRegressionExperimentOrchestrator.run()` является публичным pipeline-методом. 
-Он не должен содержать длинную бизнес-логику внутри себя. Его роль - вызвать последовательность внутренних операций:
+Он не должен содержать длинную бизнес-логику внутри себя. Сейчас он сначала строит `ExperimentPlan`, 
+а затем `_execute_experiment_plan(plan)` вызывает stage handlers в фиксированном порядке:
 
-1. `_prepare_runtime()`
-2. `_create_logger()`
-3. `_create_incremental_recorder(logger)`
-4. `_create_runner(logger)`
-5. `_load_datasets()`
-6. `_build_strategy_configs()`
+1. `_build_experiment_plan()`
+2. `_prepare_runtime()`
+3. `_create_logger()`
+4. `_create_runner(logger)`; внутри создается incremental recorder/saver.
+5. `_load_datasets()`; OpenML discovery и cap/wrapping отслеживаются через `tqdm`.
+6. `_build_strategy_grid()`; raw strategy configs нормализуются в `StrategyGridContract`.
 7. `_run_experiment(...)`
 8. `_build_report_artifacts(...)`
 9. `_write_run_metadata(...)`
 10. `_announce_completion(logger)`
+
+`ExperimentPlan` и `StrategyGridContract` нужны не ради формальности: они фиксируют порядок стадий и превращают raw dict configs в типизированный boundary. Legacy dict обратно материализуется только на границе `SamplingEnsemble`/factory, где старые стратегии всё еще ожидают kwargs.
 
 Если во время запуска падает отдельный fold, `EnsembleFoldBenchmarkExecutor` записывает failed-record 
 и возвращает управление runner-у.
@@ -107,12 +119,16 @@ dataset, model, strategy. Все, что связано с folds, split, train/v
 
 | Компонент | Чем владеет | Чем не владеет |
 |---|---|---|
-| `RMTRegressionExperimentOrchestrator` | Порядок этапов benchmark run, создание logger/saver/runner, загрузка datasets, сборка strategy configs, финальные artifacts | Fold-level split, обучение chunk-моделей, RMT-математика |
-| `EnsembleChunkBenchmarkRunner` | Итерация по моделям и стратегиям для одного dataset, передача records в saver | Детали partitioning, routing, SVD, OpenML preprocessing |
+| `RMTRegressionExperimentOrchestrator` | `ExperimentPlan`, порядок этапов benchmark run, создание logger/saver/runner, загрузка datasets, сборка `StrategyGridContract`, финальные artifacts | Fold-level split, обучение chunk-моделей, RMT-математика |
+| `sampling_zoo.core.experiment.contracts/morphisms` | Immutable contracts, raw config -> typed spec -> materialized kwargs, dataset/fold/partition/evaluation snapshots | Effectful IO, обучение моделей, SVD |
+| `EnsembleChunkBenchmarkRunner` | Итерация по моделям и стратегиям для одного dataset, нормализация strategy grid, передача records в saver | Детали partitioning, routing, SVD, OpenML preprocessing |
 | `EnsembleFoldBenchmarkExecutor` | Fold split, train/validation split, direct/ensemble plan, fold-level execution | Сохранение итоговых таблиц, численные backend kernels |
 | `SamplingEnsemble` | Создание partitioner, применение budget policy, обучение chunk-моделей, ensemble inference | Загрузка OpenML tasks, построение benchmark report |
 | `RMTContractionTensorSampler` | Оркестрация RMT chunking: preprocessing, random views, unfolding, spectral basis, cluster partitions, diagnostics | Обучение прогнозных моделей, CSV/JSON reports |
-| `MatrixRMTBackend` / `TensorRMTBackend` | Численные kernels: unfolding, randomized SVD, projection, routing distances | Strategy configs, KMeans partitions, model training |
+| `SpectralClusterSelector` | Генерация cluster candidates, balanced silhouette score, hard constraints, weighted vote по кандидатам | SVD, обучение chunk-моделей |
+| `RoutedWeightedRouter` | Spectral routing, learned/constrained router heads, routing diagnostics | Формирование partitions, переобучение chunk-моделей |
+| `RoutedEMModelRefiner` | Optional EM-style routed retraining для `routed_weighted` | Default routing; активируется только через `routing_refinement="em_retraining"` |
+| `MatrixRMTBackend` / `TensorRMTBackend` | Численные kernels: unfolding, randomized SVD, projection, routing distances | Strategy configs, cluster partitions, model training |
 | `BenchmarkLogger` | Структурное логирование run records и metrics snapshots | Решение, какие эксперименты запускать |
 | `IncrementalExperimentSaver` | Durable JSONL append, snapshot rebuild, run metadata status | Метрики моделей, математика sampler-а |
 | `RMTReportTableBuilder` | Производные таблицы по records: raw runs, efficiency curve, minimal budget | Запуск эксперимента |
@@ -147,31 +163,38 @@ sequenceDiagram
 
 1. `SamplingEnsemble.prepare_data_partitions(...)` создает `RMTContractionTensorSampler`.
 2. Sampler выполняет tabular preprocessing через `BaseSampler`.
-3. Sampler генерирует random views (`ViewSpec`) и строит mode-0 unfolding.
-4. Backend считает randomized SVD до initial rank.
-5. Sampler выбирает selected rank по explained variance.
-6. Sampler строит sample embedding, KMeans clusters и partitions.
-7. `SamplingEnsemble.train_partition_models(...)` обучает отдельную модель на каждом partition.
-8. `SamplingEnsemble.ensemble_predict(...)` объединяет predictions через `voting`, `weighted` или `routed_weighted`.
+3. Sampler автоматически выбирает `n_views`: coverage policy для `subsample`, spectrum-stability policy для `gaussian`.
+4. Sampler генерирует random views (`ViewSpec`) и строит mode-0 unfolding.
+5. Backend считает randomized SVD до initial rank.
+6. Sampler выбирает selected rank по explained variance.
+7. Sampler строит sample embedding (`embedding_mode="sv_scaled"` по умолчанию).
+8. `SpectralClusterSelector` выбирает cluster candidates: `kmeans`, `bisecting_kmeans`, `gmm`, optional `hdbscan`.
+9. Partitions формируются по лучшему кандидату или weighted vote, затем применяется `budget_ratio`.
+10. `SamplingEnsemble.train_partition_models(...)` обучает отдельную модель на каждом partition.
+11. `RoutedWeightedRouter` строит spectral или явно выбранный learned/constrained router.
+12. Если `routing_refinement="em_retraining"`, `RoutedEMModelRefiner` пробует EM-переобучение chunk-моделей и оставляет лучший validation snapshot.
+13. `SamplingEnsemble.ensemble_predict(...)` объединяет predictions через `voting`, `weighted` или `routed_weighted`.
 
 ```mermaid
 flowchart LR
     X["tabular X"] --> PP["BaseSampler preprocessing"]
-    PP --> RV["random views"]
+    PP --> RV["auto n_views + random views"]
     RV --> M["mode-0 unfolding M"]
     M --> SVD["backend randomized SVD"]
     SVD --> Rank["adaptive rank selection"]
-    Rank --> Emb["sample embedding"]
-    Emb --> KM["KMeans clusters"]
-    KM --> Part["partitions"]
+    Rank --> Emb["sv_scaled sample embedding"]
+    Emb --> Sel["SpectralClusterSelector"]
+    Sel --> Part["partitions"]
     Part --> Models["chunk models"]
-    Models --> Pred["ensemble prediction"]
+    Models --> Router["RoutedWeightedRouter"]
+    Router --> EM["optional EM retraining"]
+    EM --> Pred["ensemble prediction"]
 ```
 
 ### RMT Sampler Pipeline
 
 ```text
-ICML-style scientific figure, clean academic vector infographic, white background, muted blue-gray palette with one accent color, minimal typography, precise arrows, thin lines, labeled panels, no photorealism, no 3D glossy rendering, no decorative background, conference-paper figure aesthetics, mathematically clean, visually balanced. RMT sampler pipeline: tabular preprocessing, random feature contractions, mode-0 unfolding matrix, randomized SVD spectrum, adaptive rank selection, leverage scores, KMeans chunks, routed ensemble weights. Use labeled mathematical panels.
+ICML-style scientific figure, clean academic vector infographic, white background, muted blue-gray palette with one accent color, minimal typography, precise arrows, thin lines, labeled panels, no photorealism, no 3D glossy rendering, no decorative background, conference-paper figure aesthetics, mathematically clean, visually balanced. RMT sampler pipeline: tabular preprocessing, automatic n_views policy, random feature contractions, mode-0 unfolding matrix, randomized SVD spectrum, adaptive rank selection, sv_scaled embedding, spectral cluster selector, leverage scores, routed ensemble weights, optional EM routed retraining. Use labeled mathematical panels.
 ```
 
 ## Где Расширять Систему
@@ -181,7 +204,7 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 1. Создать или переиспользовать sampler class в `sampling_zoo/core/sampling_strategies`.
 2. Если sampler spectral/tensor-based, вынести численные операции в `sampling_zoo/core/sampling_strategies/spectral/backend`.
 3. Зарегистрировать strategy в factory, который использует `SamplingEnsemble._create_partitioner`.
-4. Добавить config в `make_rmt_experiment_strategy_configs` или отдельную benchmark config factory.
+4. Добавить config в `make_rmt_experiment_strategy_configs` или отдельную benchmark config factory и нормализовать его через `StrategyGridContract`.
 5. Добавить tests на instantiation через `SamplingEnsemble` и smoke-run через runner.
 
 Чтобы добавить новую модель:
@@ -189,7 +212,8 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 1. Добавить builder в benchmark model registry.
 2. Убедиться, что модель поддерживает нужный `problem_type`.
 3. Для GPU-sensitive моделей использовать helper, который выбирает device через torch/CUDA и поддерживает env override.
-4. Добавить небольшой test на kwargs builder и model key.
+4. Optional model packages (`tabpfn`, `tabicl`) и torch должны импортироваться лениво: import benchmark module не должен падать или зависать только потому, что конкретная модель не используется.
+5. Добавить небольшой test на kwargs builder и model key.
 
 Чтобы добавить новую таблицу отчета:
 
@@ -202,4 +226,3 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 ```text
 ICML-style scientific figure, clean academic vector infographic, white background, muted blue-gray palette with one accent color, minimal typography, precise arrows, thin lines, labeled panels, no photorealism, no 3D glossy rendering, no decorative background, conference-paper figure aesthetics, mathematically clean, visually balanced. Extension point map for a benchmark codebase: add sampler, add model, add report table, add dataset source. Show each extension entering through a narrow public interface and reusing the existing runner and saver.
 ```
-

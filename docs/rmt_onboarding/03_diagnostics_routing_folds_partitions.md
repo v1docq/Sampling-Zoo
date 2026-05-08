@@ -22,7 +22,7 @@ examples/benchmark/results/run_rmt_contraction_regression_<timestamp>/
 | `rmt_raw_runs.csv` | RMT-focused raw table. |
 | `sample_efficiency_curve.csv` | Кривая sample efficiency по budget ratios. |
 | `minimal_effective_budget.csv` | Минимальный budget ratio для delta thresholds. |
-| `run_meta.json` | Metadata запуска: config, counts, status, timestamps. |
+| `run_meta.json` | Metadata запуска: config, counts, status, timestamps, `experiment_plan`. |
 | `report.md` | Markdown summary report. |
 | `incremental_saver_errors.jsonl` | Ошибки snapshot hooks или saver-а, если они возникли. |
 
@@ -46,7 +46,9 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 | sample stats | Размер train, sample size, coverage ratio, chunk count, chunk sizes, target stats. |
 | execution extra | `effective_partitions`, `chunks_percent`, `force_chunking`, `mode`, error payload. |
 | sampler diagnostics | RMT-specific diagnostics из `RMTContractionTensorSampler.diagnostics_`. |
+| contract snapshots | Dataset/fold/evaluation/partition/routing contracts, если record был создан через typed boundary. |
 | budget policy | Как `budget_ratio` изменил partitions после sampler-а. |
+| routing refinement | Optional EM retraining diagnostics: status, best iteration, improvement, stop reason, final imbalance. |
 
 ### Text2Image Prompt: Run Record Schema
 
@@ -63,12 +65,20 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 | `backend` | Фактически выбранный backend: `torch` или `numpy`. |
 | `device` | Device tensor backend-а, например `cuda` или `cpu`. |
 | `dtype` | Численный dtype. |
-| `unfolding_shape` | Размер mode-0 unfolding matrix. Большая ширина увеличивает память и SVD cost. |
-| `raw_feature_count` | Число исходных признаков. |
+| `mode0_unfolding_shape` | Размер mode-0 unfolding matrix. Большая ширина увеличивает память и SVD cost. |
+| `raw_encoded_feature_count` | Число признаков после preprocessing до feature cap. |
 | `encoded_feature_count` | Число признаков после preprocessing и one-hot. |
-| `feature_cap_applied` | Был ли применен cap до densify. |
+| `encoded_feature_cap_applied` | Был ли применен cap до densify. |
 | `n_views` | Число random contractions. |
+| `n_views_requested` | Исходное значение `n_views`, например `"auto"` или integer. |
+| `n_views_policy` | `static`, `coverage` или `spectrum_stability`. |
+| `target_feature_coverage` | Цель coverage policy для `subsample`. |
+| `estimated_feature_coverage` | Оцененное покрытие признаков выбранным числом views. |
+| `spectrum_stability_tolerance` | Порог остановки spectrum-stability policy для `gaussian`. |
+| `spectrum_stability_change` | Фактическое относительное изменение спектра на выбранном candidate. |
+| `spectrum_stability_candidates` | Проверенные значения `n_views`. |
 | `view_strategy` | `subsample` или `gaussian`. |
+| `embedding_mode` | Например `sv_scaled`, если embedding перед кластеризацией масштабируется singular values. |
 | `initial_rank` | Rank, рассчитанный как доля от размерности unfolding. |
 | `selected_rank` | Итоговый rank после explained variance selection. |
 | `rank_selection_method` | Сейчас основной метод: `explained_variance`. |
@@ -77,15 +87,27 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 | `singular_values` | Сингулярные значения до/после truncation, полезны для анализа spectral decay. |
 | `leverage_entropy` | Энтропия распределения leverage scores. Низкая энтропия означает концентрацию leverage на малом числе точек. |
 | `effective_sample_count` | Эффективное число точек по leverage distribution. |
-| `partition_count` | Число построенных partitions. |
+| `n_partitions_requested` | Запрошенное число partitions. |
+| `selected_n_partitions` | Выбранное число partitions при `partition_selection_method="auto"`. |
+| `partition_selection_method` | `fixed` или `auto`. |
+| `selected_cluster_algorithm` | Алгоритм, выбранный `SpectralClusterSelector`, если auto-selection включен. |
+| `cluster_algorithms` | Список алгоритмов-кандидатов. |
+| `cluster_selection_metric` | `silhouette` или `balanced_silhouette`. |
+| `cluster_ensemble_method` | `best_score` или `weighted_vote`. |
+| `partition_selection_scores` | Scores по кандидатам `k`. |
+| `partition_selection_candidate_details` | Подробности candidates: algorithm, score, valid flag, components. |
+| `partition_count` / `n_partitions` | Число построенных partitions. |
 | `chunk_sizes` | Размеры chunks после selection/filtering. |
 
 ### Как Читать Диагностику
 
 - Если `selected_rank` близок к `initial_rank`, спектр убывает медленно: пространство может быть сложным или threshold слишком высоким.
+- Если `n_views_policy="coverage"`, проверяйте `estimated_feature_coverage`: низкое значение означает, что subsample-views не покрыли признаки достаточно широко.
+- Если `n_views_policy="spectrum_stability"`, смотрите `spectrum_stability_change`: большое значение означает, что спектр еще нестабилен относительно числа views.
 - Если `leverage_entropy` очень низкая, sampler нашел небольшое число spectral-influential объектов. Это может быть полезно, но стоит проверить стабильность chunks.
-- Если `chunk_sizes` сильно несбалансированы, KMeans в embedding может разделять данные на плотное ядро и редкие regions.
-- Если `feature_cap_applied=True`, downstream качество надо интерпретировать с учетом потери части one-hot признаков.
+- Если `chunk_sizes` сильно несбалансированы, выбранный clustering candidate может разделять данные на плотное ядро и редкие regions.
+- Если `selected_n_partitions` сильно меньше `n_partitions_requested`, auto-selection решила, что дополнительные clusters ухудшают balanced objective или нарушают constraints.
+- Если `encoded_feature_cap_applied=True`, downstream качество надо интерпретировать с учетом потери части one-hot признаков.
 
 ### Text2Image Prompt: RMT Diagnostics
 
@@ -124,11 +146,14 @@ flowchart LR
 Для `RMTContractionTensorSampler` partitions строятся так:
 
 1. tabular features переводятся в dense numeric matrix;
-2. random views строят mode-0 unfolding;
-3. randomized SVD дает spectral embedding;
-4. KMeans делит embedding на `n_partitions` clusters;
-5. внутри каждого cluster выбираются строки по `selection_method`;
-6. partitions получают имена `chunk_0`, `chunk_1`, ...
+2. при `n_views="auto"` выбирается число random views: coverage для `subsample`, spectrum-stability для `gaussian`;
+3. random views строят mode-0 unfolding;
+4. randomized SVD дает spectral embedding;
+5. `embedding_mode="sv_scaled"` масштабирует `U` на `S`, чтобы clustering видел не только направление, но и spectral energy;
+6. если `partition_selection_method="fixed"`, KMeans делит embedding на `n_partitions` clusters;
+7. если `partition_selection_method="auto"`, `SpectralClusterSelector` сравнивает `kmeans`, `bisecting_kmeans`, `gmm`, optional `hdbscan` и выбирает partitions по `balanced_silhouette`/`weighted_vote`;
+8. внутри каждого cluster выбираются строки по `selection_method`;
+9. partitions получают имена `chunk_0`, `chunk_1`, ...
 
 Выбор внутри cluster:
 
@@ -152,7 +177,7 @@ target_total_rows = round(budget_ratio * train_size)
 ### Text2Image Prompt: Partition Formation
 
 ```text
-ICML-style scientific figure, clean academic vector infographic, white background, muted blue-gray palette with one accent color, minimal typography, precise arrows, thin lines, labeled panels, no photorealism, no 3D glossy rendering, no decorative background, conference-paper figure aesthetics, mathematically clean, visually balanced. Partition formation figure: strategy config creates sampler, sampler fits spectral embedding, KMeans creates clusters, selection method picks rows per cluster, budget_ratio trims total rows proportionally, final chunks feed model training.
+ICML-style scientific figure, clean academic vector infographic, white background, muted blue-gray palette with one accent color, minimal typography, precise arrows, thin lines, labeled panels, no photorealism, no 3D glossy rendering, no decorative background, conference-paper figure aesthetics, mathematically clean, visually balanced. Partition formation figure: strategy config creates sampler, sampler fits sv_scaled spectral embedding, spectral cluster selector compares kmeans, bisecting kmeans, GMM and HDBSCAN candidates, balanced silhouette chooses partitions, selection method picks rows per cluster, budget_ratio trims total rows proportionally, final chunks feed model training.
 ```
 
 ## Разбиение На Folds
@@ -252,6 +277,62 @@ y_hat(x) = sum_k w_k(x) f_k(x)
 
 Это делает `routed_weighted` безопасным для non-routing samplers, хотя максимальный смысл он имеет для `RMTContractionTensorSampler`.
 
+### Routed Router Modes
+
+`RoutedWeightedRouter` отделяет routing-логику от `SamplingEnsemble`.
+
+| Режим | Что делает |
+|---|---|
+| `spectral` | Default. Использует probabilities из sampler-а, обычно `RMTContractionTensorSampler.predict_partition_proba`. |
+| `learned_head` | Legacy head, обучаемый на base routing features. Оставлен для сравнения и совместимости. |
+| `constrained_gating` | Torch gating head, обучаемый на validation predictions с KL regularization к spectral prior и balance penalty. |
+
+Для `constrained_gating` torch импортируется лениво, поэтому окружение без torch может импортировать benchmark код, но сам режим будет skipped или fallback-иться при отсутствии backend-а.
+
+### Routing Diagnostics
+
+В `validation_diagnostics.routing` и `test_routing_diagnostics` фиксируются:
+
+| Поле | Интерпретация |
+|---|---|
+| `n_rows`, `n_models` | Сколько строк и активных chunk-моделей участвовало в routing. |
+| `router_mode`, `router_head_status` | Какой router использовался и был ли он обучен/skipped. |
+| `mean_max_probability`, `median_max_probability` | Уверенность router-а. Слишком высокие значения могут означать hard routing. |
+| `mean_entropy`, `mean_normalized_entropy` | Неопределенность routing distribution. |
+| `hard_assignment_counts` | Сколько строк ушло в каждый chunk по argmax. |
+| `soft_assignment_mass` | Суммарная probability mass по chunks. |
+
+## EM Routed Retraining
+
+`routing_refinement="em_retraining"` - отдельный opt-in режим для `routed_weighted`. Он нужен, когда хочется не только смешивать уже обученные chunk-модели, но и переобучить их под фактические routed assignments.
+
+Алгоритм:
+
+1. E-step: на train pool считаются текущие routing probabilities.
+2. Assignment: probabilities переводятся в hard top-1 assignments.
+3. Guardrail: если routed partition меньше `em_min_partition_size`, итерация не принимается.
+4. M-step: каждая chunk-модель переобучается на назначенном routed partition.
+5. Router refresh: если `em_refit_router=True`, обновляется learned/constrained router и local validation metrics.
+6. Acceptance: итерация принимается только если validation metric улучшилась не меньше `em_min_improvement`.
+7. Restore: если `em_keep_best=True`, состояние ensemble возвращается к лучшему validation snapshot.
+
+Diagnostics пишутся в `validation_diagnostics.routing_refinement`:
+
+| Поле | Интерпретация |
+|---|---|
+| `status` | `disabled`, `skipped` или `completed`. |
+| `initial_metric`, `best_metric`, `metric_improvement` | Validation metric до/после refinement. |
+| `best_iteration` | Индекс лучшей EM-итерации; `0` означает, что лучше исходного состояния не стало. |
+| `stop_reason` | `max_iterations`, `no_improvement`, `min_partition_size` или skipped reason. |
+| `iterations` | Per-iteration metric, improvement, assignment-change rate, entropy before/after, imbalance. |
+| `final_partition_sizes`, `final_imbalance_ratio` | Итоговые routed partition sizes и imbalance. |
+
+### Text2Image Prompt: EM Routed Retraining
+
+```text
+ICML-style scientific figure, clean academic vector infographic, white background, muted blue-gray palette with one accent color, minimal typography, precise arrows, thin lines, labeled panels, no photorealism, no 3D glossy rendering, no decorative background, conference-paper figure aesthetics, mathematically clean, visually balanced. EM routed retraining diagnostics figure: spectral router responsibilities, hard top-1 assignment, min partition size guardrail, model refit, router refresh, validation accept or restore best, diagnostics table with improvement, entropy before and after, assignment change, imbalance.
+```
+
 ### Text2Image Prompt: Routing Weights
 
 ```text
@@ -267,7 +348,7 @@ M_new = [phi_1(X_new), ..., phi_V(X_new)]
 Z_new = M_new V_r S_r^{-1}
 ```
 
-где `V_r` и `S_r` взяты из train SVD. Далее считаются расстояния до active centroids:
+где `V_r` и `S_r` взяты из train SVD. Если sampler обучался с `embedding_mode="sv_scaled"`, train centroids построены в пространстве `U_r S_r`, а projection новых rows должен быть приведен к тому же embedding convention внутри backend/sampler path. Далее считаются расстояния до active centroids:
 
 ```text
 d_c(x)^2 = ||Z_new(x) - mu_c||_2^2
@@ -311,6 +392,8 @@ rmse_drop = (rmse - rmse_ref) / rmse_ref
 
 Для thresholds `delta = 1%, 3%, 5%` выбирается минимальный `budget_ratio`, который удерживает качество в допустимой зоне относительно baseline. Это отвечает на главный практический вопрос: какую долю train data нужно оставить, чтобы получить почти такое же качество.
 
+В текущих RMT таблицах также сохраняются axes/diagnostics, важные для анализа причин качества: `view_strategy`, `n_views`, `n_views_policy`, `selected_rank`, `selected_n_partitions`, `selected_cluster_algorithm`, routing refinement status/improvement/final imbalance.
+
 ### Text2Image Prompt: Sample Efficiency
 
 ```text
@@ -331,10 +414,13 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 - каждый completed fold создает incremental JSONL record;
 - failed fold возвращает structured failed record и не прерывает весь dataset run;
 - report tables умеют собираться из одного record и из пустого набора records.
+- `normalize_strategy_grid(...)` детерминирован и idempotent для legacy dict configs;
+- `ExperimentPlan.stage_ids()` для RMT runners стабилен;
+- lazy optional imports (`torch`, `tabpfn`, `tabicl`) не должны ломать import benchmark modules;
+- `routing_refinement="em_retraining"` сохраняет или улучшает validation metric за счет best snapshot restore.
 
 ### Text2Image Prompt: Test Invariants
 
 ```text
 ICML-style scientific figure, clean academic vector infographic, white background, muted blue-gray palette with one accent color, minimal typography, precise arrows, thin lines, labeled panels, no photorealism, no 3D glossy rendering, no decorative background, conference-paper figure aesthetics, mathematically clean, visually balanced. Test invariant checklist figure for RMT benchmark: routing probabilities sum to one, selected rank bounded by initial rank, budget policy preserves nonempty chunks, incremental record saved per fold, report tables rebuild after each record.
 ```
-
