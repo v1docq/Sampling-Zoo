@@ -239,6 +239,7 @@ class RoutedEMModelRefiner:
                 {"feature": X_part, "target": y_part},
                 metrics,
                 val_pred,
+                val_proba,
             )
             new_models.append(model_info)
             new_metrics[name] = metrics

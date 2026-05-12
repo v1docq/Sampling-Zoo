@@ -21,6 +21,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from sampling_zoo.core.metrics.eval_metrics import calculate_metrics
 from sampling_zoo.core.experiment.contracts import StrategyGridContract
+from sampling_zoo.core.experiment.errors import ClassificationProbabilitiesRequiredError
 from sampling_zoo.core.experiment.morphisms import (
     dataset_to_contract,
     evaluation_to_contract,
@@ -218,76 +219,13 @@ def _collect_metrics(
     y_proba: Optional[np.ndarray],
     model_classes: Optional[Sequence[Any]] = None,
 ) -> Dict[str, float]:
-    metrics = {
-        "accuracy": float(accuracy_score(y_true, y_pred)),
-        "f1_macro": float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
-        "f1_weighted": float(f1_score(y_true, y_pred, average="weighted", zero_division=0)),
-        "precision_macro": float(precision_score(y_true, y_pred, average="macro", zero_division=0)),
-        "recall_macro": float(recall_score(y_true, y_pred, average="macro", zero_division=0)),
-    }
-
-    if y_proba is None:
-        metrics["roc_auc"] = float("nan")
-        metrics["log_loss"] = float("nan")
-        return metrics
-
-    classes_true = np.unique(y_true)
-    try:
-        if len(classes_true) == 2:
-            if y_proba.ndim == 2 and y_proba.shape[1] > 1:
-                if model_classes is not None:
-                    classes_arr = np.asarray(model_classes)
-                    positive_class = classes_true[-1]
-                    pos_idx = np.where(classes_arr == positive_class)[0]
-                    if pos_idx.size == 1:
-                        metrics["roc_auc"] = float(roc_auc_score(y_true, y_proba[:, int(pos_idx[0])]))
-                        metrics["log_loss"] = float(log_loss(y_true, y_proba))
-                    else:
-                        metrics["roc_auc"] = float("nan")
-                        metrics["log_loss"] = float("nan")
-                else:
-                    metrics["roc_auc"] = float(roc_auc_score(y_true, y_proba[:, -1]))
-                    metrics["log_loss"] = float(log_loss(y_true, y_proba))
-            else:
-                metrics["roc_auc"] = float("nan")
-                metrics["log_loss"] = float("nan")
-            return metrics
-
-        if model_classes is None:
-            metrics["roc_auc"] = float("nan")
-            metrics["log_loss"] = float("nan")
-            return metrics
-
-        classes_arr = np.asarray(model_classes)
-        missing_classes = [cls for cls in classes_true.tolist() if cls not in set(classes_arr.tolist())]
-        if missing_classes:
-            metrics["roc_auc"] = float("nan")
-            metrics["log_loss"] = float("nan")
-            return metrics
-
-        target_classes = np.sort(classes_true)
-        target_indices = [int(np.where(classes_arr == cls)[0][0]) for cls in target_classes]
-        y_proba_selected = y_proba[:, target_indices]
-
-        row_sums = y_proba_selected.sum(axis=1, keepdims=True)
-        safe_row_sums = np.where(row_sums > 0, row_sums, 1.0)
-        y_proba_selected = y_proba_selected / safe_row_sums
-
-        metrics["roc_auc"] = float(
-            roc_auc_score(
-                y_true,
-                y_proba_selected,
-                labels=target_classes,
-                multi_class="ovr",
-                average="macro",
-            )
-        )
-        metrics["log_loss"] = float(log_loss(y_true, y_proba_selected, labels=target_classes))
-    except ValueError:
-        metrics["roc_auc"] = float("nan")
-        metrics["log_loss"] = float("nan")
-
-    return metrics
+    return calculate_metrics(
+        y_true=y_true,
+        y_labels=y_pred,
+        y_proba=y_proba,
+        problem_type="classification",
+        classes=model_classes,
+    )
 
 
 
@@ -632,6 +570,7 @@ class EnsembleFoldBenchmarkExecutor:
             y_labels=predictions,
             y_proba=y_proba if dataset.problem_type == "classification" else None,
             problem_type=dataset.problem_type,
+            classes=getattr(model, "classes_", None) if dataset.problem_type == "classification" else None,
         )
         sample_stats = self._build_train_sample_stats(
             y_train=fold.y_train,
@@ -660,12 +599,26 @@ class EnsembleFoldBenchmarkExecutor:
         if problem_type != "classification":
             return model.predict(X_test_df), None
 
-        y_proba = model.predict_proba(X_test_df) if hasattr(model, "predict_proba") else None
-        if y_proba is not None and getattr(y_proba, "ndim", 0) == 2 and y_proba.shape[1] > 0:
-            classes = np.asarray(getattr(model, "classes_", np.arange(y_proba.shape[1])))
-            if classes.shape[0] == y_proba.shape[1]:
-                return classes[np.argmax(y_proba, axis=1)], y_proba
-        return model.predict(X_test_df), y_proba
+        if not hasattr(model, "predict_proba"):
+            raise ClassificationProbabilitiesRequiredError(
+                scope="EnsembleFoldBenchmarkExecutor.direct_model",
+                details={"model": type(model).__name__},
+            )
+        y_proba = np.asarray(model.predict_proba(X_test_df), dtype=float)
+        if y_proba.ndim != 2 or y_proba.shape[1] == 0:
+            raise ClassificationProbabilitiesRequiredError(
+                scope="EnsembleFoldBenchmarkExecutor.direct_model",
+                message="classification_probabilities_required: predict_proba returned an invalid matrix.",
+                details={"shape": tuple(y_proba.shape)},
+            )
+        classes = np.asarray(getattr(model, "classes_", np.arange(y_proba.shape[1])))
+        if classes.shape[0] != y_proba.shape[1]:
+            raise ClassificationProbabilitiesRequiredError(
+                scope="EnsembleFoldBenchmarkExecutor.direct_model",
+                message="classification_probabilities_required: classes_ length does not match probability columns.",
+                details={"n_classes": int(classes.shape[0]), "probability_columns": int(y_proba.shape[1])},
+            )
+        return classes[np.argmax(y_proba, axis=1)], y_proba
 
     def _run_ensemble_fold(
         self,
@@ -702,7 +655,7 @@ class EnsembleFoldBenchmarkExecutor:
             y_val=fold.y_val,
             class_samples=class_samples,
             cv_fold=fold.fold_idx,
-            validation_metric="f1_weighted" if dataset.problem_type == "classification" else "rmse",
+            validation_metric=self._primary_validation_metric(dataset.problem_type, fold.y_train),
             train_all_chunks=True,
             save_models_to_disk=False,
         )
@@ -710,7 +663,12 @@ class EnsembleFoldBenchmarkExecutor:
         fold_stage.update(1)
 
         infer_started = perf_counter()
-        predictions = ensemble.ensemble_predict_batch(X_test_df, batch_size=10000)
+        if dataset.problem_type == "classification":
+            y_proba = ensemble.ensemble_predict_proba_batch(X_test_df, batch_size=10000)
+            predictions = ensemble._labels_from_proba(y_proba)
+        else:
+            y_proba = None
+            predictions = ensemble.ensemble_predict_batch(X_test_df, batch_size=10000)
         infer_time = perf_counter() - infer_started
         test_routing_diagnostics = ensemble.build_routing_diagnostics(X_test_df)
         fold_stage.update(1)
@@ -718,8 +676,9 @@ class EnsembleFoldBenchmarkExecutor:
         model_metrics = calculate_metrics(
             y_true=fold.y_test,
             y_labels=predictions,
-            y_proba=None,
+            y_proba=y_proba if dataset.problem_type == "classification" else None,
             problem_type=dataset.problem_type,
+            classes=getattr(ensemble, "classes_", None) if dataset.problem_type == "classification" else None,
         )
         sample_stats, chunk_sizes = self._build_ensemble_sample_stats(
             ensemble=ensemble,
@@ -750,6 +709,12 @@ class EnsembleFoldBenchmarkExecutor:
         tuned_partitioner_config["n_partitions"] = plan.effective_partitions
         tuned_partitioner_config["chunks_percent"] = plan.chunks_percent
         return tuned_partitioner_config
+
+    @staticmethod
+    def _primary_validation_metric(problem_type: str, y_train: Any) -> str:
+        if problem_type != "classification":
+            return "rmse"
+        return "roc_auc" if np.unique(np.asarray(y_train)).shape[0] == 2 else "log_loss"
 
     @staticmethod
     def _class_representatives(
@@ -952,6 +917,7 @@ class EnsembleFoldBenchmarkExecutor:
                 "effective_partitions": plan.effective_partitions,
                 "chunks_percent": plan.chunks_percent,
                 "error": str(error),
+                "error_code": getattr(error, "code", type(error).__name__),
             },
         )
 

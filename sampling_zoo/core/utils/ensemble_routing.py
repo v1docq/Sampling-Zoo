@@ -242,11 +242,13 @@ class RoutedWeightedRouter:
                 local_metrics[name] = {"assigned_count": 0, "metrics": {}}
                 continue
             val_predictions = np.asarray(model_info.get("val_predictions"))
+            val_proba = model_info.get("val_proba") if self.problem == "classification" else None
             metrics = calculate_metrics(
                 y_true=y_values.iloc[mask].to_numpy(),
                 y_labels=val_predictions[mask],
-                y_proba=None,
+                y_proba=None if val_proba is None else np.asarray(val_proba)[mask],
                 problem_type=self.problem,
+                classes=model_info.get("classes") if self.problem == "classification" else None,
             )
             local_metrics[name] = {
                 "assigned_count": assigned_count,
@@ -308,9 +310,6 @@ class RoutedWeightedRouter:
         active_models: List[Dict[str, Any]],
         partitioner: Any,
     ) -> None:
-        if self.problem != "regression":
-            self.diagnostics_ = {"router_mode": self.router_mode, "status": "skipped_unsupported_problem"}
-            return
         torch_module, _nn_module = _load_torch_backend()
         if torch_module is None or _nn_module is None:
             self.diagnostics_ = {"router_mode": self.router_mode, "status": "skipped_missing_torch"}
@@ -376,8 +375,9 @@ class RoutedWeightedRouter:
                     optimizer.step()
                     last = parts
                 if epoch % 10 == 0 or epoch == epochs - 1:
+                    postfix_key = "rmse" if "rmse" in last else "log_loss"
                     try:
-                        bar.set_postfix({"rmse": f"{last['rmse']:.4g}", "kl": f"{last['kl']:.4g}"})
+                        bar.set_postfix({postfix_key: f"{last[postfix_key]:.4g}", "kl": f"{last['kl']:.4g}"})
                     except Exception:
                         pass
                 bar.update(1)
@@ -386,16 +386,10 @@ class RoutedWeightedRouter:
         self.gating_model_names_ = [str(model_info.get("name")) for model_info in active_models]
         self.gating_device_ = device
         train_weights = self._constrained_gating_weights(X_val, training_data.prior, active_models, partitioner)
-        train_pred = np.sum(training_data.predictions * train_weights, axis=1)
-        prior_pred = np.sum(training_data.predictions * training_data.prior, axis=1)
-        train_rmse = float(np.sqrt(np.mean((train_pred - training_data.target) ** 2)))
-        prior_rmse = float(np.sqrt(np.mean((prior_pred - training_data.target) ** 2)))
+        metric_payload = self._gating_diagnostic_metrics(training_data, train_weights)
         self.diagnostics_ = {
             "router_mode": self.router_mode,
             "status": "fitted",
-            "training_rmse": train_rmse,
-            "prior_rmse": prior_rmse,
-            "rmse_delta_vs_prior": train_rmse - prior_rmse,
             "final_loss": float(last["loss"]),
             "final_kl": float(last["kl"]),
             "final_balance": float(last["balance"]),
@@ -409,6 +403,7 @@ class RoutedWeightedRouter:
             "kl_weight": kl_weight,
             "balance_weight": balance_weight,
         }
+        self.diagnostics_.update(metric_payload)
 
     def _build_gating_training_data(
         self,
@@ -421,16 +416,34 @@ class RoutedWeightedRouter:
         if features is None or features.size == 0:
             return None
         prior = self.base_weights(features=X_val, active_models=active_models, partitioner=partitioner)
-        predictions = np.column_stack([
-            np.asarray(model_info.get("val_predictions"), dtype=float)
-            for model_info in active_models
-        ])
-        target = pd.Series(y_val).reset_index(drop=True).to_numpy(dtype=float)
+        if self.problem == "classification":
+            first_classes = np.asarray(active_models[0].get("classes"))
+            if first_classes.size == 0:
+                return None
+            class_to_idx = {label: idx for idx, label in enumerate(first_classes.tolist())}
+            try:
+                target = np.asarray([class_to_idx[label] for label in pd.Series(y_val).reset_index(drop=True).to_numpy()], dtype=np.int64)
+            except KeyError:
+                return None
+            proba_parts = []
+            for model_info in active_models:
+                proba = model_info.get("val_proba")
+                classes = np.asarray(model_info.get("classes"))
+                if proba is None or classes.tolist() != first_classes.tolist():
+                    return None
+                proba_parts.append(np.asarray(proba, dtype=np.float32))
+            predictions = np.stack(proba_parts, axis=1)
+        else:
+            predictions = np.column_stack([
+                np.asarray(model_info.get("val_predictions"), dtype=float)
+                for model_info in active_models
+            ])
+            target = pd.Series(y_val).reset_index(drop=True).to_numpy(dtype=float)
         return GatingTrainingData(
             features=np.asarray(features, dtype=np.float32),
             prior=np.asarray(prior, dtype=np.float32),
             predictions=np.asarray(predictions, dtype=np.float32),
-            target=np.asarray(target, dtype=np.float32),
+            target=np.asarray(target, dtype=np.float32 if self.problem == "regression" else np.int64),
         )
 
     def _gating_features(self, features: pd.DataFrame, partitioner: Any) -> Optional[np.ndarray]:
@@ -456,17 +469,55 @@ class RoutedWeightedRouter:
         balance_weight: float,
     ) -> tuple[Any, Dict[str, float]]:
         weights = torch.softmax(model(X), dim=1)
-        y_hat = torch.sum(weights * predictions, dim=1)
-        mse = torch.mean((y_hat - target) ** 2)
+        if predictions.ndim == 3:
+            mixture = torch.sum(weights.unsqueeze(-1) * predictions, dim=1)
+            target_long = target.long()
+            task_loss = torch.mean(-torch.log(mixture[torch.arange(mixture.shape[0], device=mixture.device), target_long] + 1e-8))
+            metric_parts = {
+                "log_loss": float(task_loss.detach().cpu().item()),
+                "accuracy": float((torch.argmax(mixture, dim=1) == target_long).float().mean().detach().cpu().item()),
+            }
+        else:
+            y_hat = torch.sum(weights * predictions, dim=1)
+            mse = torch.mean((y_hat - target) ** 2)
+            task_loss = mse
+            metric_parts = {
+                "rmse": float(torch.sqrt(mse.detach()).cpu().item()),
+            }
         kl = torch.mean(torch.sum(weights * (torch.log(weights + 1e-8) - torch.log(prior + 1e-8)), dim=1))
         uniform = torch.full_like(weights.mean(dim=0), 1.0 / weights.shape[1])
         balance = torch.mean((weights.mean(dim=0) - uniform) ** 2)
-        loss = mse + kl_weight * kl + balance_weight * balance
-        return loss, {
+        loss = task_loss + kl_weight * kl + balance_weight * balance
+        result = {
             "loss": float(loss.detach().cpu().item()),
-            "rmse": float(torch.sqrt(mse.detach()).cpu().item()),
             "kl": float(kl.detach().cpu().item()),
             "balance": float(balance.detach().cpu().item()),
+        }
+        result.update(metric_parts)
+        return loss, result
+
+    def _gating_diagnostic_metrics(self, training_data: GatingTrainingData, train_weights: np.ndarray) -> Dict[str, float]:
+        if training_data.predictions.ndim == 3:
+            train_proba = np.sum(training_data.predictions * train_weights[:, :, None], axis=1)
+            prior_proba = np.sum(training_data.predictions * training_data.prior[:, :, None], axis=1)
+            target = training_data.target.astype(int)
+            train_log_loss = float(np.mean(-np.log(train_proba[np.arange(target.shape[0]), target] + 1e-12)))
+            prior_log_loss = float(np.mean(-np.log(prior_proba[np.arange(target.shape[0]), target] + 1e-12)))
+            return {
+                "training_log_loss": train_log_loss,
+                "prior_log_loss": prior_log_loss,
+                "log_loss_delta_vs_prior": train_log_loss - prior_log_loss,
+                "training_accuracy": float(np.mean(np.argmax(train_proba, axis=1) == target)),
+            }
+
+        train_pred = np.sum(training_data.predictions * train_weights, axis=1)
+        prior_pred = np.sum(training_data.predictions * training_data.prior, axis=1)
+        train_rmse = float(np.sqrt(np.mean((train_pred - training_data.target) ** 2)))
+        prior_rmse = float(np.sqrt(np.mean((prior_pred - training_data.target) ** 2)))
+        return {
+            "training_rmse": train_rmse,
+            "prior_rmse": prior_rmse,
+            "rmse_delta_vs_prior": train_rmse - prior_rmse,
         }
 
     def _constrained_gating_weights(

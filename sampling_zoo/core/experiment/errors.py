@@ -37,3 +37,20 @@ class UnavailableExperimentDependencyError(ExperimentContractError):
 
 class EmptyExperimentInputError(ExperimentContractError):
     """Expected empty dataset, partition, or model collection failure."""
+
+
+class ClassificationProbabilitiesRequiredError(ExperimentContractError):
+    """Classification benchmark requires class-aligned probability estimates."""
+
+    def __init__(
+        self,
+        scope: str,
+        message: str = "Classification AMLB runs require predict_proba output.",
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(
+            scope=scope,
+            message=message,
+            code="classification_probabilities_required",
+            details=details or {},
+        )

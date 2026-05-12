@@ -13,7 +13,11 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sampling_zoo.core.repository.constant_repo import AmlbExperimentDataset
 from sampling_zoo.core.utils.amlb_dataloader import AMLBDatasetLoader
 from sampling_zoo.core.utils.progress import progress_bar, progress_iter
-import openml
+
+try:
+    import openml
+except Exception:  # pragma: no cover - optional dependency for offline tests
+    openml = None
 
 @dataclass(frozen=True)
 class DatasetMetadata:
