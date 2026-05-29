@@ -67,6 +67,10 @@ class SamplingStrategyFactory:
 
         self.strategy_map = {**self.chunking_strategies, **self.subset_strategies}
 
+    @staticmethod
+    def _partition_budget_keys() -> set:
+        return {'budget_ratio'}
+
     def create_strategy(self, strategy_type: str, **kwargs) -> BaseSampler:
         """
         Создает стратегию семплирования по названию
@@ -92,6 +96,11 @@ class SamplingStrategyFactory:
         """Создает стратегию и сразу обучает её на переданных данных."""
         strategy_kwargs = strategy_kwargs or {}
         fit_kwargs = fit_kwargs or {}
+        strategy_kwargs = {
+            key: value
+            for key, value in strategy_kwargs.items()
+            if key not in self._partition_budget_keys()
+        }
 
         strategy = self.create_strategy(strategy_type, **strategy_kwargs)
         if self.is_subset_strategy(strategy_type):
@@ -109,13 +118,114 @@ class SamplingStrategyFactory:
                       strategy_kwargs: Dict = None, fit_kwargs: Dict = None,
                       return_strategy: bool = False) -> Any:
         """Удобный вызов для создания стратегии и получения разбиений или индексов."""
+        strategy_kwargs = strategy_kwargs or {}
+        budget_kwargs = {
+            key: strategy_kwargs[key]
+            for key in self._partition_budget_keys()
+            if key in strategy_kwargs
+        }
         strategy = self.create_and_fit(strategy_type, data, target, strategy_kwargs, fit_kwargs)
 
         if self.is_subset_strategy(strategy_type):
             return strategy.sample_indices() if not return_strategy else (strategy, strategy.sample_indices())
         elif self.is_chunking_strategy(strategy_type):
             partitions = strategy.get_partitions(data, target) if target is not None else strategy.get_partitions()
+            partitions, budget_policy = self._apply_partition_budget(
+                partitions=partitions,
+                total_rows=len(data),
+                budget_ratio=budget_kwargs.get('budget_ratio'),
+                random_state=strategy_kwargs.get('random_state'),
+            )
+            strategy.budget_policy_ = budget_policy
             return partitions if not return_strategy else (strategy, partitions)
+
+    @staticmethod
+    def _apply_partition_budget(partitions: Dict[Any, Any],
+                                total_rows: int,
+                                budget_ratio: Any = None,
+                                random_state: Any = None) -> tuple[Dict[Any, Any], Dict[str, Any]]:
+        if budget_ratio is None:
+            return partitions, {'applied': False}
+
+        budget_ratio = float(budget_ratio)
+        if not 0 < budget_ratio <= 1:
+            raise ValueError("budget_ratio must be in (0, 1]")
+
+        sizes = {
+            name: SamplingStrategyFactory._partition_size(partition_data)
+            for name, partition_data in partitions.items()
+        }
+        sizes = {name: size for name, size in sizes.items() if size > 0}
+        if not sizes:
+            return partitions, {'applied': False, 'reason': 'empty_partitions'}
+
+        budget_size = max(1, min(total_rows, int(round(total_rows * budget_ratio))))
+        current_size = int(sum(sizes.values()))
+        if current_size <= budget_size:
+            return partitions, {
+                'applied': False,
+                'budget_ratio': budget_ratio,
+                'budget_size': budget_size,
+                'current_size': current_size,
+            }
+
+        ordered_names = sorted(sizes, key=lambda name: sizes[name], reverse=True)
+        if budget_size < len(ordered_names):
+            ordered_names = ordered_names[:budget_size]
+
+        ordered_total = sum(sizes[name] for name in ordered_names)
+        counts = {
+            name: max(1, min(sizes[name], int(np.floor(budget_size * sizes[name] / ordered_total))))
+            for name in ordered_names
+        }
+
+        while sum(counts.values()) > budget_size:
+            candidates = [name for name, count in counts.items() if count > 1]
+            if not candidates:
+                break
+            counts[max(candidates, key=lambda name: counts[name])] -= 1
+
+        while sum(counts.values()) < budget_size:
+            candidates = [name for name in ordered_names if counts[name] < sizes[name]]
+            if not candidates:
+                break
+            counts[max(candidates, key=lambda name: sizes[name] - counts[name])] += 1
+
+        rng = np.random.default_rng(random_state)
+        budgeted = {}
+        for name in ordered_names:
+            local_indices = np.sort(rng.choice(np.arange(sizes[name]), size=counts[name], replace=False))
+            budgeted[name] = SamplingStrategyFactory._take_partition_rows(partitions[name], local_indices)
+
+        return budgeted, {
+            'applied': True,
+            'budget_ratio': budget_ratio,
+            'budget_size': budget_size,
+            'current_size': current_size,
+            'selected_size': int(sum(counts.values())),
+            'partition_sizes': {name: int(count) for name, count in counts.items()},
+        }
+
+    @staticmethod
+    def _partition_size(partition_data: Any) -> int:
+        if isinstance(partition_data, dict):
+            return len(partition_data['feature'])
+        return len(partition_data)
+
+    @staticmethod
+    def _take_partition_rows(partition_data: Any, local_indices: np.ndarray) -> Any:
+        if isinstance(partition_data, dict):
+            return {
+                key: SamplingStrategyFactory._take_rows(value, local_indices)
+                for key, value in partition_data.items()
+            }
+        return np.asarray(partition_data)[local_indices]
+
+    @staticmethod
+    def _take_rows(value: Any, local_indices: np.ndarray) -> Any:
+        if isinstance(value, (pd.DataFrame, pd.Series)):
+            return value.iloc[local_indices].reset_index(drop=True)
+        return np.asarray(value)[local_indices]
 
     def get_available_strategies(self) -> List[str]:
         """Возвращает список доступных стратегий"""
