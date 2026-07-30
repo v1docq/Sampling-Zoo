@@ -11,6 +11,7 @@ from typing import Any, Callable, Mapping, Sequence
 JsonReady = Callable[[Any], Any]
 SnapshotHook = Callable[[Sequence[Mapping[str, Any]]], Any]
 MetadataBuilder = Callable[[Sequence[Mapping[str, Any]], str], Mapping[str, Any]]
+LifecycleHook = Callable[[Sequence[Mapping[str, Any]], str], Any]
 
 
 def default_json_ready(value: Any) -> Any:
@@ -38,6 +39,7 @@ class IncrementalExperimentSaver:
     records_path: Path
     metadata_path: Path
     snapshot_hooks: Sequence[SnapshotHook] = ()
+    lifecycle_hooks: Sequence[LifecycleHook] = ()
     metadata_builder: MetadataBuilder | None = None
     json_ready: JsonReady = default_json_ready
     rebuild_every: int = 1
@@ -55,6 +57,14 @@ class IncrementalExperimentSaver:
 
     def start(self) -> None:
         self.write_metadata(status="running")
+        self._run_lifecycle_hooks(status="running")
+
+    def add_lifecycle_hook(
+        self,
+        hook: LifecycleHook,
+    ) -> "IncrementalExperimentSaver":
+        self.lifecycle_hooks = (*self.lifecycle_hooks, hook)
+        return self
 
     def record(self, record: Mapping[str, Any]) -> None:
         normalized = dict(record)
@@ -73,15 +83,18 @@ class IncrementalExperimentSaver:
         for hook in self.snapshot_hooks:
             self._run_snapshot_hook(hook)
         self.write_metadata(status=status)
+        self._run_lifecycle_hooks(status=status)
 
     def finalize(self, records: Sequence[Mapping[str, Any]] | None = None) -> None:
         if records is not None:
             self.records = [dict(record) for record in records]
         self.write_metadata(status="completed")
+        self._run_lifecycle_hooks(status="completed")
 
     def mark_failed(self, error: BaseException) -> None:
         self._append_error("run_failed", error)
         self.write_metadata(status="failed")
+        self._run_lifecycle_hooks(status="failed")
 
     def write_metadata(self, status: str) -> None:
         if self.metadata_builder is None:
@@ -109,6 +122,14 @@ class IncrementalExperimentSaver:
             hook(tuple(self.records))
         except Exception as ex:  # pragma: no cover - defensive logging path
             self._append_error(f"snapshot_hook:{getattr(hook, '__name__', hook.__class__.__name__)}", ex)
+
+    def _run_lifecycle_hooks(self, status: str) -> None:
+        for hook in self.lifecycle_hooks:
+            try:
+                hook(tuple(self.records), status)
+            except Exception as ex:  # pragma: no cover - defensive logging path
+                hook_name = getattr(hook, "__name__", hook.__class__.__name__)
+                self._append_error(f"lifecycle_hook:{hook_name}", ex)
 
     def _append_error(self, event: str, error: BaseException) -> None:
         if self.error_log_path is None:

@@ -1,0 +1,292 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sampling-zoo.local/schemas/rmt-artifact-manifest-v1.json",
+  "title": "Sampling Zoo RMT experiment artifact manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run",
+    "status",
+    "record_count",
+    "datasets",
+    "artifacts"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "run": {
+      "$ref": "#/$defs/runIdentity"
+    },
+    "status": {
+      "enum": [
+        "running",
+        "completed",
+        "failed"
+      ]
+    },
+    "record_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "datasets": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/datasetRef"
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/artifactRef"
+      }
+    }
+  },
+  "$defs": {
+    "nullableString": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "nullableInteger": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "runIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "project",
+        "run_id",
+        "created_at_utc",
+        "git_commit",
+        "git_dirty",
+        "python_version",
+        "platform",
+        "packages",
+        "accelerator",
+        "config"
+      ],
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1
+        },
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "created_at_utc": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "git_commit": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "git_dirty": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "python_version": {
+          "type": "string"
+        },
+        "platform": {
+          "type": "string"
+        },
+        "packages": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "version"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "version": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "accelerator": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "torch_version",
+            "cuda_runtime",
+            "cuda_available",
+            "device_count",
+            "device_name"
+          ],
+          "properties": {
+            "torch_version": {
+              "$ref": "#/$defs/nullableString"
+            },
+            "cuda_runtime": {
+              "$ref": "#/$defs/nullableString"
+            },
+            "cuda_available": {
+              "type": "boolean"
+            },
+            "device_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "device_name": {
+              "$ref": "#/$defs/nullableString"
+            }
+          }
+        },
+        "config": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "sha256",
+            "seed",
+            "max_train_rows",
+            "suite_ids",
+            "requested_tasks"
+          ],
+          "properties": {
+            "sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "seed": {
+              "$ref": "#/$defs/nullableInteger"
+            },
+            "max_train_rows": {
+              "$ref": "#/$defs/nullableInteger"
+            },
+            "suite_ids": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            },
+            "requested_tasks": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "datasetRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "split_labels"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "problem_type": {
+          "type": "string"
+        },
+        "suite_id": {
+          "type": "integer"
+        },
+        "task_id": {
+          "type": "integer"
+        },
+        "task_name": {
+          "type": "string"
+        },
+        "dataset_id": {
+          "type": "integer"
+        },
+        "split_labels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "openml_repeat": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "openml_fold": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "openml_sample": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "artifactRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "path",
+        "sha256",
+        "size_bytes",
+        "producer_stage",
+        "optional"
+      ],
+      "dependentRequired": {
+        "schema_name": [
+          "schema_version"
+        ],
+        "schema_version": [
+          "schema_name"
+        ]
+      },
+      "properties": {
+        "role": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.-]*$"
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "producer_stage": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.-]*$"
+        },
+        "optional": {
+          "type": "boolean"
+        },
+        "schema_name": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.-]*$"
+        },
+        "schema_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "scope": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

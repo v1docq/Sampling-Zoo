@@ -962,6 +962,7 @@ class EnsembleFoldBenchmarkExecutor:
         model_name: str,
         fold: FoldSplit,
     ) -> dict[str, Any]:
+        task_id = getattr(dataset, "task_id", None)
         return {
             "problem_type": dataset.problem_type,
             "strategy": strategy_name,
@@ -972,9 +973,13 @@ class EnsembleFoldBenchmarkExecutor:
             "n_train": int(len(fold.X_train)),
             "n_val": int(len(fold.X_val)),
             "n_test": int(len(fold.X_test)),
-            "task_id": getattr(dataset, "task_id", None),
+            "task_id": task_id,
             "task_name": getattr(dataset, "task_name", None),
             "suite_id": getattr(dataset, "suite_id", None),
+            "dataset_id": getattr(dataset, "dataset_id", None),
+            "openml_repeat": 0 if task_id is not None else None,
+            "openml_fold": 0 if task_id is not None else None,
+            "openml_sample": 0 if task_id is not None else None,
         }
 
     @staticmethod
