@@ -29,6 +29,14 @@ from rmt_experiment_utils import json_ready, load_reference_metrics  # noqa: E40
 from rmt_report_tables import EFFICIENCY_DELTAS, RMTReportTableBuilder, build_rmt_report_tables  # noqa: E402
 from run_big_datasets_ensemble import EnsembleReportBuilder  # noqa: E402
 from sampling_zoo.core.experiment.contracts import StrategyGridContract  # noqa: E402
+from sampling_zoo.core.experiment.artifact_manifest import (  # noqa: E402
+    ARTIFACT_MANIFEST_SCHEMA_VERSION,
+    RunIdentity,
+)
+from sampling_zoo.core.experiment.artifact_runtime import (  # noqa: E402
+    capture_run_identity,
+    materialize_experiment_artifact_manifest,
+)
 from sampling_zoo.core.experiment.morphisms import (  # noqa: E402
     build_standard_rmt_experiment_plan,
     normalize_strategy_grid,
@@ -213,6 +221,7 @@ class RMTRegressionExperimentOrchestrator:
         self.rmt_report_table_builder = RMTReportTableBuilder()
         self.incremental_saver: IncrementalExperimentSaver | None = None
         self.experiment_plan: ExperimentPlan | None = None
+        self.run_identity: RunIdentity | None = None
 
     def _prepare_runtime(self) -> None:
         if self.config.synthetic_smoke:
@@ -229,8 +238,72 @@ class RMTRegressionExperimentOrchestrator:
             logger: BenchmarkLogger,
     ) -> Callable[[Mapping[str, Any]], None]:
         self.incremental_saver = self._create_incremental_saver(logger)
+        self._configure_artifact_tracking(logger, self.incremental_saver)
         self.incremental_saver.start()
         return self.incremental_saver.record
+
+    def _configure_artifact_tracking(
+            self,
+            logger: BenchmarkLogger,
+            saver: IncrementalExperimentSaver,
+    ) -> None:
+        run_identity = self._ensure_run_identity(logger)
+        metadata_builder = saver.metadata_builder
+
+        def _build_metadata(
+                records: Sequence[Mapping[str, Any]],
+                status: str,
+        ) -> Mapping[str, Any]:
+            payload = (
+                {"status": status, "records": len(records)}
+                if metadata_builder is None
+                else metadata_builder(records, status)
+            )
+            return self._enrich_run_metadata(payload, run_identity)
+
+        def _materialize_manifest(
+                records: Sequence[Mapping[str, Any]],
+                status: str,
+        ) -> None:
+            materialize_experiment_artifact_manifest(
+                run_dir=logger.paths.root,
+                run_identity=run_identity,
+                status=status,
+                records=records,
+            )
+
+        saver.metadata_builder = _build_metadata
+        saver.add_lifecycle_hook(_materialize_manifest)
+
+    def _ensure_run_identity(self, logger: BenchmarkLogger) -> RunIdentity:
+        current_identity = getattr(self, "run_identity", None)
+        if current_identity is not None:
+            return current_identity
+        effective_config = (
+            self.experiment_plan.effective_config
+            if self.experiment_plan is not None
+            else asdict(self.config)
+        )
+        self.run_identity = capture_run_identity(
+            run_id=logger.run_id,
+            effective_config=effective_config,
+            repo_root=ROOT_DIR,
+            ignored_git_paths=(logger.paths.root,),
+        )
+        return self.run_identity
+
+    @staticmethod
+    def _enrich_run_metadata(
+            payload: Mapping[str, Any],
+            run_identity: RunIdentity,
+    ) -> dict[str, Any]:
+        return {
+            **dict(payload),
+            "artifact_manifest_schema_version": (
+                ARTIFACT_MANIFEST_SCHEMA_VERSION
+            ),
+            "run_identity": run_identity.to_dict(),
+        }
 
     def _create_incremental_saver(self, logger: BenchmarkLogger) -> IncrementalExperimentSaver:
         reference_metrics = load_reference_metrics()
@@ -384,7 +457,10 @@ class RMTRegressionExperimentOrchestrator:
         if self.incremental_saver is not None:
             self.incremental_saver.finalize(run_records)
             return
-        run_meta = self._build_run_meta(logger, run_records)
+        run_meta = self._enrich_run_metadata(
+            self._build_run_meta(logger, run_records),
+            self._ensure_run_identity(logger),
+        )
         (logger.paths.root / "run_meta.json").write_text(
             json.dumps(json_ready(run_meta), ensure_ascii=False, indent=2),
             encoding="utf-8",
