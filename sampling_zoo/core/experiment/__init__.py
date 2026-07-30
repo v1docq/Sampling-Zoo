@@ -40,7 +40,26 @@ from .contracts import (
     StrategyGridContract,
     StrategySpec,
 )
-from .errors import ExperimentContractError, InvalidExperimentConfigError
+from .errors import (
+    ExperimentContractError,
+    InvalidExperimentConfigError,
+    ResumeCompatibilityError,
+    ResumeContractError,
+    ResumeRecordError,
+)
+from .resume import (
+    LeafRunKey,
+    LeafRunOutcome,
+    ResumePlan,
+    ResumePolicy,
+    build_resume_plan,
+    leaf_run_key_from_components,
+    leaf_run_key_from_record,
+    legacy_resume_config,
+    run_record_outcome,
+    scientific_experiment_config,
+)
+from .resume_runtime import ResumeSession, load_resume_session
 from .stages import ExperimentPlan, ExperimentStageId, StageRegistry, StageRequest, StageResult
 
 __all__ = [
@@ -62,6 +81,8 @@ __all__ = [
     "ExperimentStageId",
     "FoldContract",
     "InvalidExperimentConfigError",
+    "LeafRunKey",
+    "LeafRunOutcome",
     "ModelSpec",
     "PartitionContract",
     "PartitionTrainingRequest",
@@ -73,16 +94,29 @@ __all__ = [
     "RunIdentity",
     "RunRecordContract",
     "RunStatus",
+    "ResumeCompatibilityError",
+    "ResumeContractError",
+    "ResumePlan",
+    "ResumePolicy",
+    "ResumeRecordError",
+    "ResumeSession",
     "StageRegistry",
     "StageRequest",
     "StageResult",
     "StrategyGridContract",
     "StrategySpec",
     "build_artifact_manifest",
+    "build_resume_plan",
     "capture_run_identity",
     "dataset_refs_from_records",
     "discover_run_artifacts",
     "materialize_experiment_artifact_manifest",
+    "leaf_run_key_from_components",
+    "leaf_run_key_from_record",
+    "legacy_resume_config",
+    "load_resume_session",
     "parse_artifact_manifest",
     "render_artifact_manifest",
+    "run_record_outcome",
+    "scientific_experiment_config",
 ]

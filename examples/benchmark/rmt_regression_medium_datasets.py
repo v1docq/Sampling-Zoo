@@ -34,6 +34,7 @@ from sampling_zoo.core.experiment.artifact_manifest import (  # noqa: E402
     RunIdentity,
 )
 from sampling_zoo.core.experiment.artifact_runtime import (  # noqa: E402
+    canonical_payload_sha256,
     capture_run_identity,
     materialize_experiment_artifact_manifest,
 )
@@ -42,6 +43,15 @@ from sampling_zoo.core.experiment.morphisms import (  # noqa: E402
     normalize_strategy_grid,
 )
 from sampling_zoo.core.experiment.stages import ExperimentPlan, ExperimentStageId  # noqa: E402
+from sampling_zoo.core.experiment.resume import (  # noqa: E402
+    ResumePolicy,
+    legacy_resume_config,
+    scientific_experiment_config,
+)
+from sampling_zoo.core.experiment.resume_runtime import (  # noqa: E402
+    ResumeSession,
+    load_resume_session,
+)
 
 DEFAULT_RMT_REGRESSION_TASKS: tuple[str, ...] = (
     "diamonds",
@@ -94,6 +104,11 @@ class RMTRegressionExperimentConfig:
     seed: int = 42
     show_progress: bool = True
     synthetic_smoke: bool = False
+    resume_from: str | Path | None = None
+    resume_policy: str = ResumePolicy.RETRY_FAILED.value
+
+    def __post_init__(self) -> None:
+        ResumePolicy.parse(self.resume_policy)
 
 
 @dataclass(frozen=True)
@@ -222,6 +237,8 @@ class RMTRegressionExperimentOrchestrator:
         self.incremental_saver: IncrementalExperimentSaver | None = None
         self.experiment_plan: ExperimentPlan | None = None
         self.run_identity: RunIdentity | None = None
+        self.resume_session: ResumeSession | None = None
+        self.benchmark_runner: EnsembleChunkBenchmarkRunner | None = None
 
     def _prepare_runtime(self) -> None:
         if self.config.synthetic_smoke:
@@ -230,6 +247,31 @@ class RMTRegressionExperimentOrchestrator:
 
     def _create_logger(self) -> BenchmarkLogger:
         base_dir = Path(__file__).resolve().parent
+        if self.config.resume_from is not None:
+            effective_config = (
+                self.experiment_plan.effective_config
+                if self.experiment_plan is not None
+                else asdict(self.config)
+            )
+            expected_hashes = (
+                canonical_payload_sha256(
+                    scientific_experiment_config(effective_config)
+                ),
+                canonical_payload_sha256(
+                    legacy_resume_config(effective_config)
+                ),
+            )
+            self.resume_session = load_resume_session(
+                self.config.resume_from,
+                expected_config_hashes=expected_hashes,
+                policy=self.config.resume_policy,
+                default_seed=self.config.seed,
+            )
+            self.run_identity = self.resume_session.manifest.run
+            return BenchmarkLogger(
+                run_id=self.run_identity.run_id,
+                artifacts_root=self.resume_session.run_dir.parent,
+            )
         run_id = f"run_rmt_contraction_regression_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         return BenchmarkLogger(run_id=run_id, artifacts_root=base_dir / "results")
 
@@ -239,7 +281,17 @@ class RMTRegressionExperimentOrchestrator:
     ) -> Callable[[Mapping[str, Any]], None]:
         self.incremental_saver = self._create_incremental_saver(logger)
         self._configure_artifact_tracking(logger, self.incremental_saver)
+        if self.resume_session is not None:
+            self.incremental_saver.restore_records(
+                self.resume_session.plan.source_records,
+            )
         self.incremental_saver.start()
+        if self.resume_session is not None:
+            self.incremental_saver.restore_records(
+                self.resume_session.plan.retained_records,
+                rewrite_file=True,
+            )
+            self.incremental_saver.persist_snapshot(status="running")
         return self.incremental_saver.record
 
     def _configure_artifact_tracking(
@@ -286,7 +338,9 @@ class RMTRegressionExperimentOrchestrator:
         )
         self.run_identity = capture_run_identity(
             run_id=logger.run_id,
-            effective_config=effective_config,
+            effective_config=scientific_experiment_config(
+                effective_config
+            ),
             repo_root=ROOT_DIR,
             ignored_git_paths=(logger.paths.root,),
         )
@@ -330,13 +384,20 @@ class RMTRegressionExperimentOrchestrator:
         )
 
     def _create_runner(self, logger: BenchmarkLogger) -> EnsembleChunkBenchmarkRunner:
-        return EnsembleChunkBenchmarkRunner(
+        runner = EnsembleChunkBenchmarkRunner(
             logger=logger,
             cv_folds=2 if self.config.synthetic_smoke else 1,
             seed=self.config.seed,
             show_progress=self.config.show_progress,
             on_record=self._create_incremental_recorder(logger),
+            resume_plan=(
+                None
+                if self.resume_session is None
+                else self.resume_session.plan
+            ),
         )
+        self.benchmark_runner = runner
+        return runner
 
     def _load_datasets(self) -> list[RawDatasetBundle]:
         if self.config.synthetic_smoke:
@@ -407,7 +468,14 @@ class RMTRegressionExperimentOrchestrator:
             strategy_configs: StrategyGridContract | Mapping[str, Mapping[str, Any]],
             runner: EnsembleChunkBenchmarkRunner,
     ) -> list[dict[str, Any]]:
-        run_records: list[dict[str, Any]] = []
+        run_records: list[dict[str, Any]] = (
+            []
+            if self.resume_session is None
+            else [
+                dict(record)
+                for record in self.resume_session.plan.retained_records
+            ]
+        )
         for dataset in tqdm(
                 datasets,
                 desc="Run RMT datasets",
@@ -448,6 +516,18 @@ class RMTRegressionExperimentOrchestrator:
             "view_strategies": list(self.config.view_strategies),
             "max_train_rows": self.config.max_train_rows,
             "synthetic_smoke": self.config.synthetic_smoke,
+            "resume": (
+                None
+                if self.resume_session is None
+                else {
+                    **self.resume_session.to_dict(),
+                    "runtime": (
+                        {}
+                        if self.benchmark_runner is None
+                        else self.benchmark_runner.resume_diagnostics()
+                    ),
+                }
+            ),
             "status": status,
             "records": len(run_records),
             "experiment_plan": None if self.experiment_plan is None else self.experiment_plan.to_dict(),
@@ -513,13 +593,17 @@ def run_rmt_contraction_regression_experiment(
         regression_tasks: Sequence[str] | None = None,
         models: Sequence[str] = ("lightgbm",),
         max_train_rows: int | None = 300_000,
-        show_progress: bool = True
+        show_progress: bool = True,
+        resume_from: str | Path | None = None,
+        resume_policy: str = ResumePolicy.RETRY_FAILED.value,
 ) -> Path:
     config = RMTRegressionExperimentConfig(
         regression_tasks=regression_tasks or DEFAULT_RMT_REGRESSION_TASKS,
         models=models,
         max_train_rows=max_train_rows,
         show_progress=show_progress,
+        resume_from=resume_from,
+        resume_policy=resume_policy,
     )
     return RMTRegressionExperimentOrchestrator(config).run()
 

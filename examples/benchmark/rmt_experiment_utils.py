@@ -20,6 +20,8 @@ def json_ready(value: Any) -> Any:
         return float(value)
     if isinstance(value, (np.bool_,)):
         return bool(value)
+    if isinstance(value, Path):
+        return str(value)
     return value
 
 
