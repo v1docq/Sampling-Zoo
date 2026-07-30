@@ -221,6 +221,77 @@ def test_zero_spectrum_rank_selection_uses_min_rank() -> None:
     assert explained_variance == 0.0
 
 
+def test_null_diagnostic_is_opt_in_and_does_not_change_selected_rank() -> None:
+    X = _frame(n_samples=48).select_dtypes(include=[np.number])
+    shared = dict(
+        n_partitions=3,
+        n_views=3,
+        projection_dim=2,
+        initial_rank_fraction=0.5,
+        backend="numpy",
+        random_state=43,
+        show_progress=False,
+    )
+
+    baseline = RMTContractionTensorSampler(**shared).fit(X)
+    diagnosed = RMTContractionTensorSampler(
+        null_diagnostic_enabled=True,
+        null_resamples=2,
+        **shared,
+    ).fit(X)
+
+    assert baseline.diagnostics_["null_model_status"] == "disabled"
+    assert diagnosed.diagnostics_["null_model_status"] == "ok"
+    assert diagnosed.diagnostics_["null_primary_policy"] == "feature_permutation"
+    assert diagnosed.diagnostics_["null_successful_resamples"] == 6
+    assert diagnosed.diagnostics_["null_empirical_bulk_edge"] is not None
+    assert diagnosed.diagnostics_["rank_by_null_edge"] is not None
+    assert diagnosed.diagnostics_["rank_by_stability"] is not None
+    assert diagnosed.diagnostics_["selected_rank_reason"] == "explained_variance"
+    assert diagnosed.diagnostics_["selected_rank"] == baseline.diagnostics_["selected_rank"]
+    assert np.allclose(
+        diagnosed.diagnostics_["singular_values"],
+        baseline.diagnostics_["singular_values"],
+    )
+    assert len(diagnosed.diagnostics_["initial_singular_values"]) >= len(
+        diagnosed.diagnostics_["singular_values"]
+    )
+
+
+def test_invalid_null_diagnostic_config_is_rejected() -> None:
+    with pytest.raises(ValueError, match="null_primary_policy must be included"):
+        RMTContractionTensorSampler(
+            null_model_policies=("moment_matched_gaussian",),
+            null_primary_policy="feature_permutation",
+        )
+
+    with pytest.raises(ValueError, match="null_resamples must be at least 2"):
+        RMTContractionTensorSampler(null_resamples=1)
+
+
+@pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch is optional")
+def test_torch_backend_runs_spectral_null_diagnostic() -> None:
+    X = _frame(n_samples=32).select_dtypes(include=[np.number])
+    sampler = RMTContractionTensorSampler(
+        n_partitions=2,
+        n_views=2,
+        projection_dim=2,
+        backend="torch",
+        device="cpu",
+        null_diagnostic_enabled=True,
+        null_model_policies=("feature_permutation", "view_resampling"),
+        null_resamples=2,
+        random_state=47,
+        show_progress=False,
+    )
+
+    sampler.fit(X)
+
+    assert sampler.diagnostics_["backend"] == "torch"
+    assert sampler.diagnostics_["null_model_status"] == "ok"
+    assert sampler.diagnostics_["null_successful_resamples"] == 4
+
+
 def test_matrix_rmt_backend_returns_expected_shapes() -> None:
     X = np.random.default_rng(123).normal(size=(40, 6))
     sampler = RMTContractionTensorSampler(

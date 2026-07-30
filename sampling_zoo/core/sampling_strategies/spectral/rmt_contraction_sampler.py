@@ -12,6 +12,11 @@ from .backend.matrix_backend import MatrixRMTBackend
 from .backend.tensor_backend import TensorRMTBackend
 from .base_sampler import SpectralSamplerBase
 from .cluster_selection import ClusterSelectionResult, SpectralClusterSelector
+from .null_diagnostics import (
+    SpectralNullDiagnostic,
+    SpectralNullDiagnosticConfig,
+    SpectralNullDiagnosticResult,
+)
 from ...utils.progress import progress_bar
 from ...utils.utils import safe_index
 
@@ -60,6 +65,16 @@ class RMTContractionConfig:
     rank_selection_method: str = "explained_variance"
     explained_variance_threshold: float = 0.95
     min_rank: int = 1
+    null_diagnostic_enabled: bool = False
+    null_model_policies: Tuple[str, ...] = (
+        "feature_permutation",
+        "moment_matched_gaussian",
+        "view_resampling",
+    )
+    null_resamples: int = 16
+    null_quantile: float = 0.95
+    null_min_selection_frequency: float = 0.80
+    null_primary_policy: str = "feature_permutation"
     view_strategy: str = "gaussian"
     chunk_fraction: float = 1.0
     chunks_percent: float = 100.0
@@ -272,12 +287,26 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             cfg.explained_variance_threshold,
         )
         self.min_rank = self._validate_positive_int("min_rank", cfg.min_rank)
+        null_config = SpectralNullDiagnosticConfig.from_values(
+            enabled=cfg.null_diagnostic_enabled,
+            policies=cfg.null_model_policies,
+            n_resamples=cfg.null_resamples,
+            quantile=cfg.null_quantile,
+            min_selection_frequency=cfg.null_min_selection_frequency,
+            primary_policy=cfg.null_primary_policy,
+            random_state=cfg.random_state,
+        )
+        self.spectral_null_diagnostic = SpectralNullDiagnostic(null_config)
         self.oversample_factor = int(cfg.oversample_factor)
         self.power_iterations = int(cfg.power_iterations)
         self.max_unfolding_elements = cfg.max_unfolding_elements
         self._rmt_backend: Optional[Union[MatrixRMTBackend, TensorRMTBackend]] = None
         self.cluster_selector_ = self._make_cluster_selector()
         self.cluster_centers_: Optional[np.ndarray] = None
+        self.initial_singular_values_: Optional[np.ndarray] = None
+        self.spectral_null_diagnostic_result_ = SpectralNullDiagnosticResult.disabled(
+            null_config.primary_policy
+        )
         self.rank_selection_info_: Optional[RankSelectionInfo] = None
         self.n_views_selection_info_: Optional[NViewsSelectionInfo] = None
         self.partition_selection_info_: Optional[PartitionSelectionInfo] = None
@@ -392,7 +421,7 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         with progress_bar(
             enabled=self.show_progress,
             desc="RMT sampler fit",
-            total=5,
+            total=6,
         ) as stage:
             rng = self._start_fit()
             X_num = self._fit_transform_features(data)
@@ -402,6 +431,8 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             U, S, Vt, scores, rank = self._fit_spectral_basis(M)
             stage.update(1)
             self._store_spectral_basis(U, S, Vt, scores)
+            self._fit_spectral_null_diagnostic(X_num)
+            stage.update(1)
             self._fit_clusters_and_partitions(scores, target)
             stage.update(1)
             self._build_diagnostics(M, rank)
@@ -412,6 +443,10 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self.backend_ = self._resolve_backend()
         self._rmt_backend = self._make_rmt_backend()
         self.view_specs_ = []
+        self.initial_singular_values_ = None
+        self.spectral_null_diagnostic_result_ = SpectralNullDiagnosticResult.disabled(
+            self.spectral_null_diagnostic.config.primary_policy
+        )
         self.rank_selection_info_ = None
         self.n_views_selection_info_ = None
         self.partition_selection_info_ = None
@@ -455,6 +490,10 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         n_samples, n_features = self._matrix_shape(M)
         initial_rank = self._resolve_initial_rank(n_samples, n_features)
         basis = self._get_rmt_backend().compute_spectral_basis(M, rank=initial_rank)
+        self.initial_singular_values_ = np.asarray(
+            basis.singular_values,
+            dtype=np.float64,
+        ).copy()
         selected_rank, explained_variance = self._select_rank_from_spectrum(basis.singular_values)
         selected_basis = basis.truncate(selected_rank)
         rank_info = RankSelectionInfo(
@@ -472,6 +511,49 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             selected_basis.leverage_scores,
             rank_info,
         )
+
+    def _fit_spectral_null_diagnostic(self, X: np.ndarray) -> None:
+        if self.initial_singular_values_ is None:
+            raise RuntimeError("Initial singular spectrum is not available")
+
+        diagnostic = self.spectral_null_diagnostic
+        if not diagnostic.config.enabled:
+            self.spectral_null_diagnostic_result_ = SpectralNullDiagnosticResult.disabled(
+                diagnostic.config.primary_policy
+            )
+            return
+
+        rank = int(self.initial_singular_values_.size)
+
+        def evaluate_spectrum(
+            reference_X: np.ndarray,
+            rng: np.random.Generator,
+            resample_views: bool,
+        ) -> np.ndarray:
+            specs = (
+                self._make_view_specs(reference_X.shape[1], rng, n_views=self.n_views)
+                if resample_views
+                else self.view_specs_
+            )
+            width = sum(spec.output_dim for spec in specs)
+            self._check_unfolding_size(reference_X.shape[0], width)
+            unfolding = self._get_rmt_backend().build_mode0_unfolding(reference_X, specs)
+            return self._get_rmt_backend().compute_spectral_basis(
+                unfolding,
+                rank=rank,
+            ).singular_values
+
+        with progress_bar(
+            enabled=self.show_progress,
+            desc="RMT spectral null diagnostics",
+            total=diagnostic.config.work_units,
+        ) as progress:
+            self.spectral_null_diagnostic_result_ = diagnostic.evaluate(
+                encoded_features=X,
+                observed_singular_values=self.initial_singular_values_,
+                spectrum_evaluator=evaluate_spectrum,
+                on_progress=lambda: progress.update(1),
+            )
 
     def _resolve_initial_rank(self, n_samples: int, n_features: int) -> int:
         max_rank = max(1, min(n_samples, n_features))
@@ -976,6 +1058,8 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             entropy = float(-np.sum(scores * np.log(scores + 1e-12)))
             eff_n = float(np.exp(entropy))
         partition_info = self.partition_selection_info_
+        null_result = self.spectral_null_diagnostic_result_
+        null_diagnostic = null_result.to_dict()
         self.diagnostics_ = {
             "backend": self.backend_,
             "device": self.device if self.backend_ == "torch" else None,
@@ -997,10 +1081,26 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             "spectrum_stability_candidates": list(self.n_views_selection_info_.spectrum_stability_candidates) if self.n_views_selection_info_ else [],
             "initial_rank": int(rank_info.initial_rank),
             "selected_rank": int(rank_info.selected_rank),
+            "rank_by_explained_variance": int(rank_info.selected_rank),
+            "rank_by_null_edge": null_result.rank_by_null_edge,
+            "rank_by_stability": null_result.rank_by_stability,
+            "selected_rank_reason": "explained_variance",
             "rank_selection_method": rank_info.rank_selection_method,
             "explained_variance_threshold": rank_info.explained_variance_threshold,
             "explained_variance_at_selected_rank": rank_info.explained_variance_at_selected_rank,
+            "initial_singular_values": (
+                self.initial_singular_values_.tolist()
+                if self.initial_singular_values_ is not None
+                else []
+            ),
             "singular_values": self.singular_values_.tolist() if self.singular_values_ is not None else [],
+            "null_model_status": null_result.status.value,
+            "null_primary_policy": null_result.primary_policy.value,
+            "null_empirical_bulk_edge": null_result.empirical_bulk_edge,
+            "null_stable_outlier_count": null_result.rank_by_stability,
+            "null_max_outlier_excess": null_result.max_outlier_excess,
+            "null_successful_resamples": null_result.successful_resamples,
+            "spectral_null_diagnostic": null_diagnostic,
             "leverage_entropy": entropy,
             "effective_sample_count": eff_n,
             "n_partitions_requested": int(self.n_partitions),
