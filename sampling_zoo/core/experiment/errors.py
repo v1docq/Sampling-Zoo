@@ -37,3 +37,15 @@ class UnavailableExperimentDependencyError(ExperimentContractError):
 
 class EmptyExperimentInputError(ExperimentContractError):
     """Expected empty dataset, partition, or model collection failure."""
+
+
+class ResumeContractError(ExperimentContractError):
+    """Invalid resume record, policy, or state transition."""
+
+
+class ResumeCompatibilityError(ResumeContractError):
+    """Resume directory is incompatible with the requested experiment."""
+
+
+class ResumeRecordError(ResumeContractError):
+    """Persisted run record cannot be mapped to a canonical leaf run."""

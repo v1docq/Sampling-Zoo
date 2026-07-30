@@ -66,6 +66,16 @@ class IncrementalExperimentSaver:
         self.lifecycle_hooks = (*self.lifecycle_hooks, hook)
         return self
 
+    def restore_records(
+        self,
+        records: Sequence[Mapping[str, Any]],
+        *,
+        rewrite_file: bool = False,
+    ) -> None:
+        self.records = [dict(record) for record in records]
+        if rewrite_file:
+            self._atomic_write_jsonl(self.records_path, self.records)
+
     def record(self, record: Mapping[str, Any]) -> None:
         normalized = dict(record)
         self._append_record_jsonl(normalized)
@@ -150,4 +160,24 @@ class IncrementalExperimentSaver:
             json.dumps(self.json_ready(dict(payload)), ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        tmp_path.replace(path)
+        os.replace(tmp_path, path)
+
+    def _atomic_write_jsonl(
+        self,
+        path: Path,
+        records: Sequence[Mapping[str, Any]],
+    ) -> None:
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(
+                    json.dumps(
+                        self.json_ready(dict(record)),
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+            handle.flush()
+            if self.fsync_records:
+                os.fsync(handle.fileno())
+        os.replace(tmp_path, path)

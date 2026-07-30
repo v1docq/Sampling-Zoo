@@ -28,6 +28,11 @@ from sampling_zoo.core.experiment.morphisms import (
     materialize_strategy_grid,
     normalize_strategy_grid,
 )
+from sampling_zoo.core.experiment.resume import (
+    LeafRunKey,
+    ResumePlan,
+    leaf_run_key_from_components,
+)
 from sampling_zoo.core.utils.sampling_ensemble import SamplingEnsemble
 from sampling_zoo.core.utils.amlb_dataloader import AMLBDatasetLoader
 from sampling_zoo.core.utils.progress import progress_bar
@@ -323,12 +328,15 @@ class EnsembleFoldBenchmarkExecutor:
         cv_folds: int,
         seed: int,
         show_progress: bool,
+        resume_plan: ResumePlan | None = None,
     ) -> None:
         self.logger = logger
         self.loader = loader
         self.cv_folds = cv_folds
         self.seed = seed
         self.show_progress = show_progress
+        self.resume_plan = resume_plan
+        self.skipped_leaf_keys: set[str] = set()
 
     def run_strategy_folds(
         self,
@@ -350,6 +358,19 @@ class EnsembleFoldBenchmarkExecutor:
             leave=False,
         )
         for fold in fold_iter:
+            leaf_run = self._leaf_run_key(
+                dataset=dataset,
+                strategy_name=strategy_name,
+                partitioner_config=partitioner_config,
+                model_name=model_name,
+                split_label=fold.split_label,
+            )
+            if (
+                self.resume_plan is not None
+                and not self.resume_plan.should_execute(leaf_run)
+            ):
+                self.skipped_leaf_keys.add(leaf_run.key)
+                continue
             records.append(
                 self.run_single_fold(
                     dataset=dataset,
@@ -361,6 +382,24 @@ class EnsembleFoldBenchmarkExecutor:
                 )
             )
         return records
+
+    def _leaf_run_key(
+        self,
+        *,
+        dataset: RawDatasetBundle,
+        strategy_name: str,
+        partitioner_config: Mapping[str, Any],
+        model_name: str,
+        split_label: str,
+    ) -> LeafRunKey:
+        return leaf_run_key_from_components(
+            dataset=dataset.name,
+            split=split_label,
+            model=model_name,
+            strategy=strategy_name,
+            strategy_config=partitioner_config,
+            seed=self.seed,
+        )
 
     def split_count(self, dataset: RawDatasetBundle) -> int:
         return 1 if isinstance(dataset, OpenMLRawDatasetBundle) else self.cv_folds
@@ -843,7 +882,13 @@ class EnsembleFoldBenchmarkExecutor:
             timings={"fit": fit_time, "sample": 0.0, "inference": infer_time},
             sample_stats=dict(sample_stats),
             extra={
-                **self._base_fold_extra(dataset, strategy_name, model_name, fold),
+                **self._base_fold_extra(
+                    dataset,
+                    strategy_name,
+                    model_name,
+                    fold,
+                    partitioner_config,
+                ),
                 "contracts": self._build_fold_contract_payload(
                     dataset=dataset,
                     fold=fold,
@@ -891,7 +936,13 @@ class EnsembleFoldBenchmarkExecutor:
             timings={"fit": fit_time, "sample": 0.0, "inference": infer_time},
             sample_stats=dict(sample_stats),
             extra={
-                **self._base_fold_extra(dataset, strategy_name, model_name, fold),
+                **self._base_fold_extra(
+                    dataset,
+                    strategy_name,
+                    model_name,
+                    fold,
+                    tuned_partitioner_config,
+                ),
                 "contracts": self._build_fold_contract_payload(
                     dataset=dataset,
                     fold=fold,
@@ -939,7 +990,13 @@ class EnsembleFoldBenchmarkExecutor:
                 total_train_size=max(len(fold.y_train), 1),
             ),
             extra={
-                **self._base_fold_extra(dataset, strategy_name, model_name, fold),
+                **self._base_fold_extra(
+                    dataset,
+                    strategy_name,
+                    model_name,
+                    fold,
+                    partitioner_config,
+                ),
                 "contracts": {
                     "dataset": dataset_to_contract(dataset).to_dict(),
                     "fold": fold_to_contract(fold).to_dict(),
@@ -961,8 +1018,16 @@ class EnsembleFoldBenchmarkExecutor:
         strategy_name: str,
         model_name: str,
         fold: FoldSplit,
+        partitioner_config: Mapping[str, Any],
     ) -> dict[str, Any]:
         task_id = getattr(dataset, "task_id", None)
+        leaf_run = self._leaf_run_key(
+            dataset=dataset,
+            strategy_name=strategy_name,
+            partitioner_config=partitioner_config,
+            model_name=model_name,
+            split_label=fold.split_label,
+        )
         return {
             "problem_type": dataset.problem_type,
             "strategy": strategy_name,
@@ -980,6 +1045,8 @@ class EnsembleFoldBenchmarkExecutor:
             "openml_repeat": 0 if task_id is not None else None,
             "openml_fold": 0 if task_id is not None else None,
             "openml_sample": 0 if task_id is not None else None,
+            "leaf_run_key": leaf_run.key,
+            "leaf_run": leaf_run.to_dict(),
         }
 
     @staticmethod
@@ -1015,6 +1082,7 @@ class EnsembleChunkBenchmarkRunner:
         seed: int = 42,
         show_progress: bool = True,
         on_record: Optional[Callable[[Dict[str, Any]], None]] = None,
+        resume_plan: ResumePlan | None = None,
     ) -> None:
         self.logger = logger or BenchmarkLogger()
         self.cv_folds = cv_folds
@@ -1022,12 +1090,14 @@ class EnsembleChunkBenchmarkRunner:
         self.show_progress = show_progress
         self.loader = AMLBDatasetLoader()
         self.on_record = on_record
+        self.resume_plan = resume_plan
         self.fold_executor = EnsembleFoldBenchmarkExecutor(
             logger=self.logger,
             loader=self.loader,
             cv_folds=self.cv_folds,
             seed=self.seed,
             show_progress=self.show_progress,
+            resume_plan=self.resume_plan,
         )
 
     def run_dataset(
@@ -1041,6 +1111,12 @@ class EnsembleChunkBenchmarkRunner:
             if isinstance(strategy_configs, StrategyGridContract)
             else normalize_strategy_grid(strategy_configs)
         )
+        if not self._has_pending_leaf_runs(
+            dataset,
+            strategy_grid,
+            model_pool,
+        ):
+            return []
         openml_split_data = self._load_openml_split(dataset)
         try:
             return self._run_model_strategy_grid(
@@ -1051,6 +1127,51 @@ class EnsembleChunkBenchmarkRunner:
             )
         finally:
             self._release_openml_split(openml_split_data)
+
+    def _has_pending_leaf_runs(
+        self,
+        dataset: RawDatasetBundle,
+        strategy_grid: StrategyGridContract,
+        model_pool: Mapping[str, Callable[[], Any]],
+    ) -> bool:
+        if self.resume_plan is None:
+            return True
+        pending = False
+        materialized = materialize_strategy_grid(strategy_grid)
+        split_labels = (
+            ("split_1",)
+            if isinstance(dataset, OpenMLRawDatasetBundle)
+            else tuple(
+                f"fold_{fold_idx}"
+                for fold_idx in range(1, self.cv_folds + 1)
+            )
+        )
+        for model_name in model_pool:
+            for strategy_name, partitioner_config in materialized.items():
+                for split_label in split_labels:
+                    leaf_run = leaf_run_key_from_components(
+                        dataset=dataset.name,
+                        split=split_label,
+                        model=model_name,
+                        strategy=strategy_name,
+                        strategy_config=partitioner_config,
+                        seed=self.seed,
+                    )
+                    if self.resume_plan.should_execute(leaf_run):
+                        pending = True
+                    else:
+                        self.fold_executor.skipped_leaf_keys.add(
+                            leaf_run.key
+                        )
+        return pending
+
+    def resume_diagnostics(self) -> dict[str, Any]:
+        return {
+            "enabled": self.resume_plan is not None,
+            "skipped_leaf_runs": len(
+                self.fold_executor.skipped_leaf_keys
+            ),
+        }
 
     def _load_openml_split(
         self,

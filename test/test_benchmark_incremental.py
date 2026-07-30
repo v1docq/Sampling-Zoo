@@ -108,3 +108,24 @@ def test_incremental_saver_logs_lifecycle_hook_failure(tmp_path) -> None:
     error = json.loads(error_lines[0])
     assert error["event"] == "lifecycle_hook:_broken_lifecycle"
     assert error["error"] == "manifest failed at running"
+
+
+def test_incremental_saver_restores_and_atomically_rewrites_records(
+    tmp_path,
+) -> None:
+    records_path = tmp_path / "metrics" / "runs.jsonl"
+    saver = IncrementalExperimentSaver(
+        records_path=records_path,
+        metadata_path=tmp_path / "run_meta.json",
+    )
+    saver.record({"leaf": "completed"})
+    saver.record({"leaf": "failed"})
+
+    saver.restore_records(
+        [{"leaf": "completed"}],
+        rewrite_file=True,
+    )
+
+    assert saver.records == [{"leaf": "completed"}]
+    assert load_jsonl_records(records_path) == [{"leaf": "completed"}]
+    assert not records_path.with_suffix(".jsonl.tmp").exists()
