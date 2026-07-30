@@ -59,3 +59,52 @@ def test_incremental_saver_keeps_jsonl_when_snapshot_hook_fails(tmp_path) -> Non
     error_lines = (tmp_path / "incremental_saver_errors.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(error_lines) == 1
     assert json.loads(error_lines[0])["error"] == "snapshot failed"
+
+
+def test_incremental_saver_runs_lifecycle_hooks_after_metadata_write(
+    tmp_path,
+) -> None:
+    calls: list[tuple[str, int, str]] = []
+
+    def _lifecycle(records, status):
+        metadata = json.loads(
+            (tmp_path / "run_meta.json").read_text(encoding="utf-8")
+        )
+        calls.append((status, len(records), metadata["status"]))
+
+    saver = IncrementalExperimentSaver(
+        records_path=tmp_path / "metrics" / "runs.jsonl",
+        metadata_path=tmp_path / "run_meta.json",
+        lifecycle_hooks=(_lifecycle,),
+    )
+
+    saver.start()
+    saver.record({"dataset": "a"})
+    saver.finalize()
+
+    assert calls == [
+        ("running", 0, "running"),
+        ("running", 1, "running"),
+        ("completed", 1, "completed"),
+    ]
+
+
+def test_incremental_saver_logs_lifecycle_hook_failure(tmp_path) -> None:
+    def _broken_lifecycle(records, status):
+        raise RuntimeError(f"manifest failed at {status}")
+
+    saver = IncrementalExperimentSaver(
+        records_path=tmp_path / "metrics" / "runs.jsonl",
+        metadata_path=tmp_path / "run_meta.json",
+        lifecycle_hooks=(_broken_lifecycle,),
+    )
+
+    saver.start()
+
+    error_lines = (
+        tmp_path / "metrics" / "incremental_saver_errors.jsonl"
+    ).read_text(encoding="utf-8").splitlines()
+    assert len(error_lines) == 1
+    error = json.loads(error_lines[0])
+    assert error["event"] == "lifecycle_hook:_broken_lifecycle"
+    assert error["error"] == "manifest failed at running"
