@@ -212,9 +212,11 @@ replicate на comparison rank и typed failures.
   на группу близких singular values, а не на отсутствие структуры;
 - нулевые ranks не доказывают отсутствие нелинейного сигнала.
 
-Production rank пока остается explained-variance rank. Следующий этап должен
-сначала проверить recovery на spiked synthetic datasets, а затем отдельным PR
-ввести явную policy с fallback и `selected_rank_reason`.
+Production rank пока остается explained-variance rank. Контролируемая проверка
+recovery на Gaussian и Student-t spiked datasets реализована в
+`10_spiked_synthetic_validation.md`. Только после анализа ее результатов
+следует отдельным PR вводить явную policy с fallback и
+`selected_rank_reason`.
 
 ## Вычислительная стоимость
 
