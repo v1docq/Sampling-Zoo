@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import math
 from typing import Any, Iterable, Optional
 
 import numpy as np
 
-from .matrix_backend import RMTSpectralBasis, compute_leverage_scores
+from .matrix_backend import (
+    RMTSpectralBasis,
+    RMTSubspaceComparison,
+    compute_leverage_scores,
+)
 
 try:
     import torch
@@ -122,6 +127,86 @@ class TensorRMTBackend:
             singular_values=singular_values.detach().cpu().numpy(),
             Vt=Vt.detach().cpu().numpy(),
             leverage_scores=compute_leverage_scores(U_np),
+        )
+
+    def compare_subspace_prefixes(
+        self,
+        reference_basis: np.ndarray,
+        candidate_basis: np.ndarray,
+        max_rank: int,
+    ) -> tuple[RMTSubspaceComparison, ...]:
+        reference = self._to_tensor(reference_basis)
+        candidate = self._to_tensor(candidate_basis)
+        max_rank = self._validate_subspace_inputs(reference, candidate, max_rank)
+        return tuple(
+            self._compare_tensor_subspaces(
+                reference[:, :rank],
+                candidate[:, :rank],
+                rank,
+            )
+            for rank in range(1, max_rank + 1)
+        )
+
+    @staticmethod
+    def _validate_subspace_inputs(
+        reference_basis: Any,
+        candidate_basis: Any,
+        max_rank: int,
+    ) -> int:
+        if reference_basis.ndim != 2 or candidate_basis.ndim != 2:
+            raise ValueError("Subspace bases must be 2D matrices")
+        if int(reference_basis.shape[0]) != int(candidate_basis.shape[0]):
+            raise ValueError("Subspace bases must have the same number of rows")
+        if not bool(torch.all(torch.isfinite(reference_basis))):
+            raise ValueError("Subspace bases must contain only finite values")
+        if not bool(torch.all(torch.isfinite(candidate_basis))):
+            raise ValueError("Subspace bases must contain only finite values")
+        max_rank = int(max_rank)
+        if max_rank < 1:
+            raise ValueError("max_rank must be positive")
+        available_rank = min(
+            int(reference_basis.shape[1]),
+            int(candidate_basis.shape[1]),
+        )
+        if max_rank > available_rank:
+            raise ValueError("max_rank exceeds the available basis dimensions")
+        return max_rank
+
+    @staticmethod
+    def _compare_tensor_subspaces(
+        reference_basis: Any,
+        candidate_basis: Any,
+        rank: int,
+    ) -> RMTSubspaceComparison:
+        reference_q, _ = torch.linalg.qr(reference_basis, mode="reduced")
+        candidate_q, _ = torch.linalg.qr(candidate_basis, mode="reduced")
+        canonical_correlations = torch.linalg.svdvals(reference_q.T @ candidate_q)
+        canonical_correlations = torch.clamp(canonical_correlations, min=0.0, max=1.0)
+        angles = torch.rad2deg(torch.arccos(canonical_correlations))
+        overlap_squared = torch.sum(canonical_correlations ** 2)
+        projection_squared = torch.clamp(
+            2.0 * rank - 2.0 * overlap_squared,
+            min=0.0,
+        )
+        projection_distance = torch.sqrt(projection_squared)
+        normalized_distance = projection_distance / math.sqrt(2.0 * rank)
+        angles_np = angles.detach().cpu().numpy()
+        return RMTSubspaceComparison(
+            rank=int(rank),
+            principal_angles_degrees=tuple(map(float, angles_np)),
+            mean_principal_angle_degrees=float(
+                torch.mean(angles).detach().cpu().item()
+            ),
+            max_principal_angle_degrees=float(
+                torch.max(angles).detach().cpu().item()
+            ),
+            projection_distance=float(projection_distance.detach().cpu().item()),
+            normalized_projection_distance=float(
+                normalized_distance.detach().cpu().item()
+            ),
+            min_canonical_correlation=float(
+                torch.min(canonical_correlations).detach().cpu().item()
+            ),
         )
 
     def project_new_unfolding(

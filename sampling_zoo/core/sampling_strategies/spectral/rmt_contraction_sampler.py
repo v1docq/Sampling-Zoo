@@ -17,6 +17,11 @@ from .null_diagnostics import (
     SpectralNullDiagnosticConfig,
     SpectralNullDiagnosticResult,
 )
+from .subspace_diagnostics import (
+    SpectralSubspaceDiagnostic,
+    SpectralSubspaceDiagnosticConfig,
+    SpectralSubspaceDiagnosticResult,
+)
 from ...utils.progress import progress_bar
 from ...utils.utils import safe_index
 
@@ -75,6 +80,12 @@ class RMTContractionConfig:
     null_quantile: float = 0.95
     null_min_selection_frequency: float = 0.80
     null_primary_policy: str = "feature_permutation"
+    subspace_diagnostic_enabled: bool = False
+    subspace_resamples: int = 16
+    subspace_quantile: float = 0.90
+    subspace_max_principal_angle_degrees: float = 15.0
+    subspace_max_normalized_projection_distance: float = 0.25
+    subspace_max_rank: Optional[int] = 64
     view_strategy: str = "gaussian"
     chunk_fraction: float = 1.0
     chunks_percent: float = 100.0
@@ -297,6 +308,22 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             random_state=cfg.random_state,
         )
         self.spectral_null_diagnostic = SpectralNullDiagnostic(null_config)
+        subspace_config = SpectralSubspaceDiagnosticConfig.from_values(
+            enabled=cfg.subspace_diagnostic_enabled,
+            n_resamples=cfg.subspace_resamples,
+            quantile=cfg.subspace_quantile,
+            max_principal_angle_degrees=(
+                cfg.subspace_max_principal_angle_degrees
+            ),
+            max_normalized_projection_distance=(
+                cfg.subspace_max_normalized_projection_distance
+            ),
+            max_rank=cfg.subspace_max_rank,
+            random_state=cfg.random_state,
+        )
+        self.spectral_subspace_diagnostic = SpectralSubspaceDiagnostic(
+            subspace_config
+        )
         self.oversample_factor = int(cfg.oversample_factor)
         self.power_iterations = int(cfg.power_iterations)
         self.max_unfolding_elements = cfg.max_unfolding_elements
@@ -304,8 +331,12 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self.cluster_selector_ = self._make_cluster_selector()
         self.cluster_centers_: Optional[np.ndarray] = None
         self.initial_singular_values_: Optional[np.ndarray] = None
+        self.left_basis_: Optional[np.ndarray] = None
         self.spectral_null_diagnostic_result_ = SpectralNullDiagnosticResult.disabled(
             null_config.primary_policy
+        )
+        self.spectral_subspace_diagnostic_result_ = (
+            SpectralSubspaceDiagnosticResult.disabled()
         )
         self.rank_selection_info_: Optional[RankSelectionInfo] = None
         self.n_views_selection_info_: Optional[NViewsSelectionInfo] = None
@@ -421,7 +452,7 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         with progress_bar(
             enabled=self.show_progress,
             desc="RMT sampler fit",
-            total=6,
+            total=7,
         ) as stage:
             rng = self._start_fit()
             X_num = self._fit_transform_features(data)
@@ -432,6 +463,8 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             stage.update(1)
             self._store_spectral_basis(U, S, Vt, scores)
             self._fit_spectral_null_diagnostic(X_num)
+            stage.update(1)
+            self._fit_spectral_subspace_diagnostic(X_num)
             stage.update(1)
             self._fit_clusters_and_partitions(scores, target)
             stage.update(1)
@@ -444,8 +477,12 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self._rmt_backend = self._make_rmt_backend()
         self.view_specs_ = []
         self.initial_singular_values_ = None
+        self.left_basis_ = None
         self.spectral_null_diagnostic_result_ = SpectralNullDiagnosticResult.disabled(
             self.spectral_null_diagnostic.config.primary_policy
+        )
+        self.spectral_subspace_diagnostic_result_ = (
+            SpectralSubspaceDiagnosticResult.disabled()
         )
         self.rank_selection_info_ = None
         self.n_views_selection_info_ = None
@@ -555,6 +592,49 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
                 on_progress=lambda: progress.update(1),
             )
 
+    def _fit_spectral_subspace_diagnostic(self, X: np.ndarray) -> None:
+        if self.left_basis_ is None:
+            raise RuntimeError("Left spectral basis is not available")
+
+        diagnostic = self.spectral_subspace_diagnostic
+        if not diagnostic.config.enabled:
+            self.spectral_subspace_diagnostic_result_ = (
+                SpectralSubspaceDiagnosticResult.disabled()
+            )
+            return
+
+        rank = diagnostic.resolve_comparison_rank(
+            int(self.left_basis_.shape[1])
+        )
+
+        def evaluate_basis(rng: np.random.Generator) -> np.ndarray:
+            specs = self._make_view_specs(
+                X.shape[1],
+                rng,
+                n_views=self.n_views,
+            )
+            width = sum(spec.output_dim for spec in specs)
+            self._check_unfolding_size(X.shape[0], width)
+            unfolding = self._get_rmt_backend().build_mode0_unfolding(X, specs)
+            return self._get_rmt_backend().compute_spectral_basis(
+                unfolding,
+                rank=rank,
+            ).U
+
+        with progress_bar(
+            enabled=self.show_progress,
+            desc="RMT subspace stability",
+            total=diagnostic.config.work_units,
+        ) as progress:
+            self.spectral_subspace_diagnostic_result_ = diagnostic.evaluate(
+                reference_basis=self.left_basis_,
+                basis_evaluator=evaluate_basis,
+                subspace_comparator=(
+                    self._get_rmt_backend().compare_subspace_prefixes
+                ),
+                on_progress=lambda: progress.update(1),
+            )
+
     def _resolve_initial_rank(self, n_samples: int, n_features: int) -> int:
         max_rank = max(1, min(n_samples, n_features))
         initial_rank = int(math.ceil(self.initial_rank_fraction * max_rank))
@@ -584,6 +664,7 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         Vt: np.ndarray,
         scores: np.ndarray,
     ) -> None:
+        self.left_basis_ = U
         self.singular_values_ = S
         self.right_basis_ = Vt
         if self.embedding_mode == "sv_scaled":
@@ -1060,6 +1141,9 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         partition_info = self.partition_selection_info_
         null_result = self.spectral_null_diagnostic_result_
         null_diagnostic = null_result.to_dict()
+        subspace_result = self.spectral_subspace_diagnostic_result_
+        subspace_diagnostic = subspace_result.to_dict()
+        full_rank_subspace = subspace_result.comparison_rank_diagnostic
         self.diagnostics_ = {
             "backend": self.backend_,
             "device": self.device if self.backend_ == "torch" else None,
@@ -1084,6 +1168,9 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             "rank_by_explained_variance": int(rank_info.selected_rank),
             "rank_by_null_edge": null_result.rank_by_null_edge,
             "rank_by_stability": null_result.rank_by_stability,
+            "rank_by_subspace_stability": (
+                subspace_result.rank_by_subspace_stability
+            ),
             "selected_rank_reason": "explained_variance",
             "rank_selection_method": rank_info.rank_selection_method,
             "explained_variance_threshold": rank_info.explained_variance_threshold,
@@ -1101,6 +1188,28 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             "null_max_outlier_excess": null_result.max_outlier_excess,
             "null_successful_resamples": null_result.successful_resamples,
             "spectral_null_diagnostic": null_diagnostic,
+            "subspace_stability_status": subspace_result.status.value,
+            "subspace_comparison_rank": subspace_result.comparison_rank,
+            "subspace_rank_source": subspace_result.rank_source,
+            "subspace_max_angle_quantile_degrees": (
+                full_rank_subspace.max_angle_quantile_degrees
+                if full_rank_subspace is not None
+                else None
+            ),
+            "subspace_normalized_projection_distance_quantile": (
+                full_rank_subspace.normalized_projection_distance_quantile
+                if full_rank_subspace is not None
+                else None
+            ),
+            "subspace_stability_frequency": (
+                full_rank_subspace.stability_frequency
+                if full_rank_subspace is not None
+                else None
+            ),
+            "subspace_successful_resamples": (
+                subspace_result.successful_resamples
+            ),
+            "spectral_subspace_diagnostic": subspace_diagnostic,
             "leverage_entropy": entropy,
             "effective_sample_count": eff_n,
             "n_partitions_requested": int(self.n_partitions),

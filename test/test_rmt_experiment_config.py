@@ -52,6 +52,10 @@ def test_chunking_configs_support_rmt_and_experiment_metadata() -> None:
     assert configs["rmt_contraction"]["null_diagnostic_enabled"] is False
     assert configs["rmt_contraction"]["null_primary_policy"] == "feature_permutation"
     assert "view_resampling" in configs["rmt_contraction"]["null_model_policies"]
+    assert configs["rmt_contraction"]["subspace_diagnostic_enabled"] is False
+    assert configs["rmt_contraction"]["subspace_resamples"] == 16
+    assert configs["rmt_contraction"]["subspace_quantile"] == 0.90
+    assert configs["rmt_contraction"]["subspace_max_rank"] == 64
     assert configs["feature_clustering"]["experiment_chunk_fraction"] == 0.5
     assert "chunk_fraction" not in configs["feature_clustering"]
     assert configs["random"]["budget_ratio"] == 0.1
@@ -538,6 +542,10 @@ def test_sample_efficiency_summary_selects_minimal_budget(tmp_path) -> None:
     assert "null_model_status" in tables["raw"].columns
     assert "rank_by_null_edge" in tables["raw"].columns
     assert "rank_by_stability" in tables["raw"].columns
+    assert "subspace_stability_status" in tables["raw"].columns
+    assert "subspace_rank_source" in tables["raw"].columns
+    assert "rank_by_subspace_stability" in tables["raw"].columns
+    assert "subspace_max_angle_quantile_degrees" in tables["raw"].columns
     assert (tmp_path / "rmt_raw_runs.csv").exists()
     assert (tmp_path / "sample_efficiency_curve.csv").exists()
     assert (tmp_path / "minimal_effective_budget.csv").exists()
