@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
@@ -27,6 +28,19 @@ class RMTSpectralBasis:
             Vt=Vt,
             leverage_scores=compute_leverage_scores(U),
         )
+
+
+@dataclass(frozen=True)
+class RMTSubspaceComparison:
+    """Backend result for one equal-rank subspace comparison."""
+
+    rank: int
+    principal_angles_degrees: tuple[float, ...]
+    mean_principal_angle_degrees: float
+    max_principal_angle_degrees: float
+    projection_distance: float
+    normalized_projection_distance: float
+    min_canonical_correlation: float
 
 
 def compute_leverage_scores(U: np.ndarray) -> np.ndarray:
@@ -123,6 +137,26 @@ class MatrixRMTBackend:
         )
 
     @staticmethod
+    def compare_subspace_prefixes(
+        reference_basis: np.ndarray,
+        candidate_basis: np.ndarray,
+        max_rank: int,
+    ) -> tuple[RMTSubspaceComparison, ...]:
+        reference, candidate, max_rank = _validate_subspace_inputs(
+            reference_basis,
+            candidate_basis,
+            max_rank,
+        )
+        return tuple(
+            _compare_matrix_subspaces(
+                reference[:, :rank],
+                candidate[:, :rank],
+                rank,
+            )
+            for rank in range(1, max_rank + 1)
+        )
+
+    @staticmethod
     def project_new_unfolding(
         M_new: np.ndarray,
         right_basis: np.ndarray,
@@ -143,3 +177,51 @@ class MatrixRMTBackend:
         logits = logits - np.max(logits, axis=1, keepdims=True)
         proba = np.exp(logits)
         return proba / np.maximum(np.sum(proba, axis=1, keepdims=True), 1e-12)
+
+
+def _validate_subspace_inputs(
+    reference_basis: np.ndarray,
+    candidate_basis: np.ndarray,
+    max_rank: int,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    reference = np.asarray(reference_basis, dtype=np.float64)
+    candidate = np.asarray(candidate_basis, dtype=np.float64)
+    if reference.ndim != 2 or candidate.ndim != 2:
+        raise ValueError("Subspace bases must be 2D matrices")
+    if reference.shape[0] != candidate.shape[0]:
+        raise ValueError("Subspace bases must have the same number of rows")
+    if not np.all(np.isfinite(reference)) or not np.all(np.isfinite(candidate)):
+        raise ValueError("Subspace bases must contain only finite values")
+    max_rank = int(max_rank)
+    if max_rank < 1:
+        raise ValueError("max_rank must be positive")
+    if max_rank > min(reference.shape[1], candidate.shape[1]):
+        raise ValueError("max_rank exceeds the available basis dimensions")
+    return reference, candidate, max_rank
+
+
+def _compare_matrix_subspaces(
+    reference_basis: np.ndarray,
+    candidate_basis: np.ndarray,
+    rank: int,
+) -> RMTSubspaceComparison:
+    reference_q, _ = np.linalg.qr(reference_basis, mode="reduced")
+    candidate_q, _ = np.linalg.qr(candidate_basis, mode="reduced")
+    canonical_correlations = np.linalg.svd(
+        reference_q.T @ candidate_q,
+        compute_uv=False,
+    )
+    canonical_correlations = np.clip(canonical_correlations, 0.0, 1.0)
+    angles = np.degrees(np.arccos(canonical_correlations))
+    overlap_squared = float(np.sum(canonical_correlations ** 2))
+    projection_distance = math.sqrt(max(0.0, 2.0 * rank - 2.0 * overlap_squared))
+    normalized_distance = projection_distance / math.sqrt(2.0 * rank)
+    return RMTSubspaceComparison(
+        rank=int(rank),
+        principal_angles_degrees=tuple(map(float, angles)),
+        mean_principal_angle_degrees=float(np.mean(angles)),
+        max_principal_angle_degrees=float(np.max(angles)),
+        projection_distance=float(projection_distance),
+        normalized_projection_distance=float(normalized_distance),
+        min_canonical_correlation=float(np.min(canonical_correlations)),
+    )

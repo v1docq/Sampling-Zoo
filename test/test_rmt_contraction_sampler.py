@@ -292,6 +292,79 @@ def test_torch_backend_runs_spectral_null_diagnostic() -> None:
     assert sampler.diagnostics_["null_successful_resamples"] == 4
 
 
+def test_subspace_diagnostic_is_opt_in_and_does_not_change_sampling() -> None:
+    X = _frame(n_samples=48).select_dtypes(include=[np.number])
+    shared = dict(
+        n_partitions=3,
+        n_views=3,
+        projection_dim=2,
+        backend="numpy",
+        random_state=53,
+        show_progress=False,
+    )
+
+    baseline = RMTContractionTensorSampler(**shared).fit(X)
+    diagnosed = RMTContractionTensorSampler(
+        subspace_diagnostic_enabled=True,
+        subspace_resamples=2,
+        **shared,
+    ).fit(X)
+
+    assert baseline.diagnostics_["subspace_stability_status"] == "disabled"
+    assert diagnosed.diagnostics_["subspace_stability_status"] == "ok"
+    assert diagnosed.diagnostics_["subspace_successful_resamples"] == 2
+    assert diagnosed.diagnostics_["subspace_comparison_rank"] == (
+        diagnosed.diagnostics_["selected_rank"]
+    )
+    assert diagnosed.diagnostics_["rank_by_subspace_stability"] is not None
+    assert diagnosed.diagnostics_["selected_rank_reason"] == "explained_variance"
+    assert diagnosed.diagnostics_["selected_rank"] == baseline.diagnostics_["selected_rank"]
+    assert np.allclose(
+        diagnosed.diagnostics_["singular_values"],
+        baseline.diagnostics_["singular_values"],
+    )
+    assert all(
+        np.array_equal(
+            diagnosed.partitions[name],
+            baseline.partitions[name],
+        )
+        for name in baseline.partition_names_
+    )
+
+
+def test_invalid_subspace_diagnostic_config_is_rejected() -> None:
+    with pytest.raises(ValueError, match="subspace_resamples must be at least 2"):
+        RMTContractionTensorSampler(subspace_resamples=1)
+
+    with pytest.raises(
+        ValueError,
+        match="subspace_max_principal_angle_degrees",
+    ):
+        RMTContractionTensorSampler(
+            subspace_max_principal_angle_degrees=91.0
+        )
+
+
+@pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch is optional")
+def test_torch_backend_runs_subspace_stability_diagnostic() -> None:
+    X = _frame(n_samples=32).select_dtypes(include=[np.number])
+    sampler = RMTContractionTensorSampler(
+        n_partitions=2,
+        n_views=2,
+        projection_dim=2,
+        backend="torch",
+        device="cpu",
+        subspace_diagnostic_enabled=True,
+        subspace_resamples=2,
+        random_state=59,
+        show_progress=False,
+    ).fit(X)
+
+    assert sampler.diagnostics_["backend"] == "torch"
+    assert sampler.diagnostics_["subspace_stability_status"] == "ok"
+    assert sampler.diagnostics_["subspace_successful_resamples"] == 2
+
+
 def test_matrix_rmt_backend_returns_expected_shapes() -> None:
     X = np.random.default_rng(123).normal(size=(40, 6))
     sampler = RMTContractionTensorSampler(

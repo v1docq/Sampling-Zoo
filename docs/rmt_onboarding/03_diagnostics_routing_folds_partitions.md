@@ -84,6 +84,13 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 | `rank_selection_method` | Сейчас основной метод: `explained_variance`. |
 | `explained_variance_threshold` | Порог, например `0.95`. |
 | `explained_variance_at_selected_rank` | Фактическая cumulative explained variance на selected rank. |
+| `rank_by_null_edge` | Число компонент выше empirical null bulk edge. |
+| `rank_by_stability` | Устойчивость singular-value outliers при повторных views. |
+| `rank_by_subspace_stability` | Максимальный prefix rank с устойчивым left singular span. |
+| `subspace_stability_status` | Состояние opt-in subspace diagnostics: `disabled`, `ok`, `partial`, `failed`. |
+| `subspace_max_angle_quantile_degrees` | Quantile максимального principal angle на comparison rank. |
+| `subspace_normalized_projection_distance_quantile` | Quantile нормированного расстояния проекторов. |
+| `subspace_stability_frequency` | Доля view resamples, прошедших оба geometric threshold. |
 | `singular_values` | Сингулярные значения до/после truncation, полезны для анализа spectral decay. |
 | `leverage_entropy` | Энтропия распределения leverage scores. Низкая энтропия означает концентрацию leverage на малом числе точек. |
 | `effective_sample_count` | Эффективное число точек по leverage distribution. |
@@ -104,6 +111,8 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 - Если `selected_rank` близок к `initial_rank`, спектр убывает медленно: пространство может быть сложным или threshold слишком высоким.
 - Если `n_views_policy="coverage"`, проверяйте `estimated_feature_coverage`: низкое значение означает, что subsample-views не покрыли признаки достаточно широко.
 - Если `n_views_policy="spectrum_stability"`, смотрите `spectrum_stability_change`: большое значение означает, что спектр еще нестабилен относительно числа views.
+- Близкие `rank_by_null_edge` и `rank_by_subspace_stability` усиливают свидетельство устойчивого отделимого сигнала; большой разрыв означает чувствительность spectral directions к contractions.
+- Rank-1 может быть нестабилен при стабильном rank-2 span из-за вращения близких singular vectors. Это нормальная геометрия, а не обязательно ошибка diagnostics.
 - Если `leverage_entropy` очень низкая, sampler нашел небольшое число spectral-influential объектов. Это может быть полезно, но стоит проверить стабильность chunks.
 - Если `chunk_sizes` сильно несбалансированы, выбранный clustering candidate может разделять данные на плотное ядро и редкие regions.
 - Если `selected_n_partitions` сильно меньше `n_partitions_requested`, auto-selection решила, что дополнительные clusters ухудшают balanced objective или нарушают constraints.

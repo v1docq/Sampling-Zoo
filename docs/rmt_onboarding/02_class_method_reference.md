@@ -400,6 +400,8 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 | `rank_selection_method` | Метод выбора итогового rank. Сейчас основной default: `explained_variance`. |
 | `explained_variance_threshold` | Порог cumulative spectral energy. Default: `0.95`. |
 | `min_rank` | Нижняя граница selected rank. |
+| `null_diagnostic_enabled`, `null_*` | Opt-in empirical null references и bulk-edge diagnostics; подробно в `08_null_calibrated_spectral_diagnostics.md`. |
+| `subspace_diagnostic_enabled`, `subspace_*` | Opt-in principal-angle и projection-distance diagnostics; подробно в `09_spectral_subspace_stability.md`. |
 | `view_strategy` | `subsample` или `gaussian`. |
 | `selection_method` | Как выбирать точки внутри cluster: `all`, `leverage`, `maxvol`, `hybrid`. |
 | `routing_temperature` | Температура softmax routing-а. Больше значение делает weights более равномерными. |
@@ -441,6 +443,8 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 | `_get_rmt_backend()` | Возвращает backend и проверяет, что он создан. |
 | `_build_fit_unfolding(X_num, rng)` | Строит mode-0 unfolding на train features. |
 | `_fit_spectral_basis(M)` | Вычисляет spectral basis и adaptive rank. |
+| `_fit_spectral_null_diagnostic(X_num)` | Строит empirical null references через активный backend, если diagnostics включены. |
+| `_fit_spectral_subspace_diagnostic(X_num)` | Оценивает устойчивость left singular subspace при повторной генерации views. |
 | `_fit_clusters_and_partitions(scores, target)` | Делегирует выбор labels фиксированному KMeans или `SpectralClusterSelector`, затем строит partitions. |
 | `_fit_auto_partition_clusters(embedding, target)` | Выбирает алгоритм и число clusters через auto-selection. |
 | `_partition_info_from_selection(result)` | Превращает результат `SpectralClusterSelector` в diagnostics-friendly `PartitionSelectionInfo`. |

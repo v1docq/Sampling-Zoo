@@ -121,6 +121,45 @@ class RMTReportTableBuilder:
                     df,
                     "extra.sampler_diagnostics.null_successful_resamples",
                 ),
+                "subspace_stability_status": value_series(
+                    df,
+                    "extra.sampler_diagnostics.subspace_stability_status",
+                    default=None,
+                ),
+                "subspace_comparison_rank": self._numeric_series(
+                    df,
+                    "extra.sampler_diagnostics.subspace_comparison_rank",
+                ),
+                "subspace_rank_source": value_series(
+                    df,
+                    "extra.sampler_diagnostics.subspace_rank_source",
+                    default=None,
+                ),
+                "rank_by_subspace_stability": self._numeric_series(
+                    df,
+                    "extra.sampler_diagnostics.rank_by_subspace_stability",
+                ),
+                "subspace_max_angle_quantile_degrees": self._numeric_series(
+                    df,
+                    "extra.sampler_diagnostics.subspace_max_angle_quantile_degrees",
+                ),
+                "subspace_normalized_projection_distance_quantile": (
+                    self._numeric_series(
+                        df,
+                        (
+                            "extra.sampler_diagnostics."
+                            "subspace_normalized_projection_distance_quantile"
+                        ),
+                    )
+                ),
+                "subspace_stability_frequency": self._numeric_series(
+                    df,
+                    "extra.sampler_diagnostics.subspace_stability_frequency",
+                ),
+                "subspace_successful_resamples": self._numeric_series(
+                    df,
+                    "extra.sampler_diagnostics.subspace_successful_resamples",
+                ),
                 "budget_ratio": self._numeric_series(df, "strategy_params.budget_ratio"),
                 "total_train_rows": self._numeric_series(df, "sample_stats.sample_size"),
                 "rmse": self._numeric_series(df, "model_metrics.rmse"),
@@ -286,6 +325,8 @@ class RMTReportTableBuilder:
                     "cluster_ensemble_method",
                     "null_model_status",
                     "null_primary_policy",
+                    "subspace_stability_status",
+                    "subspace_rank_source",
                     "budget_ratio",
                 ],
                 as_index=False,
@@ -300,6 +341,12 @@ class RMTReportTableBuilder:
                     "rank_by_stability": "mean",
                     "null_max_outlier_excess": "mean",
                     "null_successful_resamples": "mean",
+                    "subspace_comparison_rank": "mean",
+                    "rank_by_subspace_stability": "mean",
+                    "subspace_max_angle_quantile_degrees": "mean",
+                    "subspace_normalized_projection_distance_quantile": "mean",
+                    "subspace_stability_frequency": "mean",
+                    "subspace_successful_resamples": "mean",
                     "total_train_rows": "mean",
                     "rmse": "mean",
                     "rmse_ref": "mean",
@@ -336,6 +383,8 @@ class RMTReportTableBuilder:
                 "cluster_ensemble_method",
                 "null_model_status",
                 "null_primary_policy",
+                "subspace_stability_status",
+                "subspace_rank_source",
                 "ensemble_method",
                 "router",
                 "budget_ratio",
@@ -363,6 +412,8 @@ class RMTReportTableBuilder:
                     "cluster_ensemble_method",
                     "null_model_status",
                     "null_primary_policy",
+                    "subspace_stability_status",
+                    "subspace_rank_source",
                 ],
                 as_index=False,
                 dropna=False,

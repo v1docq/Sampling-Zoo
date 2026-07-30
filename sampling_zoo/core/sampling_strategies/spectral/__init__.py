@@ -7,6 +7,12 @@ from .null_diagnostics import (
     SpectralNullDiagnosticResult,
 )
 from .rmt_contraction_sampler import RMTContractionTensorSampler
+from .subspace_diagnostics import (
+    SpectralSubspaceDiagnostic,
+    SpectralSubspaceDiagnosticConfig,
+    SpectralSubspaceDiagnosticResult,
+    SubspaceDiagnosticStatus,
+)
 
 __all__ = [
     "NullDiagnosticStatus",
@@ -15,4 +21,8 @@ __all__ = [
     "SpectralNullDiagnostic",
     "SpectralNullDiagnosticConfig",
     "SpectralNullDiagnosticResult",
+    "SpectralSubspaceDiagnostic",
+    "SpectralSubspaceDiagnosticConfig",
+    "SpectralSubspaceDiagnosticResult",
+    "SubspaceDiagnosticStatus",
 ]

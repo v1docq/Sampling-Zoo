@@ -209,9 +209,9 @@ quantiles, frequencies, empirical p-values и failures каждого replicate.
 - Сильное расхождение permutation и Gaussian policies указывает, что форма
   маргинальных распределений существенно влияет на спектр.
 
-Следующий научный шаг — добавить principal-angle/subspace stability и только
-после synthetic controls рассматривать policy
-`stable null outliers -> explained variance fallback` для production rank.
+Principal-angle/subspace stability реализована отдельным opt-in слоем и
+описана в `09_spectral_subspace_stability.md`. Объединять ее с null edge в
+production rank policy следует только после synthetic controls.
 
 ## Text2Image Prompt
 
