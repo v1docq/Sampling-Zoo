@@ -25,6 +25,7 @@ class ClusterCandidateFitFailureCode(str, Enum):
 class ClusterConstraintViolation(str, Enum):
     MAX_IMBALANCE_RATIO = "max_imbalance_ratio"
     MIN_CLUSTER_FRACTION = "min_cluster_fraction"
+    SINGLE_CLASS_CLUSTER = "single_class_cluster"
 
 
 @dataclass(frozen=True)
@@ -166,6 +167,38 @@ class ClusterCandidateFitFailure:
 
 
 @dataclass(frozen=True)
+class ClassificationPartitionComponents:
+    """Class coverage and distribution drift of one candidate partitioning."""
+
+    class_labels: Tuple[str, ...]
+    global_class_counts: Tuple[int, ...]
+    cluster_class_counts: Tuple[Tuple[int, ...], ...]
+    missing_class_fraction: float
+    single_class_cluster_fraction: float
+    single_class_sample_fraction: float
+    class_distribution_drift: float
+    violations: Tuple[ClusterConstraintViolation, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "class_labels": list(self.class_labels),
+            "global_class_counts": list(self.global_class_counts),
+            "cluster_class_counts": [
+                list(counts) for counts in self.cluster_class_counts
+            ],
+            "missing_class_fraction": float(self.missing_class_fraction),
+            "single_class_cluster_fraction": float(
+                self.single_class_cluster_fraction
+            ),
+            "single_class_sample_fraction": float(self.single_class_sample_fraction),
+            "class_distribution_drift": float(self.class_distribution_drift),
+            "constraint_violations": [
+                violation.value for violation in self.violations
+            ],
+        }
+
+
+@dataclass(frozen=True)
 class ClusterScoreComponents:
     """Balanced-objective inputs and explicit hard-constraint violations."""
 
@@ -176,6 +209,7 @@ class ClusterScoreComponents:
     target_contrast: float
     counts: Tuple[int, ...]
     violations: Tuple[ClusterConstraintViolation, ...]
+    classification: Optional[ClassificationPartitionComponents] = None
 
     @property
     def valid(self) -> bool:
@@ -191,6 +225,11 @@ class ClusterScoreComponents:
             "valid": bool(self.valid),
             "counts": list(self.counts),
             "constraint_violations": [violation.value for violation in self.violations],
+            "classification": (
+                self.classification.to_dict()
+                if self.classification is not None
+                else None
+            ),
         }
 
 
@@ -294,6 +333,7 @@ def evaluate_cluster_score_components(
     target_contrast: float,
     max_cluster_imbalance_ratio: float,
     min_cluster_fraction: float,
+    classification: Optional[ClassificationPartitionComponents] = None,
 ) -> ClusterScoreComponents:
     normalized_counts = tuple(int(count) for count in counts)
     if not normalized_counts or any(count < 0 for count in normalized_counts):
@@ -318,6 +358,8 @@ def evaluate_cluster_score_components(
         violations.append(ClusterConstraintViolation.MAX_IMBALANCE_RATIO)
     if observed_min_fraction < float(min_cluster_fraction):
         violations.append(ClusterConstraintViolation.MIN_CLUSTER_FRACTION)
+    if classification is not None:
+        violations.extend(classification.violations)
     return ClusterScoreComponents(
         silhouette=None if silhouette is None else float(silhouette),
         imbalance_ratio=float(imbalance_ratio),
@@ -326,6 +368,86 @@ def evaluate_cluster_score_components(
         target_contrast=float(target_contrast),
         counts=normalized_counts,
         violations=tuple(violations),
+        classification=classification,
+    )
+
+
+def evaluate_classification_partition_components(
+    *,
+    global_class_counts: Sequence[int],
+    cluster_class_counts: Sequence[Sequence[int]],
+    class_labels: Sequence[str] = (),
+) -> ClassificationPartitionComponents:
+    """Evaluate class coverage and weighted distribution drift for partitions."""
+
+    global_counts = tuple(int(count) for count in global_class_counts)
+    cluster_counts = tuple(
+        tuple(int(count) for count in counts) for counts in cluster_class_counts
+    )
+    if not global_counts or any(count < 1 for count in global_counts):
+        raise ValueError("global_class_counts must contain positive counts")
+    if not cluster_counts:
+        raise ValueError("cluster_class_counts must contain at least one cluster")
+    if any(len(counts) != len(global_counts) for counts in cluster_counts):
+        raise ValueError("cluster class-count rows must align with global classes")
+    if any(count < 0 for counts in cluster_counts for count in counts):
+        raise ValueError("cluster class counts must be non-negative")
+    if any(sum(counts) < 1 for counts in cluster_counts):
+        raise ValueError("each cluster must contain at least one sample")
+    observed_global = tuple(
+        sum(counts[class_index] for counts in cluster_counts)
+        for class_index in range(len(global_counts))
+    )
+    if observed_global != global_counts:
+        raise ValueError("cluster class counts must sum to global_class_counts")
+    total_samples = sum(global_counts)
+    if total_samples < 1:
+        raise ValueError("classification profile must contain at least one sample")
+
+    labels = tuple(str(label) for label in class_labels)
+    if labels and len(labels) != len(global_counts):
+        raise ValueError("class_labels must align with global_class_counts")
+    if not labels:
+        labels = tuple(str(index) for index in range(len(global_counts)))
+
+    n_clusters = len(cluster_counts)
+    n_classes = len(global_counts)
+    missing_pairs = sum(
+        count == 0 for counts in cluster_counts for count in counts
+    )
+    single_class_rows = tuple(
+        counts for counts in cluster_counts if sum(count > 0 for count in counts) <= 1
+    )
+    global_distribution = tuple(count / total_samples for count in global_counts)
+    distribution_drift = 0.0
+    for counts in cluster_counts:
+        cluster_size = sum(counts)
+        cluster_distribution = tuple(count / cluster_size for count in counts)
+        total_variation = 0.5 * sum(
+            abs(observed - expected)
+            for observed, expected in zip(
+                cluster_distribution,
+                global_distribution,
+            )
+        )
+        distribution_drift += (cluster_size / total_samples) * total_variation
+
+    violations = (
+        (ClusterConstraintViolation.SINGLE_CLASS_CLUSTER,)
+        if single_class_rows
+        else ()
+    )
+    return ClassificationPartitionComponents(
+        class_labels=labels,
+        global_class_counts=global_counts,
+        cluster_class_counts=cluster_counts,
+        missing_class_fraction=float(missing_pairs / (n_clusters * n_classes)),
+        single_class_cluster_fraction=float(len(single_class_rows) / n_clusters),
+        single_class_sample_fraction=float(
+            sum(sum(counts) for counts in single_class_rows) / total_samples
+        ),
+        class_distribution_drift=float(distribution_drift),
+        violations=violations,
     )
 
 
@@ -336,6 +458,9 @@ def score_cluster_components(
     imbalance_penalty_weight: float,
     tiny_cluster_penalty_weight: float,
     target_contrast_weight: float,
+    missing_class_penalty_weight: float = 0.0,
+    single_class_penalty_weight: float = 0.0,
+    class_distribution_drift_weight: float = 0.0,
     hard_constraint_penalty: float = 1.0,
 ) -> float:
     silhouette = -1.0 if components.silhouette is None else components.silhouette
@@ -348,11 +473,32 @@ def score_cluster_components(
     )
     tiny_penalty = float(tiny_cluster_penalty_weight) * (components.tiny_cluster_mass)
     target_bonus = float(target_contrast_weight) * components.target_contrast
+    classification = components.classification
+    missing_class_penalty = (
+        float(missing_class_penalty_weight) * classification.missing_class_fraction
+        if classification is not None
+        else 0.0
+    )
+    single_class_penalty = (
+        float(single_class_penalty_weight)
+        * classification.single_class_cluster_fraction
+        if classification is not None
+        else 0.0
+    )
+    distribution_drift_penalty = (
+        float(class_distribution_drift_weight)
+        * classification.class_distribution_drift
+        if classification is not None
+        else 0.0
+    )
     constraint_penalty = 0.0 if components.valid else hard_constraint_penalty
     return float(
         silhouette
         - imbalance_penalty
         - tiny_penalty
+        - missing_class_penalty
+        - single_class_penalty
+        - distribution_drift_penalty
         + target_bonus
         - constraint_penalty
     )

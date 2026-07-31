@@ -159,6 +159,26 @@ $$
 
 Hard constraints включают `max_cluster_imbalance_ratio` и `min_cluster_fraction`. Это важно, потому что чистый silhouette часто выбирает слишком малое число clusters или допускает tiny chunks, на которых chunk-модель обучается плохо.
 
+Для classification target передается в selector, и objective дополняется:
+
+$$
+- \lambda_{miss} p_{miss}
+- \lambda_{single} p_{single}
+- \lambda_{drift} p_{drift}.
+$$
+
+`p_miss` измеряет долю отсутствующих пар chunk/class, `p_single` — долю
+одно-классовых chunks, `p_drift` — взвешенный по размеру chunk total-variation
+drift от глобального распределения классов. Одно-классовый chunk также является
+hard violation `single_class_cluster`. Отсутствие каждого редкого класса в каждом
+chunk не запрещается жёстко, иначе multiclass partitioning часто не имел бы ни
+одного допустимого candidate.
+
+Тип target задается через `cluster_target_type`. Benchmark factory передает
+`regression` или `classification` явно; режим `auto` предназначен прежде всего
+для прямого использования sampler-а. Для целочисленной regression target нужен
+явный `cluster_target_type="regression"`.
+
 Для каждого кластера можно:
 
 - взять все точки;

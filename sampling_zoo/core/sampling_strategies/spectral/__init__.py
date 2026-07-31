@@ -12,9 +12,11 @@ from .cluster_selection_contracts import (
     ClusterConstraintViolation,
     ClusterScoreComponents,
     ClusterSelectionUnavailableError,
+    ClassificationPartitionComponents,
     build_cluster_candidate_plan,
     build_cluster_consensus_plan,
     evaluate_cluster_score_components,
+    evaluate_classification_partition_components,
     score_cluster_components,
 )
 from .null_diagnostics import (
@@ -45,6 +47,7 @@ __all__ = [
     "ClusterConstraintViolation",
     "ClusterScoreComponents",
     "ClusterSelectionUnavailableError",
+    "ClassificationPartitionComponents",
     "NullDiagnosticStatus",
     "NullModelPolicy",
     "RMTContractionTensorSampler",
@@ -59,5 +62,6 @@ __all__ = [
     "build_cluster_consensus_plan",
     "build_weighted_membership_embedding",
     "evaluate_cluster_score_components",
+    "evaluate_classification_partition_components",
     "score_cluster_components",
 ]

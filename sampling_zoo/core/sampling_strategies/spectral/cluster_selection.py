@@ -10,6 +10,7 @@ import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 from sklearn.mixture import GaussianMixture
+from sklearn.utils.multiclass import type_of_target
 
 from .cluster_consensus import build_weighted_membership_embedding
 from .cluster_selection_contracts import (
@@ -18,12 +19,14 @@ from .cluster_selection_contracts import (
     ClusterCandidatePlan,
     ClusterCandidateRequest,
     ClusterConsensusPlan,
+    ClassificationPartitionComponents,
     ClusterScoreComponents,
     ClusterSelectionUnavailableError,
     build_cluster_candidate_plan,
     build_cluster_consensus_plan,
     candidate_fit_failure,
     evaluate_cluster_score_components,
+    evaluate_classification_partition_components,
     normalize_cluster_algorithm,
     score_cluster_components,
 )
@@ -118,6 +121,10 @@ class SpectralClusterSelector:
         imbalance_penalty_weight: float = 0.15,
         tiny_cluster_penalty_weight: float = 0.30,
         target_contrast_weight: float = 0.0,
+        target_type: str = "auto",
+        missing_class_penalty_weight: float = 0.25,
+        single_class_penalty_weight: float = 0.50,
+        class_distribution_drift_weight: float = 0.25,
         vote_temperature: float = 0.05,
         random_state: Optional[int] = 42,
         show_progress: bool = True,
@@ -144,6 +151,23 @@ class SpectralClusterSelector:
         self.imbalance_penalty_weight = float(imbalance_penalty_weight)
         self.tiny_cluster_penalty_weight = float(tiny_cluster_penalty_weight)
         self.target_contrast_weight = float(target_contrast_weight)
+        self.target_type = self._validate_choice(
+            "cluster_target_type",
+            target_type,
+            ("auto", "regression", "classification"),
+        )
+        self.missing_class_penalty_weight = self._validate_nonnegative_float(
+            "missing_class_penalty_weight",
+            missing_class_penalty_weight,
+        )
+        self.single_class_penalty_weight = self._validate_nonnegative_float(
+            "single_class_penalty_weight",
+            single_class_penalty_weight,
+        )
+        self.class_distribution_drift_weight = self._validate_nonnegative_float(
+            "class_distribution_drift_weight",
+            class_distribution_drift_weight,
+        )
         self.vote_temperature = max(float(vote_temperature), 1e-6)
         self.random_state = random_state
         self.show_progress = bool(show_progress)
@@ -185,7 +209,7 @@ class SpectralClusterSelector:
             consensus_candidates=(
                 decision.consensus.candidates if decision.consensus else ()
             ),
-            diagnostics=self._build_diagnostics(batch, decision),
+            diagnostics=self._build_diagnostics(batch, decision, target),
         )
 
     def build_candidate_plan(self, n_samples: int) -> ClusterCandidatePlan:
@@ -364,13 +388,24 @@ class SpectralClusterSelector:
     ) -> ClusterScoreComponents:
         counts = np.bincount(labels, minlength=int(labels.max()) + 1)
         silhouette = self._safe_silhouette(embedding, labels)
-        target_contrast = self._target_contrast(labels, target)
+        resolved_target_type = self._resolve_target_type(target)
+        target_contrast = (
+            self._target_contrast(labels, target)
+            if resolved_target_type == "regression"
+            else 0.0
+        )
+        classification = (
+            self._classification_components(labels, target)
+            if resolved_target_type == "classification"
+            else None
+        )
         return evaluate_cluster_score_components(
             counts=counts,
             silhouette=silhouette,
             target_contrast=target_contrast,
             max_cluster_imbalance_ratio=self.max_cluster_imbalance_ratio,
             min_cluster_fraction=self.min_cluster_fraction,
+            classification=classification,
         )
 
     def _candidate_score(self, components: ClusterScoreComponents) -> float:
@@ -380,6 +415,57 @@ class SpectralClusterSelector:
             imbalance_penalty_weight=self.imbalance_penalty_weight,
             tiny_cluster_penalty_weight=self.tiny_cluster_penalty_weight,
             target_contrast_weight=self.target_contrast_weight,
+            missing_class_penalty_weight=self.missing_class_penalty_weight,
+            single_class_penalty_weight=self.single_class_penalty_weight,
+            class_distribution_drift_weight=(
+                self.class_distribution_drift_weight
+            ),
+        )
+
+    def _resolve_target_type(self, target: Optional[Any]) -> str:
+        if target is None:
+            return "none"
+        if self.target_type != "auto":
+            return self.target_type
+        try:
+            inferred = type_of_target(np.asarray(target))
+        except (TypeError, ValueError):
+            return "none"
+        if inferred in {"binary", "multiclass"}:
+            return "classification"
+        if inferred in {"continuous"}:
+            return "regression"
+        return "none"
+
+    @staticmethod
+    def _classification_components(
+        labels: np.ndarray,
+        target: Optional[Any],
+    ) -> Optional[ClassificationPartitionComponents]:
+        if target is None:
+            return None
+        y = np.asarray(target)
+        if y.ndim != 1 or y.size != labels.size:
+            return None
+        try:
+            classes, encoded = np.unique(y, return_inverse=True)
+        except (TypeError, ValueError):
+            return None
+        cluster_ids = np.unique(labels)
+        class_counts = np.zeros((cluster_ids.size, classes.size), dtype=int)
+        cluster_positions = {
+            int(cluster_id): position
+            for position, cluster_id in enumerate(cluster_ids.tolist())
+        }
+        rows = np.asarray(
+            [cluster_positions[int(cluster_id)] for cluster_id in labels],
+            dtype=int,
+        )
+        np.add.at(class_counts, (rows, encoded), 1)
+        return evaluate_classification_partition_components(
+            global_class_counts=np.bincount(encoded, minlength=classes.size),
+            cluster_class_counts=class_counts,
+            class_labels=tuple(str(value) for value in classes.tolist()),
         )
 
     def _safe_silhouette(
@@ -532,6 +618,7 @@ class SpectralClusterSelector:
         self,
         batch: _ClusterCandidateBatch,
         decision: _ClusterSelectionDecision,
+        target: Optional[Any],
     ) -> Dict[str, Any]:
         selected = decision.selected
         consensus = decision.consensus
@@ -543,6 +630,17 @@ class SpectralClusterSelector:
             "cluster_ensemble_method": self.ensemble_method,
             "max_cluster_imbalance_ratio": float(self.max_cluster_imbalance_ratio),
             "min_cluster_fraction": float(self.min_cluster_fraction),
+            "cluster_target_type": self.target_type,
+            "resolved_cluster_target_type": self._resolve_target_type(target),
+            "missing_class_penalty_weight": float(
+                self.missing_class_penalty_weight
+            ),
+            "single_class_penalty_weight": float(
+                self.single_class_penalty_weight
+            ),
+            "class_distribution_drift_weight": float(
+                self.class_distribution_drift_weight
+            ),
             "candidate_plan": batch.plan.to_dict(),
             "candidate_failures": [failure.to_dict() for failure in batch.failures],
             "selected_candidate": self._candidate_diagnostic(selected),
@@ -599,6 +697,13 @@ class SpectralClusterSelector:
             allowed = ", ".join(choices)
             raise ValueError(f"{name} must be one of: {allowed}")
         return value
+
+    @staticmethod
+    def _validate_nonnegative_float(name: str, value: float) -> float:
+        normalized = float(value)
+        if not np.isfinite(normalized) or normalized < 0:
+            raise ValueError(f"{name} must be a non-negative finite value")
+        return normalized
 
     @staticmethod
     def _normalize_labels(labels: np.ndarray) -> np.ndarray:

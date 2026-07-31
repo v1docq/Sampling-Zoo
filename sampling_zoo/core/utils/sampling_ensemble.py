@@ -229,6 +229,8 @@ class SamplingEnsemble:
     ) -> Dict[str, Any]:
         if strategy_name in ['difficulty', 'uncertainty']:
             return self._fit_supervised_partitioner(partitioner, features, target)
+        if strategy_name == 'rmt_contraction':
+            return self._fit_target_aware_partitioner(partitioner, features, target)
         if strategy_name.__contains__('stratified'):
             return self._fit_stratified_partitioner(partitioner, features, target)
         return self._fit_standard_partitioner(partitioner, features, target)
@@ -241,6 +243,15 @@ class SamplingEnsemble:
     @staticmethod
     def _fit_standard_partitioner(partitioner: Any, features: pd.DataFrame, target: pd.Series) -> Dict[str, Any]:
         partitioner.fit(features)
+        return partitioner.get_partitions(features, target)
+
+    @staticmethod
+    def _fit_target_aware_partitioner(
+        partitioner: Any,
+        features: pd.DataFrame,
+        target: pd.Series,
+    ) -> Dict[str, Any]:
+        partitioner.fit(features, target=target)
         return partitioner.get_partitions(features, target)
 
     @staticmethod

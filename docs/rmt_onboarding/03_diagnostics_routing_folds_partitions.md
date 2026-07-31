@@ -101,8 +101,19 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 | `cluster_algorithms` | Список алгоритмов-кандидатов. |
 | `cluster_selection_metric` | `silhouette` или `balanced_silhouette`. |
 | `cluster_ensemble_method` | `best_score`, legacy `weighted_vote` или `coassociation`. |
+| `cluster_target_type` | Настроенный target mode: `auto`, `regression` или `classification`. |
+| `resolved_cluster_target_type` | Фактически использованный selector-ом target mode; находится в diagnostics `SpectralClusterSelector`. |
+| `missing_class_penalty_weight` | Вес штрафа за отсутствующие chunk/class pairs. |
+| `single_class_penalty_weight` | Вес штрафа за одно-классовые chunks. |
+| `class_distribution_drift_weight` | Вес class-distribution drift в balanced objective. |
 | `partition_selection_scores` | Scores по кандидатам `k`. |
-| `partition_selection_candidate_details` | Подробности candidates: algorithm, score, valid flag, components. |
+| `partition_selection_candidate_details` | Подробности candidates: algorithm, score, valid flag, balance components и optional `classification` profile. |
+| `components.classification.global_class_counts` | Глобальное число строк каждого класса. |
+| `components.classification.cluster_class_counts` | Матрица counts размера `n_chunks x n_classes`. |
+| `components.classification.missing_class_fraction` | Доля отсутствующих chunk/class pairs. |
+| `components.classification.single_class_cluster_fraction` | Доля chunks, содержащих только один класс. |
+| `components.classification.single_class_sample_fraction` | Доля всех строк, попавших в одно-классовые chunks. |
+| `components.classification.class_distribution_drift` | Среднее взвешенное total-variation distance между class distribution chunk-а и всего train. |
 | `partition_selection_candidate_plan` | Исходная и eligible count grid, size-guard rejections, fallback flag и planned adapter requests. |
 | `partition_selection_candidate_failures` | Structured failures: request, `adapter_unavailable`/`fit_failed`, тип и сообщение ошибки. |
 | `partition_selection_consensus.plan` | Source weights, votes по `k`, выбранное `k` и число columns в sparse membership representation. |
@@ -124,7 +135,10 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 - Если `chunk_sizes` сильно несбалансированы, выбранный clustering candidate может разделять данные на плотное ядро и редкие regions.
 - Если `selected_n_partitions` сильно меньше `n_partitions_requested`, auto-selection решила, что дополнительные clusters ухудшают balanced objective или нарушают constraints.
 - Если `size_guard_rejections` содержит ожидаемое `k`, оно не дошло до count-based adapters. При `size_guard_fallback_applied=True` вся исходная grid была возвращена после полного отсева.
-- `constraint_violations` внутри candidate components показывает конкретную hard constraint: `max_imbalance_ratio` и/или `min_cluster_fraction`.
+- `constraint_violations` внутри candidate components показывает конкретную hard constraint: `max_imbalance_ratio`, `min_cluster_fraction` и/или `single_class_cluster`.
+- Для classification сравнивайте `missing_class_fraction` и `class_distribution_drift` между candidates, а не только у выбранного разбиения. Нулевой `single_class_cluster_fraction` обязателен для valid candidate.
+- Высокий `missing_class_fraction` при нулевой доле одно-классовых chunks может быть нормален для multiclass dataset с редкими классами: это soft penalty, а не автоматический запрет candidate.
+- `cluster_target_type="auto"` удобен для прямого вызова, но integer-valued regression target может выглядеть как multiclass. Benchmark factory передает `regression`/`classification` явно.
 - Непустые `partition_selection_candidate_failures` не обязательно делают run failed: selector продолжает работу, если хотя бы один независимый adapter вернул candidate.
 - При `cluster_ensemble_method="coassociation"` ожидайте `representation_shape[0] == n_samples` и `representation_nnz <= n_samples * n_sources`. Большая fallback rate означает, что consensus систематически нарушает balance constraints и не должен становиться безусловным улучшением.
 - Если `encoded_feature_cap_applied=True`, downstream качество надо интерпретировать с учетом потери части one-hot признаков.
@@ -145,7 +159,7 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 2. собрать kwargs для partitioner-а;
 3. убрать служебные и unsupported kwargs;
 4. создать partitioner;
-5. вызвать подходящий fit-flow;
+5. вызвать подходящий fit-flow; для `rmt_contraction` target передается в `fit`, чтобы selector мог рассчитать task-aware objective;
 6. получить partitions;
 7. применить `budget_ratio`, если он задан;
 8. сохранить `self.partitions` и `self.partitioner`.

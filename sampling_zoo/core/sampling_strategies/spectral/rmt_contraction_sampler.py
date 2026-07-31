@@ -56,6 +56,10 @@ class RMTContractionConfig:
     imbalance_penalty_weight: float = 0.15
     tiny_cluster_penalty_weight: float = 0.30
     target_contrast_weight: float = 0.0
+    cluster_target_type: str = "auto"
+    missing_class_penalty_weight: float = 0.25
+    single_class_penalty_weight: float = 0.50
+    class_distribution_drift_weight: float = 0.25
     cluster_vote_temperature: float = 0.05
     n_views: Union[int, str] = "auto"
     n_views_policy: str = "auto"
@@ -155,6 +159,8 @@ class PartitionSelectionInfo:
     cluster_algorithms: Tuple[str, ...]
     cluster_selection_metric: str
     cluster_ensemble_method: str
+    cluster_target_type: str
+    resolved_cluster_target_type: str
     candidates: Tuple[int, ...]
     scores: Tuple[Tuple[int, Optional[float]], ...]
     candidate_details: Tuple[Dict[str, Any], ...]
@@ -257,6 +263,23 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self.imbalance_penalty_weight = float(cfg.imbalance_penalty_weight)
         self.tiny_cluster_penalty_weight = float(cfg.tiny_cluster_penalty_weight)
         self.target_contrast_weight = float(cfg.target_contrast_weight)
+        self.cluster_target_type = self._validate_choice(
+            "cluster_target_type",
+            cfg.cluster_target_type,
+            ("auto", "regression", "classification"),
+        )
+        self.missing_class_penalty_weight = self._validate_nonnegative_float(
+            "missing_class_penalty_weight",
+            cfg.missing_class_penalty_weight,
+        )
+        self.single_class_penalty_weight = self._validate_nonnegative_float(
+            "single_class_penalty_weight",
+            cfg.single_class_penalty_weight,
+        )
+        self.class_distribution_drift_weight = self._validate_nonnegative_float(
+            "class_distribution_drift_weight",
+            cfg.class_distribution_drift_weight,
+        )
         self.cluster_vote_temperature = self._validate_positive_float(
             "cluster_vote_temperature",
             cfg.cluster_vote_temperature,
@@ -427,6 +450,13 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             raise ValueError(f"{name} must be positive")
         return value
 
+    @staticmethod
+    def _validate_nonnegative_float(name: str, value: float) -> float:
+        value = float(value)
+        if not np.isfinite(value) or value < 0:
+            raise ValueError(f"{name} must be a non-negative finite value")
+        return value
+
     def _make_cluster_selector(self) -> SpectralClusterSelector:
         return SpectralClusterSelector(
             algorithms=self.cluster_algorithms,
@@ -441,6 +471,12 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             imbalance_penalty_weight=self.imbalance_penalty_weight,
             tiny_cluster_penalty_weight=self.tiny_cluster_penalty_weight,
             target_contrast_weight=self.target_contrast_weight,
+            target_type=self.cluster_target_type,
+            missing_class_penalty_weight=self.missing_class_penalty_weight,
+            single_class_penalty_weight=self.single_class_penalty_weight,
+            class_distribution_drift_weight=(
+                self.class_distribution_drift_weight
+            ),
             vote_temperature=self.cluster_vote_temperature,
             random_state=self.random_state,
             show_progress=self.show_progress,
@@ -706,6 +742,8 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             cluster_algorithms=("kmeans",),
             cluster_selection_metric="fixed",
             cluster_ensemble_method="none",
+            cluster_target_type=self.cluster_target_type,
+            resolved_cluster_target_type="not_used",
             candidates=(int(n_clusters),),
             scores=((int(n_clusters), None),),
             candidate_details=(),
@@ -749,6 +787,12 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             cluster_algorithms=tuple(result.diagnostics.get("cluster_algorithms", self.cluster_algorithms)),
             cluster_selection_metric=str(result.diagnostics.get("cluster_selection_metric", self.cluster_selection_metric)),
             cluster_ensemble_method=str(result.diagnostics.get("cluster_ensemble_method", self.cluster_ensemble_method)),
+            cluster_target_type=str(
+                result.diagnostics.get("cluster_target_type", self.cluster_target_type)
+            ),
+            resolved_cluster_target_type=str(
+                result.diagnostics.get("resolved_cluster_target_type", "none")
+            ),
             candidates=candidate_counts,
             scores=candidate_scores,
             candidate_details=candidate_details,
@@ -1232,6 +1276,25 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             "cluster_algorithms": list(partition_info.cluster_algorithms) if partition_info else [],
             "cluster_selection_metric": partition_info.cluster_selection_metric if partition_info else None,
             "cluster_ensemble_method": partition_info.cluster_ensemble_method if partition_info else None,
+            "cluster_target_type": (
+                partition_info.cluster_target_type
+                if partition_info
+                else self.cluster_target_type
+            ),
+            "resolved_cluster_target_type": (
+                partition_info.resolved_cluster_target_type
+                if partition_info
+                else "none"
+            ),
+            "missing_class_penalty_weight": float(
+                self.missing_class_penalty_weight
+            ),
+            "single_class_penalty_weight": float(
+                self.single_class_penalty_weight
+            ),
+            "class_distribution_drift_weight": float(
+                self.class_distribution_drift_weight
+            ),
             "partition_selection_candidates": list(partition_info.candidates) if partition_info else [],
             "partition_selection_scores": {
                 str(candidate): score
