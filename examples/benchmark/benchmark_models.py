@@ -4,6 +4,7 @@ import json
 import sys
 from dataclasses import dataclass
 from datetime import datetime
+from numbers import Integral
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence
 
@@ -273,8 +274,24 @@ def make_model_pool(
     seed: int = 42,
     model_names: Optional[Sequence[str]] = None,
     problem_type: Optional[str] = None,
+    n_jobs: int | None = None,
 ) -> Dict[str, Any]:
-    """Builds model pool for benchmark runners (name -> factory callable)."""
+    """Build model factories, optionally limiting parallel estimator workers.
+
+    ``n_jobs=None`` preserves the historical per-model defaults. Passing an
+    explicit value applies the same worker limit to parallel sklearn and
+    LightGBM estimators.
+    """
+    if n_jobs is not None:
+        if (
+            isinstance(n_jobs, bool)
+            or not isinstance(n_jobs, Integral)
+            or n_jobs == 0
+            or n_jobs < -1
+        ):
+            raise ValueError("n_jobs must be None, -1, or a positive integer")
+        n_jobs = int(n_jobs)
+
     available_names = {"random_forest", "lightgbm", "hist_gradient_boosting", "ridge", "tabpfn", "tabicl"}
     if model_names is None:
         requested = {"random_forest", "lightgbm"}
@@ -289,12 +306,13 @@ def make_model_pool(
     normalized_problem = problem_type.strip().lower() if problem_type else "classification"
 
     if "random_forest" in requested:
+        random_forest_n_jobs = -1 if n_jobs is None else n_jobs
         if normalized_problem == "regression":
             model_pool["random_forest"] = lambda: RandomForestRegressor(
                 n_estimators=80,
                 max_depth=10,
                 min_samples_leaf=2,
-                n_jobs=-1,
+                n_jobs=random_forest_n_jobs,
                 random_state=seed,
             )
         else:
@@ -302,22 +320,25 @@ def make_model_pool(
                 n_estimators=80,
                 max_depth=10,
                 min_samples_leaf=2,
-                n_jobs=-1,
+                n_jobs=random_forest_n_jobs,
                 random_state=seed,
             )
 
     if "lightgbm" in requested:
         if LGBMClassifier is None or LGBMRegressor is None:
             raise ValueError("lightgbm is not available. Install lightgbm or choose another model.")
+        lightgbm_parallel_kwargs = {} if n_jobs is None else {"n_jobs": n_jobs}
         if normalized_problem == "regression":
             model_pool["lightgbm"] = lambda: LGBMRegressor(
                 random_state=seed,
                 verbosity=-1,
+                **lightgbm_parallel_kwargs,
             )
         else:
             model_pool["lightgbm"] = lambda: LGBMClassifier(
                 random_state=seed,
                 verbosity=-1,
+                **lightgbm_parallel_kwargs,
             )
 
     if "hist_gradient_boosting" in requested:

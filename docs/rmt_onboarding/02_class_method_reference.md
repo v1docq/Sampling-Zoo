@@ -762,12 +762,13 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 
 | Элемент | Назначение |
 |---|---|
-| `RMTPartitionSelectionAblationConfig` | Frozen scientific config. Нормализует datasets, models, budgets и selection metrics; фиксирует `routed_weighted`, spectral router и gaussian views через преобразование в основной regression config. |
+| `RMTPartitionSelectionAblationConfig` | Frozen scientific config. Нормализует datasets, models, budgets и selection metrics; фиксирует `routed_weighted`, spectral router и gaussian views через преобразование в основной regression config. Параметр `model_n_jobs` явно ограничивает число потоков каждой parallel estimator; серверный default равен `1`, чтобы исключить oversubscription на многоядерных узлах. |
 | `RMTPartitionSelectionGridPoint` | Typed leaf point из пары `(budget_ratio, cluster_selection_metric)` с уникальным config name. |
 | `make_rmt_partition_selection_grid(...)` | Чисто и детерминированно строит budget-paired grid. |
 | `make_rmt_partition_selection_strategy_configs(config)` | Материализует typed grid в legacy strategy kwargs только на границе benchmark runner. |
 | `_build_experiment_plan()` | Включает все scientific axes и proxy parameters в run identity и artifact manifest. |
 | `_build_strategy_grid()` | Нормализует materialized configs в `StrategyGridContract`. |
+| `_make_model_pool()` | Материализует модели с явным `model_n_jobs` из ablation config; лимит одинаково применяется к LightGBM и RandomForest. |
 | `_build_run_meta(...)` | Добавляет тип эксперимента и validation-proxy parameters в incremental metadata. |
 | `run_rmt_partition_selection_ablation(...)` | Публичный entrypoint; execution lifecycle наследуется от `RMTRegressionExperimentOrchestrator`. |
 

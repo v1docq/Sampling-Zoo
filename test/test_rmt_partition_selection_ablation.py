@@ -3,6 +3,7 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
+from examples.benchmark import rmt_regression_medium_datasets
 from examples.benchmark.benchmark_logging import BenchmarkLogger
 from examples.benchmark.rmt_partition_selection_ablation import (
     RMTPartitionSelectionAblationConfig,
@@ -41,6 +42,15 @@ def test_ablation_config_normalizes_stable_sequences() -> None:
         "routed_weighted",
     )
     assert config.to_regression_config().router_modes == ("spectral",)
+    assert config.model_n_jobs == 1
+
+
+@pytest.mark.parametrize("model_n_jobs", [0, -1, True, 1.5, "2"])
+def test_ablation_config_rejects_invalid_model_worker_limit(
+    model_n_jobs,
+) -> None:
+    with pytest.raises(ValueError, match="model_n_jobs"):
+        RMTPartitionSelectionAblationConfig(model_n_jobs=model_n_jobs)
 
 
 @pytest.mark.parametrize(
@@ -197,10 +207,74 @@ def test_ablation_plan_and_metadata_capture_scientific_axes(
         "balanced_silhouette",
         "validation_proxy",
     )
+    assert plan.effective_config["model_n_jobs"] == 1
     assert metadata["experiment_kind"] == "rmt_partition_selection_ablation"
     assert metadata["cluster_selection_metrics"] == [
         "balanced_silhouette",
         "validation_proxy",
+    ]
+    assert metadata["model_n_jobs"] == 1
+
+
+def test_ablation_orchestrator_applies_model_worker_limit(monkeypatch) -> None:
+    calls = []
+    marker = object()
+
+    def fake_make_model_pool(**kwargs):
+        calls.append(kwargs)
+        return {"ridge": marker}
+
+    monkeypatch.setattr(
+        "examples.benchmark.rmt_partition_selection_ablation.make_model_pool",
+        fake_make_model_pool,
+    )
+    orchestrator = RMTPartitionSelectionAblationOrchestrator(
+        RMTPartitionSelectionAblationConfig(
+            regression_tasks=("diamonds",),
+            models=("ridge",),
+            model_n_jobs=2,
+            show_progress=False,
+        )
+    )
+
+    assert orchestrator._make_model_pool() == {"ridge": marker}
+    assert calls == [
+        {
+            "seed": 42,
+            "model_names": ("ridge",),
+            "problem_type": "regression",
+            "n_jobs": 2,
+        }
+    ]
+
+
+def test_base_orchestrator_keeps_legacy_model_pool_defaults(monkeypatch) -> None:
+    calls = []
+
+    def fake_make_model_pool(**kwargs):
+        calls.append(kwargs)
+        return {}
+
+    monkeypatch.setattr(
+        rmt_regression_medium_datasets,
+        "make_model_pool",
+        fake_make_model_pool,
+    )
+    orchestrator = rmt_regression_medium_datasets.RMTRegressionExperimentOrchestrator(
+        rmt_regression_medium_datasets.RMTRegressionExperimentConfig(
+            regression_tasks=("diamonds",),
+            models=("ridge",),
+            show_progress=False,
+        )
+    )
+
+    assert orchestrator._make_model_pool() == {}
+    assert calls == [
+        {
+            "seed": 42,
+            "model_names": ("ridge",),
+            "problem_type": "regression",
+        }
     ]
 
 
