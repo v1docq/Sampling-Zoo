@@ -30,6 +30,7 @@ from .cluster_selection_contracts import (
     normalize_cluster_algorithm,
     score_cluster_components,
 )
+from .partition_validation import PartitionValidationProxyEvaluator
 from ...utils.progress import progress_bar, progress_write
 
 try:  # scikit-learn >= 1.1
@@ -65,6 +66,13 @@ class _ClusterCandidateBatch:
     plan: ClusterCandidatePlan
     candidates: Tuple[ClusterCandidate, ...]
     failures: Tuple[ClusterCandidateFitFailure, ...]
+
+
+@dataclass(frozen=True)
+class _ClusterScoringContext:
+    target: Optional[Any]
+    resolved_target_type: str
+    validation_proxy: Optional[PartitionValidationProxyEvaluator] = None
 
 
 @dataclass(frozen=True)
@@ -125,6 +133,9 @@ class SpectralClusterSelector:
         missing_class_penalty_weight: float = 0.25,
         single_class_penalty_weight: float = 0.50,
         class_distribution_drift_weight: float = 0.25,
+        validation_proxy_fraction: float = 0.2,
+        validation_proxy_min_partition_rows: int = 8,
+        validation_proxy_smoothing: float = 1.0,
         vote_temperature: float = 0.05,
         random_state: Optional[int] = 42,
         show_progress: bool = True,
@@ -133,7 +144,7 @@ class SpectralClusterSelector:
         self.selection_metric = self._validate_choice(
             "cluster_selection_metric",
             selection_metric,
-            ("silhouette", "balanced_silhouette"),
+            ("silhouette", "balanced_silhouette", "validation_proxy"),
         )
         self.ensemble_method = self._validate_choice(
             "cluster_ensemble_method",
@@ -168,6 +179,18 @@ class SpectralClusterSelector:
             "class_distribution_drift_weight",
             class_distribution_drift_weight,
         )
+        self.validation_proxy_fraction = self._validate_fraction(
+            "validation_proxy_fraction",
+            validation_proxy_fraction,
+        )
+        self.validation_proxy_min_partition_rows = max(
+            1,
+            int(validation_proxy_min_partition_rows),
+        )
+        self.validation_proxy_smoothing = self._validate_positive_float(
+            "validation_proxy_smoothing",
+            validation_proxy_smoothing,
+        )
         self.vote_temperature = max(float(vote_temperature), 1e-6)
         self.random_state = random_state
         self.show_progress = bool(show_progress)
@@ -180,11 +203,16 @@ class SpectralClusterSelector:
         embedding = np.asarray(embedding, dtype=float)
         if embedding.ndim != 2:
             raise ValueError("embedding must be a 2D matrix")
-        batch = self._build_candidates(embedding, target)
+        scoring_context = self._build_scoring_context(embedding, target)
+        batch = self._build_candidates(embedding, scoring_context)
         if not batch.candidates:
             raise ClusterSelectionUnavailableError(batch.plan, batch.failures)
 
-        decision = self._select_candidate(batch.candidates, embedding, target)
+        decision = self._select_candidate(
+            batch.candidates,
+            embedding,
+            scoring_context,
+        )
         selected = decision.selected
         progress_write(
             (
@@ -209,7 +237,11 @@ class SpectralClusterSelector:
             consensus_candidates=(
                 decision.consensus.candidates if decision.consensus else ()
             ),
-            diagnostics=self._build_diagnostics(batch, decision, target),
+            diagnostics=self._build_diagnostics(
+                batch,
+                decision,
+                scoring_context,
+            ),
         )
 
     def build_candidate_plan(self, n_samples: int) -> ClusterCandidatePlan:
@@ -224,7 +256,7 @@ class SpectralClusterSelector:
     def _build_candidates(
         self,
         embedding: np.ndarray,
-        target: Optional[Any],
+        scoring_context: _ClusterScoringContext,
     ) -> _ClusterCandidateBatch:
         plan = self.build_candidate_plan(embedding.shape[0])
         candidates: List[ClusterCandidate] = []
@@ -243,7 +275,7 @@ class SpectralClusterSelector:
                 outcome = self._fit_candidate_request(
                     request,
                     embedding,
-                    target,
+                    scoring_context,
                 )
                 if isinstance(outcome, ClusterCandidateFitFailure):
                     failures.append(outcome)
@@ -281,18 +313,18 @@ class SpectralClusterSelector:
         self,
         request: ClusterCandidateRequest,
         embedding: np.ndarray,
-        target: Optional[Any],
+        scoring_context: _ClusterScoringContext,
     ) -> Union[ClusterCandidate, ClusterCandidateFitFailure]:
         try:
             if request.kind is ClusterCandidateKind.DENSITY_BASED:
-                return self._fit_hdbscan_candidate(embedding, target)
+                return self._fit_hdbscan_candidate(embedding, scoring_context)
             if request.n_clusters is None:
                 raise ValueError("Count-based request requires n_clusters")
             return self._fit_count_based_candidate(
                 request.algorithm,
                 embedding,
                 request.n_clusters,
-                target,
+                scoring_context,
             )
         except _ClusterAdapterUnavailableError as exc:
             return candidate_fit_failure(request, exc, unavailable=True)
@@ -304,12 +336,17 @@ class SpectralClusterSelector:
         algorithm: str,
         embedding: np.ndarray,
         n_clusters: int,
-        target: Optional[Any],
+        scoring_context: _ClusterScoringContext,
     ) -> ClusterCandidate:
         estimator = self._make_count_based_estimator(algorithm, n_clusters)
         labels = estimator.fit_predict(embedding)
         return self._make_candidate(
-            algorithm, int(n_clusters), labels, embedding, target, estimator
+            algorithm,
+            int(n_clusters),
+            labels,
+            embedding,
+            scoring_context,
+            estimator,
         )
 
     def _make_count_based_estimator(self, algorithm: str, n_clusters: int) -> Any:
@@ -335,7 +372,7 @@ class SpectralClusterSelector:
     def _fit_hdbscan_candidate(
         self,
         embedding: np.ndarray,
-        target: Optional[Any],
+        scoring_context: _ClusterScoringContext,
     ) -> ClusterCandidate:
         min_cluster_size = max(
             2, int(math.ceil(self.min_cluster_fraction * embedding.shape[0]))
@@ -352,7 +389,12 @@ class SpectralClusterSelector:
         if n_clusters < 1:
             raise ValueError("HDBSCAN returned no clusters")
         return self._make_candidate(
-            "hdbscan", n_clusters, normalized, embedding, target, estimator
+            "hdbscan",
+            n_clusters,
+            normalized,
+            embedding,
+            scoring_context,
+            estimator,
         )
 
     def _make_candidate(
@@ -361,12 +403,16 @@ class SpectralClusterSelector:
         n_clusters: int,
         labels: np.ndarray,
         embedding: np.ndarray,
-        target: Optional[Any],
+        scoring_context: _ClusterScoringContext,
         estimator: Any,
     ) -> ClusterCandidate:
         labels = self._normalize_labels(labels)
         centers = self._centers_from_labels(embedding, labels)
-        score_components = self._score_components(embedding, labels, target)
+        score_components = self._score_components(
+            embedding,
+            labels,
+            scoring_context,
+        )
         components = score_components.to_dict()
         score = self._candidate_score(score_components)
         return ClusterCandidate(
@@ -384,19 +430,23 @@ class SpectralClusterSelector:
         self,
         embedding: np.ndarray,
         labels: np.ndarray,
-        target: Optional[Any],
+        scoring_context: _ClusterScoringContext,
     ) -> ClusterScoreComponents:
         counts = np.bincount(labels, minlength=int(labels.max()) + 1)
         silhouette = self._safe_silhouette(embedding, labels)
-        resolved_target_type = self._resolve_target_type(target)
         target_contrast = (
-            self._target_contrast(labels, target)
-            if resolved_target_type == "regression"
+            self._target_contrast(labels, scoring_context.target)
+            if scoring_context.resolved_target_type == "regression"
             else 0.0
         )
         classification = (
-            self._classification_components(labels, target)
-            if resolved_target_type == "classification"
+            self._classification_components(labels, scoring_context.target)
+            if scoring_context.resolved_target_type == "classification"
+            else None
+        )
+        validation_proxy = (
+            scoring_context.validation_proxy.evaluate(labels)
+            if scoring_context.validation_proxy is not None
             else None
         )
         return evaluate_cluster_score_components(
@@ -406,6 +456,7 @@ class SpectralClusterSelector:
             max_cluster_imbalance_ratio=self.max_cluster_imbalance_ratio,
             min_cluster_fraction=self.min_cluster_fraction,
             classification=classification,
+            validation_proxy=validation_proxy,
         )
 
     def _candidate_score(self, components: ClusterScoreComponents) -> float:
@@ -420,6 +471,35 @@ class SpectralClusterSelector:
             class_distribution_drift_weight=(
                 self.class_distribution_drift_weight
             ),
+        )
+
+    def _build_scoring_context(
+        self,
+        embedding: np.ndarray,
+        target: Optional[Any],
+    ) -> _ClusterScoringContext:
+        resolved_target_type = self._resolve_target_type(target)
+        validation_proxy = None
+        if self.selection_metric == "validation_proxy":
+            if resolved_target_type not in {"regression", "classification"}:
+                raise ValueError(
+                    "validation_proxy cluster selection requires a supported target"
+                )
+            validation_proxy = PartitionValidationProxyEvaluator(
+                embedding,
+                target,
+                target_type=resolved_target_type,
+                validation_fraction=self.validation_proxy_fraction,
+                min_partition_train_rows=(
+                    self.validation_proxy_min_partition_rows
+                ),
+                classification_smoothing=self.validation_proxy_smoothing,
+                random_state=self.random_state,
+            )
+        return _ClusterScoringContext(
+            target=target,
+            resolved_target_type=resolved_target_type,
+            validation_proxy=validation_proxy,
         )
 
     def _resolve_target_type(self, target: Optional[Any]) -> str:
@@ -519,7 +599,7 @@ class SpectralClusterSelector:
         self,
         candidates: Sequence[ClusterCandidate],
         embedding: np.ndarray,
-        target: Optional[Any],
+        scoring_context: _ClusterScoringContext,
     ) -> _ClusterSelectionDecision:
         valid_candidates = [candidate for candidate in candidates if candidate.valid]
         pool = valid_candidates or list(candidates)
@@ -528,7 +608,11 @@ class SpectralClusterSelector:
                 selected=self._select_by_weighted_vote(pool)
             )
         if self.ensemble_method == "coassociation":
-            return self._select_by_coassociation(pool, embedding, target)
+            return self._select_by_coassociation(
+                pool,
+                embedding,
+                scoring_context,
+            )
         return _ClusterSelectionDecision(
             selected=max(pool, key=lambda candidate: candidate.score)
         )
@@ -554,7 +638,7 @@ class SpectralClusterSelector:
         self,
         candidates: Sequence[ClusterCandidate],
         embedding: np.ndarray,
-        target: Optional[Any],
+        scoring_context: _ClusterScoringContext,
     ) -> _ClusterSelectionDecision:
         ordered = tuple(
             sorted(
@@ -583,7 +667,7 @@ class SpectralClusterSelector:
             plan.selected_n_clusters,
             labels,
             embedding,
-            target,
+            scoring_context,
             estimator,
         )
         same_k_sources = tuple(
@@ -618,7 +702,7 @@ class SpectralClusterSelector:
         self,
         batch: _ClusterCandidateBatch,
         decision: _ClusterSelectionDecision,
-        target: Optional[Any],
+        scoring_context: _ClusterScoringContext,
     ) -> Dict[str, Any]:
         selected = decision.selected
         consensus = decision.consensus
@@ -631,7 +715,9 @@ class SpectralClusterSelector:
             "max_cluster_imbalance_ratio": float(self.max_cluster_imbalance_ratio),
             "min_cluster_fraction": float(self.min_cluster_fraction),
             "cluster_target_type": self.target_type,
-            "resolved_cluster_target_type": self._resolve_target_type(target),
+            "resolved_cluster_target_type": (
+                scoring_context.resolved_target_type
+            ),
             "missing_class_penalty_weight": float(
                 self.missing_class_penalty_weight
             ),
@@ -640,6 +726,14 @@ class SpectralClusterSelector:
             ),
             "class_distribution_drift_weight": float(
                 self.class_distribution_drift_weight
+            ),
+            "validation_proxy_plan": (
+                scoring_context.validation_proxy.plan.to_dict()
+                if scoring_context.validation_proxy is not None
+                else None
+            ),
+            "validation_proxy_smoothing": float(
+                self.validation_proxy_smoothing
             ),
             "candidate_plan": batch.plan.to_dict(),
             "candidate_failures": [failure.to_dict() for failure in batch.failures],
@@ -703,6 +797,20 @@ class SpectralClusterSelector:
         normalized = float(value)
         if not np.isfinite(normalized) or normalized < 0:
             raise ValueError(f"{name} must be a non-negative finite value")
+        return normalized
+
+    @staticmethod
+    def _validate_positive_float(name: str, value: float) -> float:
+        normalized = float(value)
+        if not np.isfinite(normalized) or normalized <= 0:
+            raise ValueError(f"{name} must be a positive finite value")
+        return normalized
+
+    @staticmethod
+    def _validate_fraction(name: str, value: float) -> float:
+        normalized = float(value)
+        if not np.isfinite(normalized) or not 0 < normalized < 0.5:
+            raise ValueError(f"{name} must be in (0, 0.5)")
         return normalized
 
     @staticmethod

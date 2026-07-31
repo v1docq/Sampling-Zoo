@@ -179,6 +179,28 @@ chunk не запрещается жёстко, иначе multiclass partitioni
 для прямого использования sampler-а. Для целочисленной regression target нужен
 явный `cluster_target_type="regression"`.
 
+Дополнительно доступен opt-in `cluster_selection_metric="validation_proxy"`.
+Он использует единый internal holdout внутри train fold и сравнивает global
+constant expert с hard-routed local constant experts. Для regression локальный
+expert предсказывает `mean(y)` partition-а. Для classification:
+
+$$
+\hat p_{c,k} = \frac{n_{c,k} + \alpha}{n_c + \alpha K},
+$$
+
+где `alpha = validation_proxy_smoothing`, `K` — число классов. Validation rows
+маршрутизируются к ближайшему train-only centroid в spectral embedding. Score:
+
+$$
+G = \frac{L_{global} - L_{partition}}{\max(|L_{global}|, \varepsilon)}
+- \text{hard constraint penalty}.
+$$
+
+Используется RMSE для regression и log loss для classification. Это дешёвая
+оценка полезности partition/router, а не имитация финальной chunk-модели.
+Default `balanced_silhouette` не изменён; обе policies нужно сравнивать как
+отдельную partition-selection ablation.
+
 Для каждого кластера можно:
 
 - взять все точки;

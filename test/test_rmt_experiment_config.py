@@ -75,6 +75,25 @@ def test_classification_chunking_config_selects_class_aware_objective() -> None:
     assert configs["rmt_contraction"]["cluster_target_type"] == "classification"
 
 
+def test_chunking_config_accepts_validation_proxy_ablation() -> None:
+    configs = make_chunking_strategy_configs(
+        problem_type="regression",
+        strategy_names=("rmt_contraction",),
+        extra_strategy_params={
+            "rmt_contraction": {
+                "cluster_selection_metric": "validation_proxy",
+                "validation_proxy_fraction": 0.25,
+                "validation_proxy_min_partition_rows": 16,
+            }
+        },
+    )
+
+    config = configs["rmt_contraction"]
+    assert config["cluster_selection_metric"] == "validation_proxy"
+    assert config["validation_proxy_fraction"] == 0.25
+    assert config["validation_proxy_min_partition_rows"] == 16
+
+
 def test_routed_weighted_falls_back_for_non_routing_sampler() -> None:
     rng = np.random.default_rng(123)
     X = pd.DataFrame(rng.normal(size=(90, 5)), columns=[f"x_{idx}" for idx in range(5)])
@@ -524,7 +543,22 @@ def test_sample_efficiency_summary_selects_minimal_budget(tmp_path) -> None:
             "model_metrics": {"rmse": 10.8},
             "timings_sec": {"fit": 0.5, "inference": 0.1},
             "sample_stats": {"sample_size": 5},
-            "extra": {"sampler_diagnostics": {"leverage_entropy": 1.2, "effective_sample_count": 3.3}},
+            "extra": {
+                "sampler_diagnostics": {
+                    "leverage_entropy": 1.2,
+                    "effective_sample_count": 3.3,
+                    "partition_selection_selected_candidate": {
+                        "components": {
+                            "validation_proxy": {
+                                "baseline_loss": 1.0,
+                                "candidate_loss": 0.8,
+                                "relative_gain": 0.2,
+                                "fallback_validation_fraction": 0.0,
+                            }
+                        }
+                    },
+                }
+            },
         },
         {
             "dataset": "demo",
@@ -559,6 +593,12 @@ def test_sample_efficiency_summary_selects_minimal_budget(tmp_path) -> None:
     assert "subspace_rank_source" in tables["raw"].columns
     assert "rank_by_subspace_stability" in tables["raw"].columns
     assert "subspace_max_angle_quantile_degrees" in tables["raw"].columns
+    assert "validation_proxy_relative_gain" in tables["raw"].columns
+    proxy_row = tables["raw"][tables["raw"]["budget_ratio"] == 0.05].iloc[0]
+    assert proxy_row["validation_proxy_baseline_loss"] == 1.0
+    assert proxy_row["validation_proxy_candidate_loss"] == 0.8
+    assert proxy_row["validation_proxy_relative_gain"] == 0.2
+    assert proxy_row["validation_proxy_fallback_fraction"] == 0.0
     assert (tmp_path / "rmt_raw_runs.csv").exists()
     assert (tmp_path / "sample_efficiency_curve.csv").exists()
     assert (tmp_path / "minimal_effective_budget.csv").exists()

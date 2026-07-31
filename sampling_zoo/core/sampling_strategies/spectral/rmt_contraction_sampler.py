@@ -60,6 +60,9 @@ class RMTContractionConfig:
     missing_class_penalty_weight: float = 0.25
     single_class_penalty_weight: float = 0.50
     class_distribution_drift_weight: float = 0.25
+    validation_proxy_fraction: float = 0.2
+    validation_proxy_min_partition_rows: int = 8
+    validation_proxy_smoothing: float = 1.0
     cluster_vote_temperature: float = 0.05
     n_views: Union[int, str] = "auto"
     n_views_policy: str = "auto"
@@ -163,10 +166,12 @@ class PartitionSelectionInfo:
     resolved_cluster_target_type: str
     candidates: Tuple[int, ...]
     scores: Tuple[Tuple[int, Optional[float]], ...]
+    selected_candidate: Dict[str, Any]
     candidate_details: Tuple[Dict[str, Any], ...]
     candidate_plan: Dict[str, Any]
     candidate_failures: Tuple[Dict[str, Any], ...]
     consensus: Dict[str, Any]
+    validation_proxy_plan: Dict[str, Any]
     min_auto_partition_size: int
     selection_sample_size: int
 
@@ -229,7 +234,7 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self.cluster_selection_metric = self._validate_choice(
             "cluster_selection_metric",
             cfg.cluster_selection_metric,
-            ("silhouette", "balanced_silhouette"),
+            ("silhouette", "balanced_silhouette", "validation_proxy"),
         )
         self.cluster_ensemble_method = self._validate_choice(
             "cluster_ensemble_method",
@@ -279,6 +284,20 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self.class_distribution_drift_weight = self._validate_nonnegative_float(
             "class_distribution_drift_weight",
             cfg.class_distribution_drift_weight,
+        )
+        self.validation_proxy_fraction = self._validate_fraction(
+            "validation_proxy_fraction",
+            cfg.validation_proxy_fraction,
+        )
+        if self.validation_proxy_fraction >= 0.5:
+            raise ValueError("validation_proxy_fraction must be in (0, 0.5)")
+        self.validation_proxy_min_partition_rows = self._validate_positive_int(
+            "validation_proxy_min_partition_rows",
+            cfg.validation_proxy_min_partition_rows,
+        )
+        self.validation_proxy_smoothing = self._validate_positive_float(
+            "validation_proxy_smoothing",
+            cfg.validation_proxy_smoothing,
         )
         self.cluster_vote_temperature = self._validate_positive_float(
             "cluster_vote_temperature",
@@ -477,6 +496,11 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             class_distribution_drift_weight=(
                 self.class_distribution_drift_weight
             ),
+            validation_proxy_fraction=self.validation_proxy_fraction,
+            validation_proxy_min_partition_rows=(
+                self.validation_proxy_min_partition_rows
+            ),
+            validation_proxy_smoothing=self.validation_proxy_smoothing,
             vote_temperature=self.cluster_vote_temperature,
             random_state=self.random_state,
             show_progress=self.show_progress,
@@ -746,10 +770,12 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             resolved_cluster_target_type="not_used",
             candidates=(int(n_clusters),),
             scores=((int(n_clusters), None),),
+            selected_candidate={},
             candidate_details=(),
             candidate_plan={},
             candidate_failures=(),
             consensus={},
+            validation_proxy_plan={},
             min_auto_partition_size=int(self.min_auto_partition_size),
             selection_sample_size=0,
         )
@@ -795,10 +821,16 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             ),
             candidates=candidate_counts,
             scores=candidate_scores,
+            selected_candidate=dict(
+                result.diagnostics.get("selected_candidate") or {}
+            ),
             candidate_details=candidate_details,
             candidate_plan=candidate_plan,
             candidate_failures=candidate_failures,
             consensus=dict(result.diagnostics.get("consensus") or {}),
+            validation_proxy_plan=dict(
+                result.diagnostics.get("validation_proxy_plan") or {}
+            ),
             min_auto_partition_size=int(self.min_auto_partition_size),
             selection_sample_size=int(min(self.partition_selection_sample_size, result.labels.shape[0])),
         )
@@ -1295,15 +1327,34 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             "class_distribution_drift_weight": float(
                 self.class_distribution_drift_weight
             ),
+            "validation_proxy_fraction": float(
+                self.validation_proxy_fraction
+            ),
+            "validation_proxy_min_partition_rows": int(
+                self.validation_proxy_min_partition_rows
+            ),
+            "validation_proxy_smoothing": float(
+                self.validation_proxy_smoothing
+            ),
             "partition_selection_candidates": list(partition_info.candidates) if partition_info else [],
             "partition_selection_scores": {
                 str(candidate): score
                 for candidate, score in partition_info.scores
             } if partition_info else {},
+            "partition_selection_selected_candidate": (
+                dict(partition_info.selected_candidate)
+                if partition_info
+                else {}
+            ),
             "partition_selection_candidate_details": list(partition_info.candidate_details) if partition_info else [],
             "partition_selection_candidate_plan": dict(partition_info.candidate_plan) if partition_info else {},
             "partition_selection_candidate_failures": list(partition_info.candidate_failures) if partition_info else [],
             "partition_selection_consensus": dict(partition_info.consensus) if partition_info else {},
+            "partition_selection_validation_proxy_plan": (
+                dict(partition_info.validation_proxy_plan)
+                if partition_info
+                else {}
+            ),
             "max_cluster_imbalance_ratio": float(self.max_cluster_imbalance_ratio),
             "min_cluster_fraction": float(self.min_cluster_fraction),
             "min_auto_partition_size": int(partition_info.min_auto_partition_size) if partition_info else None,

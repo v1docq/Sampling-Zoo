@@ -99,7 +99,7 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 | `partition_selection_method` | `fixed` или `auto`. |
 | `selected_cluster_algorithm` | Алгоритм, выбранный `SpectralClusterSelector`, если auto-selection включен. |
 | `cluster_algorithms` | Список алгоритмов-кандидатов. |
-| `cluster_selection_metric` | `silhouette` или `balanced_silhouette`. |
+| `cluster_selection_metric` | `silhouette`, default `balanced_silhouette` или opt-in `validation_proxy`. |
 | `cluster_ensemble_method` | `best_score`, legacy `weighted_vote` или `coassociation`. |
 | `cluster_target_type` | Настроенный target mode: `auto`, `regression` или `classification`. |
 | `resolved_cluster_target_type` | Фактически использованный selector-ом target mode; находится в diagnostics `SpectralClusterSelector`. |
@@ -108,6 +108,13 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 | `class_distribution_drift_weight` | Вес class-distribution drift в balanced objective. |
 | `partition_selection_scores` | Scores по кандидатам `k`. |
 | `partition_selection_candidate_details` | Подробности candidates: algorithm, score, valid flag, balance components и optional `classification` profile. |
+| `partition_selection_selected_candidate` | Полная диагностика фактически выбранного source или consensus candidate. |
+| `partition_selection_validation_proxy_plan` | Размеры и checksums общего internal holdout, target type и effective validation fraction. |
+| `components.validation_proxy.baseline_loss` | Loss global constant expert на internal validation. |
+| `components.validation_proxy.candidate_loss` | Loss routed local constant experts. |
+| `components.validation_proxy.relative_gain` | Относительное улучшение candidate loss против global baseline; больше — лучше. |
+| `components.validation_proxy.routed_validation_counts` | Число internal validation rows, hard-routed в каждый partition. |
+| `components.validation_proxy.fallback_validation_fraction` | Доля validation rows, для которых local expert был слишком мал и использован global fallback. |
 | `components.classification.global_class_counts` | Глобальное число строк каждого класса. |
 | `components.classification.cluster_class_counts` | Матрица counts размера `n_chunks x n_classes`. |
 | `components.classification.missing_class_fraction` | Доля отсутствующих chunk/class pairs. |
@@ -139,6 +146,9 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 - Для classification сравнивайте `missing_class_fraction` и `class_distribution_drift` между candidates, а не только у выбранного разбиения. Нулевой `single_class_cluster_fraction` обязателен для valid candidate.
 - Высокий `missing_class_fraction` при нулевой доле одно-классовых chunks может быть нормален для multiclass dataset с редкими классами: это soft penalty, а не автоматический запрет candidate.
 - `cluster_target_type="auto"` удобен для прямого вызова, но integer-valued regression target может выглядеть как multiclass. Benchmark factory передает `regression`/`classification` явно.
+- При `cluster_selection_metric="validation_proxy"` положительный `relative_gain` означает улучшение над global constant baseline, а не гарантированное улучшение итоговой TabPFN/LightGBM модели.
+- Высокий `fallback_validation_fraction` означает, что выбранное `k` слишком велико для размера internal proxy-train или `validation_proxy_min_partition_rows` слишком строг.
+- Проверяйте, что `routed_validation_counts` суммируются в `partition_selection_validation_proxy_plan.n_validation`; это основной conservation invariant proxy routing.
 - Непустые `partition_selection_candidate_failures` не обязательно делают run failed: selector продолжает работу, если хотя бы один независимый adapter вернул candidate.
 - При `cluster_ensemble_method="coassociation"` ожидайте `representation_shape[0] == n_samples` и `representation_nnz <= n_samples * n_sources`. Большая fallback rate означает, что consensus систематически нарушает balance constraints и не должен становиться безусловным улучшением.
 - Если `encoded_feature_cap_applied=True`, downstream качество надо интерпретировать с учетом потери части one-hot признаков.

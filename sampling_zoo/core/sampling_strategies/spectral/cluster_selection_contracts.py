@@ -199,6 +199,73 @@ class ClassificationPartitionComponents:
 
 
 @dataclass(frozen=True)
+class PartitionValidationPlan:
+    """Deterministic internal holdout shared by all partition candidates."""
+
+    target_type: str
+    train_indices: Tuple[int, ...]
+    validation_indices: Tuple[int, ...]
+    requested_validation_fraction: float
+    effective_validation_fraction: float
+    random_state: Optional[int]
+    min_partition_train_rows: int
+    class_labels: Tuple[str, ...] = ()
+
+    @property
+    def n_samples(self) -> int:
+        return len(self.train_indices) + len(self.validation_indices)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "target_type": self.target_type,
+            "n_samples": int(self.n_samples),
+            "n_train": len(self.train_indices),
+            "n_validation": len(self.validation_indices),
+            "requested_validation_fraction": float(
+                self.requested_validation_fraction
+            ),
+            "effective_validation_fraction": float(
+                self.effective_validation_fraction
+            ),
+            "random_state": self.random_state,
+            "min_partition_train_rows": int(self.min_partition_train_rows),
+            "class_labels": list(self.class_labels),
+            "train_index_checksum": _index_checksum(self.train_indices),
+            "validation_index_checksum": _index_checksum(
+                self.validation_indices
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class PartitionValidationComponents:
+    """Validation loss and routing evidence for one partition candidate."""
+
+    target_type: str
+    loss_name: str
+    baseline_loss: float
+    candidate_loss: float
+    relative_gain: float
+    routed_validation_counts: Tuple[int, ...]
+    fallback_partition_count: int
+    fallback_validation_fraction: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "target_type": self.target_type,
+            "loss_name": self.loss_name,
+            "baseline_loss": float(self.baseline_loss),
+            "candidate_loss": float(self.candidate_loss),
+            "relative_gain": float(self.relative_gain),
+            "routed_validation_counts": list(self.routed_validation_counts),
+            "fallback_partition_count": int(self.fallback_partition_count),
+            "fallback_validation_fraction": float(
+                self.fallback_validation_fraction
+            ),
+        }
+
+
+@dataclass(frozen=True)
 class ClusterScoreComponents:
     """Balanced-objective inputs and explicit hard-constraint violations."""
 
@@ -210,6 +277,7 @@ class ClusterScoreComponents:
     counts: Tuple[int, ...]
     violations: Tuple[ClusterConstraintViolation, ...]
     classification: Optional[ClassificationPartitionComponents] = None
+    validation_proxy: Optional[PartitionValidationComponents] = None
 
     @property
     def valid(self) -> bool:
@@ -228,6 +296,11 @@ class ClusterScoreComponents:
             "classification": (
                 self.classification.to_dict()
                 if self.classification is not None
+                else None
+            ),
+            "validation_proxy": (
+                self.validation_proxy.to_dict()
+                if self.validation_proxy is not None
                 else None
             ),
         }
@@ -334,6 +407,7 @@ def evaluate_cluster_score_components(
     max_cluster_imbalance_ratio: float,
     min_cluster_fraction: float,
     classification: Optional[ClassificationPartitionComponents] = None,
+    validation_proxy: Optional[PartitionValidationComponents] = None,
 ) -> ClusterScoreComponents:
     normalized_counts = tuple(int(count) for count in counts)
     if not normalized_counts or any(count < 0 for count in normalized_counts):
@@ -369,6 +443,7 @@ def evaluate_cluster_score_components(
         counts=normalized_counts,
         violations=tuple(violations),
         classification=classification,
+        validation_proxy=validation_proxy,
     )
 
 
@@ -466,8 +541,18 @@ def score_cluster_components(
     silhouette = -1.0 if components.silhouette is None else components.silhouette
     if selection_metric == "silhouette":
         return float(silhouette)
+    if selection_metric == "validation_proxy":
+        if components.validation_proxy is None:
+            raise ValueError(
+                "validation_proxy components are required for validation_proxy scoring"
+            )
+        constraint_penalty = 0.0 if components.valid else hard_constraint_penalty
+        return float(components.validation_proxy.relative_gain - constraint_penalty)
     if selection_metric != "balanced_silhouette":
-        raise ValueError("selection_metric must be silhouette or balanced_silhouette")
+        raise ValueError(
+            "selection_metric must be silhouette, balanced_silhouette, "
+            "or validation_proxy"
+        )
     imbalance_penalty = float(imbalance_penalty_weight) * math.log(
         max(components.imbalance_ratio, 1.0)
     )
@@ -501,6 +586,17 @@ def score_cluster_components(
         - distribution_drift_penalty
         + target_bonus
         - constraint_penalty
+    )
+
+
+def _index_checksum(indices: Sequence[int]) -> int:
+    modulus = (1 << 63) - 1
+    return int(
+        sum(
+            (position + 1) * (int(index) + 1)
+            for position, index in enumerate(indices)
+        )
+        % modulus
     )
 
 

@@ -13,11 +13,17 @@ from .cluster_selection_contracts import (
     ClusterScoreComponents,
     ClusterSelectionUnavailableError,
     ClassificationPartitionComponents,
+    PartitionValidationComponents,
+    PartitionValidationPlan,
     build_cluster_candidate_plan,
     build_cluster_consensus_plan,
     evaluate_cluster_score_components,
     evaluate_classification_partition_components,
     score_cluster_components,
+)
+from .partition_validation import (
+    PartitionValidationProxyEvaluator,
+    build_partition_validation_plan,
 )
 from .null_diagnostics import (
     NullDiagnosticStatus,
@@ -48,6 +54,9 @@ __all__ = [
     "ClusterScoreComponents",
     "ClusterSelectionUnavailableError",
     "ClassificationPartitionComponents",
+    "PartitionValidationComponents",
+    "PartitionValidationPlan",
+    "PartitionValidationProxyEvaluator",
     "NullDiagnosticStatus",
     "NullModelPolicy",
     "RMTContractionTensorSampler",
@@ -63,5 +72,6 @@ __all__ = [
     "build_weighted_membership_embedding",
     "evaluate_cluster_score_components",
     "evaluate_classification_partition_components",
+    "build_partition_validation_plan",
     "score_cluster_components",
 ]
