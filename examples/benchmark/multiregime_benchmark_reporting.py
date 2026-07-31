@@ -89,6 +89,11 @@ class MultiRegimeBenchmarkArtifactBuilder:
             row.setdefault("size_guard_fallback_applied", False)
             row.setdefault("candidate_failure_count", 0)
             row.setdefault("candidate_failure_codes", [])
+            row.setdefault("consensus_used", False)
+            row.setdefault("consensus_fallback_to_source", False)
+            row.setdefault("consensus_representation_columns", None)
+            row.setdefault("consensus_source_count", 0)
+            row.setdefault("consensus_score_delta_vs_best_source", None)
             row["diagnostics_available"] = bool(row.pop("diagnostics", {}))
             row["extra_json"] = json.dumps(
                 row.pop("extra", {}),
@@ -156,6 +161,20 @@ class MultiRegimeBenchmarkArtifactBuilder:
                 ),
                 candidate_failure_count_mean=(
                     "candidate_failure_count",
+                    "mean",
+                ),
+                consensus_use_rate=("consensus_used", "mean"),
+                consensus_fallback_rate=(
+                    "consensus_fallback_to_source",
+                    "mean",
+                ),
+                consensus_source_count_mean=("consensus_source_count", "mean"),
+                consensus_representation_columns_mean=(
+                    "consensus_representation_columns",
+                    "mean",
+                ),
+                consensus_score_delta_vs_best_source_mean=(
+                    "consensus_score_delta_vs_best_source",
                     "mean",
                 ),
                 selected_subspace_recall_mean=(

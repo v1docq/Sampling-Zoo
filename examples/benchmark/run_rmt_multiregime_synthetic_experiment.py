@@ -92,6 +92,7 @@ class RMTMultiRegimeExperimentConfig:
     view_strategies: Sequence[str] = DEFAULT_VIEW_STRATEGIES
     partition_policies: Sequence[str] = DEFAULT_PARTITION_POLICIES
     cluster_algorithms: Sequence[str] = DEFAULT_CLUSTER_ALGORITHMS
+    cluster_ensemble_method: str = "coassociation"
     regime_separation: float = 2.0
     local_signal_scale: float = 0.50
     student_t_df: float = 5.0
@@ -119,6 +120,11 @@ class RMTMultiRegimeExperimentConfig:
         if isinstance(self.n_views, str):
             object.__setattr__(self, "n_views", self.n_views.strip().lower())
         object.__setattr__(self, "output_root", Path(self.output_root))
+        object.__setattr__(
+            self,
+            "cluster_ensemble_method",
+            str(self.cluster_ensemble_method).strip().lower(),
+        )
         self._validate_runtime_controls()
         self.build_grid()
         self._validate_data_configs()
@@ -173,6 +179,15 @@ class RMTMultiRegimeExperimentConfig:
             raise ValueError("snapshot_every must be positive")
         if self.dtype not in {"float32", "float64"}:
             raise ValueError("dtype must be float32 or float64")
+        if self.cluster_ensemble_method not in {
+            "best_score",
+            "weighted_vote",
+            "coassociation",
+        }:
+            raise ValueError(
+                "cluster_ensemble_method must be best_score, weighted_vote, "
+                "or coassociation"
+            )
 
     def _validate_data_configs(self) -> None:
         for n_regimes in self.n_regimes_values:
@@ -349,7 +364,7 @@ class RMTMultiRegimeExperimentOrchestrator:
             if fixed
             else tuple(self.config.cluster_algorithms),
             cluster_selection_metric="balanced_silhouette",
-            cluster_ensemble_method="weighted_vote",
+            cluster_ensemble_method=self.config.cluster_ensemble_method,
             min_partitions=2,
             max_partitions=max(
                 int(self.config.max_partitions_floor),
@@ -420,6 +435,7 @@ class RMTMultiRegimeExperimentOrchestrator:
             "partition_selection_candidate_failures",
             (),
         )
+        consensus = diagnostics.get("partition_selection_consensus", {})
         count_based_candidates = (
             candidates
             if point.partition_policy is PartitionProbePolicy.FIXED_ORACLE
@@ -489,6 +505,19 @@ class RMTMultiRegimeExperimentOrchestrator:
             "candidate_failure_codes": sorted(
                 {str(failure.get("code")) for failure in candidate_failures}
             ),
+            "consensus_used": bool(consensus),
+            "consensus_fallback_to_source": bool(
+                consensus.get("fallback_to_source_candidate", False)
+            ),
+            "consensus_representation_columns": (
+                consensus.get("plan", {}).get("representation_columns")
+            ),
+            "consensus_source_count": len(
+                consensus.get("plan", {}).get("sources", ())
+            ),
+            "consensus_score_delta_vs_best_source": consensus.get(
+                "score_delta_vs_best_source"
+            ),
             "selected_candidate_valid": _selected_candidate_value(
                 diagnostics,
                 selected_k,
@@ -537,7 +566,10 @@ def _selected_candidate_value(
     selected_k: int,
     key: str,
 ) -> Any:
-    candidates = diagnostics.get("partition_selection_candidate_details", ())
+    candidates = list(diagnostics.get("partition_selection_candidate_details", ()))
+    candidates.extend(
+        diagnostics.get("partition_selection_consensus", {}).get("candidates", ())
+    )
     algorithm = diagnostics.get("selected_cluster_algorithm")
     matched = [
         candidate
@@ -560,6 +592,7 @@ def run_rmt_multiregime_synthetic_experiment(
     backends: Sequence[str] = DEFAULT_BACKENDS,
     view_strategies: Sequence[str] = DEFAULT_VIEW_STRATEGIES,
     partition_policies: Sequence[str] = DEFAULT_PARTITION_POLICIES,
+    cluster_ensemble_method: str = "coassociation",
     n_samples: int = 512,
     n_features: int = 64,
     local_rank: int = 2,
@@ -578,6 +611,7 @@ def run_rmt_multiregime_synthetic_experiment(
         backends=tuple(backends),
         view_strategies=tuple(view_strategies),
         partition_policies=tuple(partition_policies),
+        cluster_ensemble_method=cluster_ensemble_method,
         show_progress=show_progress,
         output_root=output_root,
     )

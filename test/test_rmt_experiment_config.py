@@ -40,7 +40,7 @@ def test_chunking_configs_support_rmt_and_experiment_metadata() -> None:
     assert configs["rmt_contraction"]["embedding_mode"] == "sv_scaled"
     assert configs["rmt_contraction"]["partition_selection_method"] == "auto"
     assert configs["rmt_contraction"]["cluster_selection_metric"] == "balanced_silhouette"
-    assert configs["rmt_contraction"]["cluster_ensemble_method"] == "weighted_vote"
+    assert configs["rmt_contraction"]["cluster_ensemble_method"] == "coassociation"
     assert "gmm" in configs["rmt_contraction"]["cluster_algorithms"]
     assert configs["rmt_contraction"]["max_partitions"] >= 4
     assert configs["rmt_contraction"]["max_cluster_imbalance_ratio"] == 5.0

@@ -28,6 +28,51 @@ class ClusterConstraintViolation(str, Enum):
 
 
 @dataclass(frozen=True)
+class ClusterConsensusSource:
+    """One weighted partition contributing to a consensus representation."""
+
+    key: str
+    algorithm: str
+    n_clusters: int
+    score: float
+    weight: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "key": self.key,
+            "algorithm": self.algorithm,
+            "n_clusters": int(self.n_clusters),
+            "score": float(self.score),
+            "weight": float(self.weight),
+        }
+
+
+@dataclass(frozen=True)
+class ClusterConsensusPlan:
+    """Deterministic weights and target K for scalable co-association consensus."""
+
+    method: str
+    selected_n_clusters: int
+    vote_temperature: float
+    sources: Tuple[ClusterConsensusSource, ...]
+    votes_by_n_clusters: Tuple[Tuple[int, float], ...]
+    representation_columns: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "method": self.method,
+            "selected_n_clusters": int(self.selected_n_clusters),
+            "vote_temperature": float(self.vote_temperature),
+            "sources": [source.to_dict() for source in self.sources],
+            "votes_by_n_clusters": {
+                str(n_clusters): float(weight)
+                for n_clusters, weight in self.votes_by_n_clusters
+            },
+            "representation_columns": int(self.representation_columns),
+        }
+
+
+@dataclass(frozen=True)
 class ClusterCandidateRequest:
     """One effectful clustering adapter invocation planned by the pure core."""
 
@@ -328,6 +373,74 @@ def candidate_fit_failure(
         ),
         error_type=error.__class__.__name__,
         message=str(error),
+    )
+
+
+def build_cluster_consensus_plan(
+    *,
+    algorithms: Sequence[str],
+    n_clusters: Sequence[int],
+    scores: Sequence[float],
+    vote_temperature: float,
+) -> ClusterConsensusPlan:
+    """Plan weighted partition consensus while preserving the legacy K vote."""
+
+    normalized_algorithms = tuple(str(value) for value in algorithms)
+    normalized_counts = tuple(int(value) for value in n_clusters)
+    normalized_scores = tuple(float(value) for value in scores)
+    source_count = len(normalized_algorithms)
+    if source_count < 1:
+        raise ValueError("consensus requires at least one cluster candidate")
+    if len(normalized_counts) != source_count or len(normalized_scores) != source_count:
+        raise ValueError("algorithms, n_clusters, and scores must have equal lengths")
+    if any(value < 1 for value in normalized_counts):
+        raise ValueError("consensus source cluster counts must be positive")
+    temperature = float(vote_temperature)
+    if not math.isfinite(temperature) or temperature <= 0:
+        raise ValueError("vote_temperature must be a positive finite value")
+
+    finite_scores = tuple(
+        score if math.isfinite(score) else -1e9 for score in normalized_scores
+    )
+    max_score = max(finite_scores)
+    raw_weights = tuple(
+        math.exp(max((score - max_score) / temperature, -745.0))
+        for score in finite_scores
+    )
+    weight_sum = sum(raw_weights)
+    if not math.isfinite(weight_sum) or weight_sum <= 0:
+        normalized_weights = tuple(1.0 / source_count for _ in raw_weights)
+    else:
+        normalized_weights = tuple(weight / weight_sum for weight in raw_weights)
+
+    sources = tuple(
+        ClusterConsensusSource(
+            key=f"{algorithm}|k={count}|candidate={index}",
+            algorithm=algorithm,
+            n_clusters=count,
+            score=score,
+            weight=weight,
+        )
+        for index, (algorithm, count, score, weight) in enumerate(
+            zip(
+                normalized_algorithms,
+                normalized_counts,
+                finite_scores,
+                normalized_weights,
+            )
+        )
+    )
+    votes: dict[int, float] = {}
+    for source in sources:
+        votes[source.n_clusters] = votes.get(source.n_clusters, 0.0) + source.weight
+    selected_n_clusters = max(votes.items(), key=lambda item: (item[1], item[0]))[0]
+    return ClusterConsensusPlan(
+        method="weighted_membership_kmeans",
+        selected_n_clusters=int(selected_n_clusters),
+        vote_temperature=temperature,
+        sources=sources,
+        votes_by_n_clusters=tuple(sorted(votes.items())),
+        representation_columns=sum(source.n_clusters for source in sources),
     )
 
 

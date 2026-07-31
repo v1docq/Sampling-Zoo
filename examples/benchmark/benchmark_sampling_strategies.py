@@ -254,7 +254,7 @@ def make_chunking_strategy_configs(
                 "partition_selection_method": "auto",
                 "cluster_algorithms": ["kmeans", "bisecting_kmeans", "gmm", "hdbscan"],
                 "cluster_selection_metric": "balanced_silhouette",
-                "cluster_ensemble_method": "weighted_vote",
+                "cluster_ensemble_method": "coassociation",
                 "min_partitions": 2,
                 "max_partitions": max(8, n_partitions),
                 "min_auto_partition_size": 256,

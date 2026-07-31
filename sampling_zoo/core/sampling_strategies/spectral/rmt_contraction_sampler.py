@@ -160,6 +160,7 @@ class PartitionSelectionInfo:
     candidate_details: Tuple[Dict[str, Any], ...]
     candidate_plan: Dict[str, Any]
     candidate_failures: Tuple[Dict[str, Any], ...]
+    consensus: Dict[str, Any]
     min_auto_partition_size: int
     selection_sample_size: int
 
@@ -227,7 +228,7 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self.cluster_ensemble_method = self._validate_choice(
             "cluster_ensemble_method",
             cfg.cluster_ensemble_method,
-            ("best_score", "weighted_vote"),
+            ("best_score", "weighted_vote", "coassociation"),
         )
         self.min_partitions = self._validate_positive_int("min_partitions", cfg.min_partitions)
         self.max_partitions = (
@@ -710,6 +711,7 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             candidate_details=(),
             candidate_plan={},
             candidate_failures=(),
+            consensus={},
             min_auto_partition_size=int(self.min_auto_partition_size),
             selection_sample_size=0,
         )
@@ -752,6 +754,7 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             candidate_details=candidate_details,
             candidate_plan=candidate_plan,
             candidate_failures=candidate_failures,
+            consensus=dict(result.diagnostics.get("consensus") or {}),
             min_auto_partition_size=int(self.min_auto_partition_size),
             selection_sample_size=int(min(self.partition_selection_sample_size, result.labels.shape[0])),
         )
@@ -1237,6 +1240,7 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             "partition_selection_candidate_details": list(partition_info.candidate_details) if partition_info else [],
             "partition_selection_candidate_plan": dict(partition_info.candidate_plan) if partition_info else {},
             "partition_selection_candidate_failures": list(partition_info.candidate_failures) if partition_info else [],
+            "partition_selection_consensus": dict(partition_info.consensus) if partition_info else {},
             "max_cluster_imbalance_ratio": float(self.max_cluster_imbalance_ratio),
             "min_cluster_fraction": float(self.min_cluster_fraction),
             "min_auto_partition_size": int(partition_info.min_auto_partition_size) if partition_info else None,
