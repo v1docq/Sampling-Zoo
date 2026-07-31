@@ -462,6 +462,13 @@ class RMTRegressionExperimentOrchestrator:
         )
         return normalize_strategy_grid(configs)
 
+    def _make_model_pool(self) -> dict[str, Any]:
+        return make_model_pool(
+            seed=self.config.seed,
+            model_names=self.config.models,
+            problem_type="regression",
+        )
+
     def _run_experiment(
             self,
             datasets: Sequence[RawDatasetBundle],
@@ -482,11 +489,7 @@ class RMTRegressionExperimentOrchestrator:
                 disable=not self.config.show_progress,
                 leave=False,
         ):
-            model_pool = make_model_pool(
-                seed=self.config.seed,
-                model_names=self.config.models,
-                problem_type="regression",
-            )
+            model_pool = self._make_model_pool()
             run_records.extend(runner.run_dataset(dataset, strategy_configs, model_pool))
         return run_records
 

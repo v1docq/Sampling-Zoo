@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import datetime
 import math
+from numbers import Integral
 from pathlib import Path
 import sys
 from typing import Any, Mapping, Sequence
@@ -17,6 +18,7 @@ if str(BENCHMARK_DIR) not in sys.path:
     sys.path.insert(0, str(BENCHMARK_DIR))
 
 from benchmark_logging import BenchmarkLogger  # noqa: E402
+from benchmark_models import make_model_pool  # noqa: E402
 from benchmark_repo import OPENML_REGRESSION_SUITE  # noqa: E402
 from benchmark_sampling_strategies import make_chunking_strategy_configs  # noqa: E402
 from rmt_experiment_utils import budget_ratio_tag  # noqa: E402
@@ -114,6 +116,7 @@ class RMTPartitionSelectionAblationConfig:
     validation_proxy_fraction: float = 0.2
     validation_proxy_min_partition_rows: int = 8
     validation_proxy_smoothing: float = 1.0
+    model_n_jobs: int = 1
     max_train_rows: int | None = 300_000
     seed: int = 42
     show_progress: bool = True
@@ -149,6 +152,12 @@ class RMTPartitionSelectionAblationConfig:
             raise ValueError("validation_proxy_smoothing must be finite")
         if self.validation_proxy_smoothing <= 0:
             raise ValueError("validation_proxy_smoothing must be positive")
+        if (
+            isinstance(self.model_n_jobs, bool)
+            or not isinstance(self.model_n_jobs, Integral)
+            or self.model_n_jobs < 1
+        ):
+            raise ValueError("model_n_jobs must be a positive integer")
         if self.max_train_rows is not None and self.max_train_rows < 1:
             raise ValueError("max_train_rows must be positive when provided")
 
@@ -169,6 +178,7 @@ class RMTPartitionSelectionAblationConfig:
             "resume_policy",
             ResumePolicy.parse(self.resume_policy).value,
         )
+        object.__setattr__(self, "model_n_jobs", int(self.model_n_jobs))
 
     def to_regression_config(self) -> RMTRegressionExperimentConfig:
         return RMTRegressionExperimentConfig(
@@ -312,6 +322,14 @@ class RMTPartitionSelectionAblationOrchestrator(
             )
         )
 
+    def _make_model_pool(self) -> dict[str, Any]:
+        return make_model_pool(
+            seed=self.ablation_config.seed,
+            model_names=self.ablation_config.models,
+            problem_type="regression",
+            n_jobs=self.ablation_config.model_n_jobs,
+        )
+
     def _build_run_meta(
         self,
         logger: BenchmarkLogger,
@@ -334,6 +352,7 @@ class RMTPartitionSelectionAblationOrchestrator(
                 "validation_proxy_smoothing": (
                     self.ablation_config.validation_proxy_smoothing
                 ),
+                "model_n_jobs": self.ablation_config.model_n_jobs,
             }
         )
         return metadata
@@ -345,6 +364,7 @@ def run_rmt_partition_selection_ablation(
     budget_ratios: Sequence[float] = DEFAULT_PARTITION_ABLATION_BUDGET_RATIOS,
     cluster_selection_metrics: Sequence[str] = DEFAULT_PARTITION_SELECTION_METRICS,
     max_train_rows: int | None = 300_000,
+    model_n_jobs: int = 1,
     seed: int = 42,
     show_progress: bool = True,
     resume_from: str | Path | None = None,
@@ -360,6 +380,7 @@ def run_rmt_partition_selection_ablation(
         budget_ratios=budget_ratios,
         cluster_selection_metrics=cluster_selection_metrics,
         max_train_rows=max_train_rows,
+        model_n_jobs=model_n_jobs,
         seed=seed,
         show_progress=show_progress,
         resume_from=resume_from,
