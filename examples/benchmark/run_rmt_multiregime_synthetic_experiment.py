@@ -412,6 +412,14 @@ class RMTMultiRegimeExperimentOrchestrator:
             "partition_selection_candidate_details",
             (),
         )
+        candidate_plan = diagnostics.get(
+            "partition_selection_candidate_plan",
+            {},
+        )
+        candidate_failures = diagnostics.get(
+            "partition_selection_candidate_failures",
+            (),
+        )
         count_based_candidates = (
             candidates
             if point.partition_policy is PartitionProbePolicy.FIXED_ORACLE
@@ -434,6 +442,17 @@ class RMTMultiRegimeExperimentOrchestrator:
                 }
             )
         )
+        planned_count_candidates = tuple(
+            int(value)
+            for value in candidate_plan.get(
+                "eligible_count_candidates",
+                count_based_candidates,
+            )
+        )
+        rejected_counts = {
+            int(rejection["n_clusters"])
+            for rejection in candidate_plan.get("size_guard_rejections", ())
+        }
         selected_k = int(cluster_metrics.predicted_n_clusters)
         return {
             **point.to_dict(),
@@ -453,10 +472,22 @@ class RMTMultiRegimeExperimentOrchestrator:
             "count_based_candidate_set_contains_true_n": (
                 point.n_regimes in count_based_candidates
             ),
+            "planned_count_candidate_set": list(planned_count_candidates),
+            "planned_count_candidate_set_contains_true_n": (
+                point.n_regimes in planned_count_candidates
+            ),
+            "size_guard_rejected_true_n": point.n_regimes in rejected_counts,
+            "size_guard_fallback_applied": bool(
+                candidate_plan.get("size_guard_fallback_applied", False)
+            ),
             "density_candidate_set": list(density_candidates),
             "density_candidate_rescued_true_n": (
                 point.n_regimes not in count_based_candidates
                 and point.n_regimes in density_candidates
+            ),
+            "candidate_failure_count": len(candidate_failures),
+            "candidate_failure_codes": sorted(
+                {str(failure.get("code")) for failure in candidate_failures}
             ),
             "selected_candidate_valid": _selected_candidate_value(
                 diagnostics,

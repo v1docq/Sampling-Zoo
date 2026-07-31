@@ -552,7 +552,10 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 
 ## SpectralClusterSelector
 
-Файл: `sampling_zoo/core/sampling_strategies/spectral/cluster_selection.py`
+Файлы:
+
+- `sampling_zoo/core/sampling_strategies/spectral/cluster_selection.py`;
+- `sampling_zoo/core/sampling_strategies/spectral/cluster_selection_contracts.py`.
 
 Назначение: отдельный collaborator для кластеризации spectral embedding. Он разгружает `RMTContractionTensorSampler`: sampler строит embedding и partitions, а selector отвечает за candidates, scoring, hard constraints и выбор лучшего разбиения.
 
@@ -561,12 +564,29 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 | Метод | Назначение |
 |---|---|
 | `select(embedding, target=None)` | Публичный метод: строит candidates, выбирает лучший и возвращает `ClusterSelectionResult`. |
-| `_build_candidates(...)` | Перебирает алгоритмы и значения `k` с tqdm `Spectral cluster candidates`. |
+| `build_candidate_plan(n_samples)` | Чисто строит typed plan: исходную сетку `k`, size-guard rejections, fallback и adapter requests. |
+| `_build_candidates(...)` | Исполняет `ClusterCandidatePlan` с tqdm `Spectral cluster candidates` и собирает successes/failures. |
+| `_fit_candidate_request(...)` | Превращает исключение optional adapter-а в `ClusterCandidateFitFailure`, не скрывая причину. |
 | `_fit_count_based_candidate(...)` | Обучает `kmeans`, `bisecting_kmeans` или `gmm` для заданного `k`. |
-| `_fit_hdbscan_candidate(...)` | Пытается построить HDBSCAN candidate, если доступен sklearn/external backend. |
-| `_score_components(...)` | Считает silhouette, imbalance ratio, tiny cluster mass, optional target contrast и validity flag. |
+| `_fit_hdbscan_candidate(...)` | Строит HDBSCAN candidate через sklearn/external backend или возвращает typed unavailable failure. |
+| `_score_components(...)` | Делегирует pure core расчёт silhouette inputs, imbalance, tiny mass и constraint violations. |
 | `_candidate_score(...)` | Для `balanced_silhouette` считает `silhouette - imbalance_penalty - tiny_cluster_penalty + target_bonus - hard_constraint_penalty`. |
 | `_select_by_weighted_vote(...)` | Агрегирует candidates по числу clusters через soft weights от score. |
+
+### Typed Contracts
+
+- `ClusterCandidatePlan` различает исходную и допустимую count grid, хранит
+  `size_guard_rejections` и явный `size_guard_fallback_applied`;
+- `ClusterCandidateRequest` описывает один count-based или density-based adapter call;
+- `ClusterCandidateFitFailure` различает `adapter_unavailable` и `fit_failed`;
+- `ClusterScoreComponents` хранит objective inputs и список
+  `ClusterConstraintViolation` вместо неявного boolean-only результата;
+- `ClusterSelectionUnavailableError` содержит весь plan и failures, если не удалось
+  построить ни одного candidate.
+
+Старые поля `ClusterSelectionResult.candidates` и словарные diagnostics сохранены.
+Typed contracts являются внутренним source of truth, а словари материализуются на
+границе sampler/reporting для обратной совместимости.
 
 ### Balanced Silhouette
 
@@ -580,7 +600,7 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 ### Text2Image Prompt: Cluster Selection
 
 ```text
-ICML-style scientific figure, clean academic vector infographic, white background, muted blue-gray palette with one accent color, minimal typography, precise arrows, thin lines, labeled panels, no photorealism, no 3D glossy rendering, no decorative background, conference-paper figure aesthetics, mathematically clean, visually balanced. Spectral cluster selection figure: sv_scaled embedding enters four candidate algorithms kmeans, bisecting kmeans, Gaussian mixture, HDBSCAN; each candidate has silhouette, imbalance, tiny cluster penalty, target contrast; weighted vote selects final number of partitions and cluster labels.
+ICML-style scientific figure, clean academic vector infographic, white background, muted blue-gray palette with one accent color, minimal typography, precise arrows, thin lines, labeled panels, no photorealism, no 3D glossy rendering, no decorative background, conference-paper figure aesthetics, mathematically clean, visually balanced. Spectral cluster selection figure: a typed candidate plan separates requested cluster counts, counts rejected by minimum average partition size, fallback-reincluded counts, count-based adapter requests and one density-based HDBSCAN request; an effect shell executes adapters and records successful candidates or structured failures; each successful candidate has silhouette, imbalance, tiny cluster penalty, target contrast and explicit hard-constraint violations; weighted vote selects final partitions. Show pure-core and effect-shell boundary with precise arrows.
 ```
 
 ## MatrixRMTBackend И TensorRMTBackend
