@@ -221,3 +221,6 @@ production policy и `selected_rank_reason`.
 ```text
 ICML-style scientific figure, clean academic vector infographic, white background, muted blue-gray palette with one accent color, minimal typography, precise arrows, thin lines, labeled panels, no photorealism, no 3D glossy rendering, no decorative background, conference-paper figure aesthetics, mathematically clean, visually balanced. Four-panel scientific figure for controlled RMT spiked validation: panel A latent low-rank matrix L equals U diagonal spikes V transpose plus Gaussian or Student-t noise N with exact Frobenius SNR; panel B the same observed matrix enters random feature contractions and NumPy or Torch spectral backends; panel C four rank curves versus logarithmic SNR labeled explained variance, null edge, view stability, and subspace stability with the true rank as a horizontal reference; panel D rotation-invariant subspace precision and recall from canonical correlations, plus paired backend absolute deltas and rank-zero false-positive controls. Show equations for empirical SNR and squared subspace overlap, thin confidence bands across seeds, precise scientific labels.
 ```
+
+Следующий диагностический уровень - mixture of low-rank regimes, recovery числа
+partitions и cluster labels - описан в `11_multiregime_cluster_validation.md`.
