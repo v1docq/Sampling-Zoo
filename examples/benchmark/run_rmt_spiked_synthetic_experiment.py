@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 import sys
 from time import perf_counter
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Optional, Sequence
 
 import numpy as np
 from tqdm.auto import tqdm
@@ -26,12 +26,12 @@ from benchmark_logging import BenchmarkLogger  # noqa: E402
 from spiked_benchmark_reporting import (  # noqa: E402
     SpikedBenchmarkArtifactBuilder,
 )
-from sampling_zoo.core.experiment.artifact_runtime import (  # noqa: E402
-    capture_run_identity,
-    materialize_experiment_artifact_manifest,
-)
 from sampling_zoo.core.experiment.errors import (  # noqa: E402
     UnavailableExperimentDependencyError,
+)
+from synthetic_benchmark_runtime import (  # noqa: E402
+    create_synthetic_incremental_saver,
+    resolve_backend_device,
 )
 from sampling_zoo.core.sampling_strategies.spectral.rmt_contraction_sampler import (  # noqa: E402
     RMTContractionConfig,
@@ -205,8 +205,7 @@ class RMTSpikedExperimentOrchestrator:
 
     def _create_logger(self) -> BenchmarkLogger:
         run_id = (
-            "run_rmt_spiked_synthetic_"
-            f"{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            "run_rmt_spiked_synthetic_" f"{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         )
         return BenchmarkLogger(
             run_id=run_id,
@@ -221,55 +220,16 @@ class RMTSpikedExperimentOrchestrator:
         logger: BenchmarkLogger,
         grid_size: int,
     ) -> IncrementalExperimentSaver:
-        effective_config = _config_payload(self.config)
-        run_identity = capture_run_identity(
-            run_id=logger.run_id,
-            effective_config=effective_config,
+        saver = create_synthetic_incremental_saver(
+            logger=logger,
+            config=self.config,
+            grid_size=grid_size,
+            experiment_name="rmt_spiked_synthetic_validation",
+            records_filename="rmt_spiked_runs.jsonl",
+            artifact_builder=self.artifact_builder,
+            snapshot_every=self.config.snapshot_every,
             repo_root=ROOT_DIR,
-            ignored_git_paths=(logger.paths.root,),
         )
-
-        def build_artifacts(records: Sequence[Mapping[str, Any]]) -> None:
-            self.artifact_builder.build(records, logger.paths.root)
-
-        def build_metadata(
-            records: Sequence[Mapping[str, Any]],
-            status: str,
-        ) -> Mapping[str, Any]:
-            statuses = [str(record.get("status", "unknown")) for record in records]
-            return {
-                "run_id": logger.run_id,
-                "experiment": "rmt_spiked_synthetic_validation",
-                "status": status,
-                "grid_size": int(grid_size),
-                "completed_leaf_runs": statuses.count("completed"),
-                "failed_leaf_runs": statuses.count("failed"),
-                "skipped_leaf_runs": statuses.count("skipped"),
-                "effective_config": effective_config,
-                "run_identity": run_identity.to_dict(),
-            }
-
-        saver = IncrementalExperimentSaver(
-            records_path=logger.paths.metrics / "rmt_spiked_runs.jsonl",
-            metadata_path=logger.paths.root / "run_meta.json",
-            snapshot_hooks=(build_artifacts,),
-            metadata_builder=build_metadata,
-            json_ready=_json_ready,
-            rebuild_every=self.config.snapshot_every,
-        )
-
-        def materialize_manifest(
-            records: Sequence[Mapping[str, Any]],
-            status: str,
-        ) -> None:
-            materialize_experiment_artifact_manifest(
-                run_dir=logger.paths.root,
-                run_identity=run_identity,
-                status=status,
-                records=records,
-            )
-
-        saver.add_lifecycle_hook(materialize_manifest)
         self.incremental_saver = saver
         return saver
 
@@ -297,9 +257,7 @@ class RMTSpikedExperimentOrchestrator:
     ) -> dict[str, Any]:
         device = self._resolve_backend_device(point)
         dataset = self._generate_dataset(point)
-        sampler = RMTContractionTensorSampler(
-            self._make_sampler_config(point, device)
-        )
+        sampler = RMTContractionTensorSampler(self._make_sampler_config(point, device))
         started = perf_counter()
         sampler.fit(dataset.X)
         fit_time = perf_counter() - started
@@ -319,9 +277,7 @@ class RMTSpikedExperimentOrchestrator:
             "fit_time_sec": float(fit_time),
             "initial_rank": sampler.diagnostics_.get("initial_rank"),
             "selected_n_views": sampler.diagnostics_.get("n_views"),
-            "null_model_status": sampler.diagnostics_.get(
-                "null_model_status"
-            ),
+            "null_model_status": sampler.diagnostics_.get("null_model_status"),
             "subspace_stability_status": sampler.diagnostics_.get(
                 "subspace_stability_status"
             ),
@@ -364,9 +320,7 @@ class RMTSpikedExperimentOrchestrator:
             max_views=self.config.max_views,
             view_strategy=point.view_strategy,
             initial_rank_fraction=self.config.initial_rank_fraction,
-            explained_variance_threshold=(
-                self.config.explained_variance_threshold
-            ),
+            explained_variance_threshold=(self.config.explained_variance_threshold),
             null_diagnostic_enabled=True,
             null_model_policies=tuple(self.config.null_model_policies),
             null_resamples=self.config.null_resamples,
@@ -386,28 +340,11 @@ class RMTSpikedExperimentOrchestrator:
         self,
         point: SpikedValidationGridPoint,
     ) -> str:
-        if point.backend == "numpy":
-            return "cpu"
-        try:
-            import torch
-        except Exception as exc:
-            raise UnavailableExperimentDependencyError(
-                scope="rmt_spiked.backend",
-                code="torch_backend_unavailable",
-                message="Torch backend is unavailable for this leaf run",
-                details={"backend": point.backend},
-            ) from exc
-        if self.config.device != "auto":
-            requested = str(self.config.device)
-            if requested.startswith("cuda") and not torch.cuda.is_available():
-                raise UnavailableExperimentDependencyError(
-                    scope="rmt_spiked.backend",
-                    code="torch_device_unavailable",
-                    message=f"Requested torch device is unavailable: {requested}",
-                    details={"backend": point.backend, "device": requested},
-                )
-            return requested
-        return "cuda" if torch.cuda.is_available() else "cpu"
+        return resolve_backend_device(
+            backend=point.backend,
+            requested_device=self.config.device,
+            error_scope="rmt_spiked.backend",
+        )
 
     @staticmethod
     def _failed_record(
@@ -426,8 +363,7 @@ class RMTSpikedExperimentOrchestrator:
         return {
             **point.to_dict(),
             "dataset": (
-                f"spiked_{point.noise_distribution.value}"
-                f"_rank_{point.true_rank}"
+                f"spiked_{point.noise_distribution.value}" f"_rank_{point.true_rank}"
             ),
             "status": "skipped" if unavailable else "failed",
             "error_code": error_code,
@@ -519,28 +455,6 @@ def make_smoke_spiked_config(
         show_progress=show_progress,
         output_root=output_root,
     )
-
-
-def _config_payload(config: RMTSpikedExperimentConfig) -> dict[str, Any]:
-    return _json_ready(asdict(config))
-
-
-def _json_ready(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return {str(key): _json_ready(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_ready(item) for item in value]
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, (np.integer,)):
-        return int(value)
-    if isinstance(value, (np.floating,)):
-        return float(value)
-    if isinstance(value, (np.bool_,)):
-        return bool(value)
-    return value
 
 
 def _parse_args() -> argparse.Namespace:
