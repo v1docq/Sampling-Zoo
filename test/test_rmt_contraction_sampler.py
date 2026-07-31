@@ -183,6 +183,36 @@ def test_auto_partition_selection_skips_unavailable_optional_algorithms() -> Non
     assert sampler.predict_partition_proba(X.iloc[:5]).shape[1] == len(sampler.partition_names_)
 
 
+def test_auto_partition_selection_exposes_coassociation_diagnostics() -> None:
+    X = _frame(n_samples=60).select_dtypes(include=[np.number])
+    sampler = RMTContractionTensorSampler(
+        n_partitions=3,
+        partition_selection_method="auto",
+        cluster_algorithms=("kmeans", "gmm"),
+        cluster_ensemble_method="coassociation",
+        min_partitions=2,
+        max_partitions=4,
+        min_auto_partition_size=1,
+        cluster_vote_temperature=1.0,
+        n_views=2,
+        projection_dim=2,
+        backend="numpy",
+        random_state=43,
+        show_progress=False,
+    )
+
+    sampler.fit(X)
+
+    consensus = sampler.diagnostics_["partition_selection_consensus"]
+    assert consensus["plan"]["method"] == "weighted_membership_kmeans"
+    assert consensus["representation_shape"][0] == len(X)
+    assert consensus["representation_nnz"] <= len(X) * 6
+    assert sampler.diagnostics_["cluster_ensemble_method"] == "coassociation"
+    assert sampler.predict_partition_proba(X.iloc[:5]).shape[1] == len(
+        sampler.partition_names_
+    )
+
+
 def test_config_constructor_and_legacy_positional_arguments() -> None:
     config = RMTContractionConfig(
         n_partitions=2,

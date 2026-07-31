@@ -1,3 +1,4 @@
+from .cluster_consensus import build_weighted_membership_embedding
 from .cluster_selection_contracts import (
     ClusterCandidateFitFailure,
     ClusterCandidateFitFailureCode,
@@ -6,10 +7,13 @@ from .cluster_selection_contracts import (
     ClusterCandidateRejection,
     ClusterCandidateRejectionReason,
     ClusterCandidateRequest,
+    ClusterConsensusPlan,
+    ClusterConsensusSource,
     ClusterConstraintViolation,
     ClusterScoreComponents,
     ClusterSelectionUnavailableError,
     build_cluster_candidate_plan,
+    build_cluster_consensus_plan,
     evaluate_cluster_score_components,
     score_cluster_components,
 )
@@ -36,6 +40,8 @@ __all__ = [
     "ClusterCandidateRejection",
     "ClusterCandidateRejectionReason",
     "ClusterCandidateRequest",
+    "ClusterConsensusPlan",
+    "ClusterConsensusSource",
     "ClusterConstraintViolation",
     "ClusterScoreComponents",
     "ClusterSelectionUnavailableError",
@@ -50,6 +56,8 @@ __all__ = [
     "SpectralSubspaceDiagnosticResult",
     "SubspaceDiagnosticStatus",
     "build_cluster_candidate_plan",
+    "build_cluster_consensus_plan",
+    "build_weighted_membership_embedding",
     "evaluate_cluster_score_components",
     "score_cluster_components",
 ]

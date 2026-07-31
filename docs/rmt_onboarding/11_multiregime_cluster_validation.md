@@ -97,6 +97,20 @@ r_{signal}=K r + (K-1),
 - `candidate_failure_count` и `candidate_failure_codes` показывают недоступные или
   упавшие adapters, которые раньше молча исчезали из результата.
 
+Auto policies по умолчанию используют `cluster_ensemble_method="coassociation"`.
+Candidate scores преобразуются в веса, one-hot memberships объединяются в sparse
+matrix `H`, а финальные labels строятся KMeans над `H`. Полная pairwise matrix не
+создаётся, хотя `H H^T` точно соответствует weighted co-association. Отчёт хранит:
+
+- `consensus_used` и `consensus_fallback_to_source`;
+- `consensus_source_count`;
+- `consensus_representation_columns`;
+- `consensus_score_delta_vs_best_source`.
+
+Legacy `weighted_vote` остаётся доступной ablation: она выбирает `k`, но возвращает
+labels одного лучшего source candidate. Это позволяет отдельно измерить эффект именно
+consensus labels.
+
 Если size guard отсекает все count-based значения, текущий selector возвращает
 исходную сетку как fallback. Этот behavior покрыт invariant test и должен учитываться
 при интерпретации малых smoke datasets.
@@ -129,10 +143,12 @@ sampler basis. Высокий subspace recall при низком ARI указы
 2. Высокий oracle ARI и низкий count-based coverage означают, что истинный K был
    исключен planner guard до расчета balanced objective.
 3. Истинный K присутствует, но auto-policy выбирает другой K: проблема objective,
-   hard constraints, weighted vote или clustering adapter.
-4. Count grid не содержит K, но `density_candidate_rescued_true_n=True`: результат
+   hard constraints, weighted vote по `k` или clustering adapter.
+4. K выбран верно, но ARI consensus ниже лучших source candidates: проверить
+   `consensus_fallback_to_source`, source weights и устойчивость memberships.
+5. Count grid не содержит K, но `density_candidate_rescued_true_n=True`: результат
    спасен HDBSCAN; это надо отделять от корректности count planner-а.
-5. NumPy/Torch paired delta выше tolerance означает backend divergence, а не качество
+6. NumPy/Torch paired delta выше tolerance означает backend divergence, а не качество
    selector-а.
 
 ## Запуск
@@ -203,5 +219,5 @@ output_dir = run_rmt_multiregime_synthetic_experiment(
 ## Text2Image Prompt
 
 ```text
-ICML-style scientific figure, clean academic vector infographic, white background, muted blue-gray palette with one accent color, minimal typography, precise arrows, thin lines, labeled panels, no photorealism, no 3D glossy rendering, no decorative background, conference-paper figure aesthetics, mathematically clean, visually balanced. Four-panel figure for multi-regime RMT cluster validation: panel A mixture of K affine low-rank regimes with orthogonal centroids and local subspaces, balanced and four-to-one imbalanced profiles, plus Gaussian or Student-t noise with exact Frobenius SNR; panel B random feature contractions and sv-scaled sample embedding; panel C three probe paths labeled fixed oracle K, auto production size guard, and auto unrestricted, branching into KMeans, bisecting KMeans, Gaussian mixture, and HDBSCAN; panel D diagnostic decision tree comparing subspace recall, count-based candidate coverage, HDBSCAN density rescue, adjusted Rand index, aligned accuracy, and auto-policy regret versus oracle. Include the equations X equals L plus N and signal rank equals K times local rank plus K minus one, thin confidence bands over seeds, precise scientific labels.
+ICML-style scientific figure, clean academic vector infographic, white background, muted blue-gray palette with one accent color, minimal typography, precise arrows, thin lines, labeled panels, no photorealism, no 3D glossy rendering, no decorative background, conference-paper figure aesthetics, mathematically clean, visually balanced. Four-panel figure for multi-regime RMT cluster validation: panel A mixture of K affine low-rank regimes with orthogonal centroids and local subspaces, balanced and four-to-one imbalanced profiles, plus Gaussian or Student-t noise with exact Frobenius SNR; panel B random feature contractions and sv-scaled sample embedding; panel C three probe paths labeled fixed oracle K, auto production size guard, and auto unrestricted, branching into KMeans, bisecting KMeans, Gaussian mixture, and HDBSCAN, then weighted sparse membership matrix H and consensus KMeans; annotate H H transpose equals weighted co-association without dense materialization; panel D diagnostic decision tree comparing subspace recall, count-based candidate coverage, density rescue, consensus fallback, adjusted Rand index, aligned accuracy, and auto-policy regret versus oracle. Include the equations X equals L plus N and signal rank equals K times local rank plus K minus one, thin confidence bands over seeds, precise scientific labels.
 ```

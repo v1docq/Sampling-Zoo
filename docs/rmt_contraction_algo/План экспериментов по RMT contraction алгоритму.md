@@ -46,7 +46,7 @@ embedding_mode = "sv_scaled"
 partition_selection_method = "auto"
 cluster_algorithms = ["kmeans", "bisecting_kmeans", "gmm", "hdbscan"]
 cluster_selection_metric = "balanced_silhouette"
-cluster_ensemble_method = "weighted_vote"
+cluster_ensemble_method = "coassociation"
 initial_rank_fraction = 0.25
 rank_selection_method = "explained_variance"
 explained_variance_threshold = 0.95
@@ -61,7 +61,8 @@ explained_variance_threshold = 0.95
 3. `n_views_policy`: `coverage` vs `spectrum_stability` vs static integer.
 4. `partition_selection_method`: `fixed` vs `auto`.
 5. `cluster_algorithms`: исключение/добавление `gmm`, `bisecting_kmeans`, `hdbscan`.
-6. `routing_refinement`: `"none"` vs `"em_retraining"`.
+6. `cluster_ensemble_method`: `coassociation` vs legacy `weighted_vote` для изоляции эффекта consensus labels.
+7. `routing_refinement`: `"none"` vs `"em_retraining"`.
 
 # Диагностики, которые обязательно анализировать
 

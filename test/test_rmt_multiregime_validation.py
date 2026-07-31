@@ -224,6 +224,16 @@ def test_tiny_multi_regime_experiment_persists_incremental_artifacts(
     assert all("density_candidate_rescued_true_n" in record for record in records)
     assert all("planned_count_candidate_set" in record for record in records)
     assert all("candidate_failure_count" in record for record in records)
+    assert all("consensus_used" in record for record in records)
+    auto_record = next(
+        record for record in records if record["partition_policy"] == "auto_unrestricted"
+    )
+    fixed_record = next(
+        record for record in records if record["partition_policy"] == "fixed_oracle"
+    )
+    assert auto_record["consensus_used"] is True
+    assert auto_record["consensus_source_count"] > 0
+    assert fixed_record["consensus_used"] is False
     assert (output_dir / "metrics" / "rmt_multiregime_raw_runs.csv").exists()
     assert (output_dir / "metrics" / "rmt_multiregime_summary_by_snr.csv").exists()
     assert (output_dir / "metrics" / "rmt_multiregime_policy_regret.csv").exists()
@@ -242,6 +252,11 @@ def test_tiny_multi_regime_experiment_persists_incremental_artifacts(
         "size_guard_fallback_applied",
         "candidate_failure_count",
         "candidate_failure_codes",
+        "consensus_used",
+        "consensus_fallback_to_source",
+        "consensus_representation_columns",
+        "consensus_source_count",
+        "consensus_score_delta_vs_best_source",
     }
     legacy_records = [
         {key: value for key, value in record.items() if key not in legacy_fields}

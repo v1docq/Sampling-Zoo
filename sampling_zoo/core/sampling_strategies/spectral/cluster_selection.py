@@ -11,14 +11,17 @@ from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 from sklearn.mixture import GaussianMixture
 
+from .cluster_consensus import build_weighted_membership_embedding
 from .cluster_selection_contracts import (
     ClusterCandidateFitFailure,
     ClusterCandidateKind,
     ClusterCandidatePlan,
     ClusterCandidateRequest,
+    ClusterConsensusPlan,
     ClusterScoreComponents,
     ClusterSelectionUnavailableError,
     build_cluster_candidate_plan,
+    build_cluster_consensus_plan,
     candidate_fit_failure,
     evaluate_cluster_score_components,
     normalize_cluster_algorithm,
@@ -62,6 +65,23 @@ class _ClusterCandidateBatch:
 
 
 @dataclass(frozen=True)
+class _ClusterConsensusRuntime:
+    plan: ClusterConsensusPlan
+    candidates: Tuple[ClusterCandidate, ...]
+    representation_shape: Tuple[int, int]
+    representation_nnz: int
+    fallback_to_source_candidate: bool
+    best_source_score: float
+    score_delta_vs_best_source: float
+
+
+@dataclass(frozen=True)
+class _ClusterSelectionDecision:
+    selected: ClusterCandidate
+    consensus: Optional[_ClusterConsensusRuntime] = None
+
+
+@dataclass(frozen=True)
 class ClusterSelectionResult:
     labels: np.ndarray
     centers: np.ndarray
@@ -72,6 +92,8 @@ class ClusterSelectionResult:
     candidate_plan: ClusterCandidatePlan
     candidate_failures: Tuple[ClusterCandidateFitFailure, ...]
     diagnostics: Dict[str, Any]
+    consensus_plan: Optional[ClusterConsensusPlan] = None
+    consensus_candidates: Tuple[ClusterCandidate, ...] = ()
 
 
 class _ClusterAdapterUnavailableError(RuntimeError):
@@ -109,7 +131,7 @@ class SpectralClusterSelector:
         self.ensemble_method = self._validate_choice(
             "cluster_ensemble_method",
             ensemble_method,
-            ("best_score", "weighted_vote"),
+            ("best_score", "weighted_vote", "coassociation"),
         )
         self.min_partitions = max(1, int(min_partitions))
         self.max_partitions = (
@@ -138,7 +160,8 @@ class SpectralClusterSelector:
         if not batch.candidates:
             raise ClusterSelectionUnavailableError(batch.plan, batch.failures)
 
-        selected = self._select_candidate(batch.candidates)
+        decision = self._select_candidate(batch.candidates, embedding, target)
+        selected = decision.selected
         progress_write(
             (
                 "Selected spectral clusters: "
@@ -158,7 +181,11 @@ class SpectralClusterSelector:
             candidates=batch.candidates,
             candidate_plan=batch.plan,
             candidate_failures=batch.failures,
-            diagnostics=self._build_diagnostics(batch, selected),
+            consensus_plan=(decision.consensus.plan if decision.consensus else None),
+            consensus_candidates=(
+                decision.consensus.candidates if decision.consensus else ()
+            ),
+            diagnostics=self._build_diagnostics(batch, decision),
         )
 
     def build_candidate_plan(self, n_samples: int) -> ClusterCandidatePlan:
@@ -403,13 +430,22 @@ class SpectralClusterSelector:
         return between / global_std
 
     def _select_candidate(
-        self, candidates: Sequence[ClusterCandidate]
-    ) -> ClusterCandidate:
+        self,
+        candidates: Sequence[ClusterCandidate],
+        embedding: np.ndarray,
+        target: Optional[Any],
+    ) -> _ClusterSelectionDecision:
         valid_candidates = [candidate for candidate in candidates if candidate.valid]
         pool = valid_candidates or list(candidates)
         if self.ensemble_method == "weighted_vote":
-            return self._select_by_weighted_vote(pool)
-        return max(pool, key=lambda candidate: candidate.score)
+            return _ClusterSelectionDecision(
+                selected=self._select_by_weighted_vote(pool)
+            )
+        if self.ensemble_method == "coassociation":
+            return self._select_by_coassociation(pool, embedding, target)
+        return _ClusterSelectionDecision(
+            selected=max(pool, key=lambda candidate: candidate.score)
+        )
 
     def _select_by_weighted_vote(
         self, candidates: Sequence[ClusterCandidate]
@@ -428,11 +464,77 @@ class SpectralClusterSelector:
         ]
         return max(same_k, key=lambda candidate: candidate.score)
 
+    def _select_by_coassociation(
+        self,
+        candidates: Sequence[ClusterCandidate],
+        embedding: np.ndarray,
+        target: Optional[Any],
+    ) -> _ClusterSelectionDecision:
+        ordered = tuple(
+            sorted(
+                candidates,
+                key=lambda candidate: (
+                    candidate.algorithm,
+                    candidate.n_clusters,
+                    -candidate.score,
+                ),
+            )
+        )
+        plan = build_cluster_consensus_plan(
+            algorithms=[candidate.algorithm for candidate in ordered],
+            n_clusters=[candidate.n_clusters for candidate in ordered],
+            scores=[candidate.score for candidate in ordered],
+            vote_temperature=self.vote_temperature,
+        )
+        membership = build_weighted_membership_embedding(
+            [candidate.labels for candidate in ordered],
+            plan,
+        )
+        estimator = self._make_kmeans(plan.selected_n_clusters)
+        labels = estimator.fit_predict(membership)
+        consensus_candidate = self._make_candidate(
+            "coassociation_consensus",
+            plan.selected_n_clusters,
+            labels,
+            embedding,
+            target,
+            estimator,
+        )
+        same_k_sources = tuple(
+            candidate
+            for candidate in ordered
+            if candidate.n_clusters == plan.selected_n_clusters
+        )
+        best_source = max(same_k_sources, key=lambda candidate: candidate.score)
+        selected = consensus_candidate
+        if not consensus_candidate.valid and same_k_sources:
+            valid_sources = tuple(
+                candidate for candidate in same_k_sources if candidate.valid
+            )
+            fallback_pool = valid_sources or same_k_sources
+            fallback = max(fallback_pool, key=lambda candidate: candidate.score)
+            if fallback.valid or fallback.score > consensus_candidate.score:
+                selected = fallback
+        runtime = _ClusterConsensusRuntime(
+            plan=plan,
+            candidates=(consensus_candidate,),
+            representation_shape=tuple(map(int, membership.shape)),
+            representation_nnz=int(membership.nnz),
+            fallback_to_source_candidate=(selected is not consensus_candidate),
+            best_source_score=float(best_source.score),
+            score_delta_vs_best_source=float(
+                consensus_candidate.score - best_source.score
+            ),
+        )
+        return _ClusterSelectionDecision(selected=selected, consensus=runtime)
+
     def _build_diagnostics(
         self,
         batch: _ClusterCandidateBatch,
-        selected: ClusterCandidate,
+        decision: _ClusterSelectionDecision,
     ) -> Dict[str, Any]:
+        selected = decision.selected
+        consensus = decision.consensus
         return {
             "selected_algorithm": selected.algorithm,
             "selected_n_clusters": int(selected.n_clusters),
@@ -443,16 +545,38 @@ class SpectralClusterSelector:
             "min_cluster_fraction": float(self.min_cluster_fraction),
             "candidate_plan": batch.plan.to_dict(),
             "candidate_failures": [failure.to_dict() for failure in batch.failures],
-            "candidates": [
+            "selected_candidate": self._candidate_diagnostic(selected),
+            "candidates": [self._candidate_diagnostic(candidate) for candidate in batch.candidates],
+            "consensus": (
                 {
-                    "algorithm": candidate.algorithm,
-                    "n_clusters": int(candidate.n_clusters),
-                    "score": float(candidate.score),
-                    "valid": bool(candidate.valid),
-                    "components": candidate.components,
+                    "plan": consensus.plan.to_dict(),
+                    "representation_shape": list(consensus.representation_shape),
+                    "representation_nnz": int(consensus.representation_nnz),
+                    "fallback_to_source_candidate": bool(
+                        consensus.fallback_to_source_candidate
+                    ),
+                    "best_source_score": float(consensus.best_source_score),
+                    "score_delta_vs_best_source": float(
+                        consensus.score_delta_vs_best_source
+                    ),
+                    "candidates": [
+                        self._candidate_diagnostic(candidate)
+                        for candidate in consensus.candidates
+                    ],
                 }
-                for candidate in batch.candidates
-            ],
+                if consensus is not None
+                else None
+            ),
+        }
+
+    @staticmethod
+    def _candidate_diagnostic(candidate: ClusterCandidate) -> Dict[str, Any]:
+        return {
+            "algorithm": candidate.algorithm,
+            "n_clusters": int(candidate.n_clusters),
+            "score": float(candidate.score),
+            "valid": bool(candidate.valid),
+            "components": candidate.components,
         }
 
     def _make_kmeans(self, n_clusters: int) -> KMeans:

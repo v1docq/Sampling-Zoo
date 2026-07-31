@@ -385,7 +385,7 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 | `partition_selection_method` | `fixed` или `auto`. В `auto` число partitions выбирается через `SpectralClusterSelector`. |
 | `cluster_algorithms` | Кандидаты кластеризации: `kmeans`, `bisecting_kmeans`, `gmm`, optional `hdbscan`. |
 | `cluster_selection_metric` | Метрика выбора candidates: `silhouette` или `balanced_silhouette`. |
-| `cluster_ensemble_method` | `best_score` или `weighted_vote` по candidates. |
+| `cluster_ensemble_method` | `best_score`, legacy `weighted_vote` или `coassociation`, который строит consensus labels из всех candidates. |
 | `min_partitions`, `max_partitions` | Диапазон числа кластеров для auto-selection. |
 | `max_cluster_imbalance_ratio`, `min_cluster_fraction` | Hard constraints против слишком несбалансированных или слишком маленьких clusters. |
 | `n_views` | Сколько random feature views строить. Может быть integer или `"auto"`. |
@@ -555,7 +555,8 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 Файлы:
 
 - `sampling_zoo/core/sampling_strategies/spectral/cluster_selection.py`;
-- `sampling_zoo/core/sampling_strategies/spectral/cluster_selection_contracts.py`.
+- `sampling_zoo/core/sampling_strategies/spectral/cluster_selection_contracts.py`;
+- `sampling_zoo/core/sampling_strategies/spectral/cluster_consensus.py`.
 
 Назначение: отдельный collaborator для кластеризации spectral embedding. Он разгружает `RMTContractionTensorSampler`: sampler строит embedding и partitions, а selector отвечает за candidates, scoring, hard constraints и выбор лучшего разбиения.
 
@@ -572,6 +573,8 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 | `_score_components(...)` | Делегирует pure core расчёт silhouette inputs, imbalance, tiny mass и constraint violations. |
 | `_candidate_score(...)` | Для `balanced_silhouette` считает `silhouette - imbalance_penalty - tiny_cluster_penalty + target_bonus - hard_constraint_penalty`. |
 | `_select_by_weighted_vote(...)` | Агрегирует candidates по числу clusters через soft weights от score. |
+| `_select_by_coassociation(...)` | Строит sparse weighted membership representation, получает consensus labels и проверяет их прежним balanced objective. |
+| `build_weighted_membership_embedding(...)` | Чисто строит разреженную матрицу memberships без материализации квадратной co-association matrix. |
 
 ### Typed Contracts
 
@@ -581,12 +584,41 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 - `ClusterCandidateFitFailure` различает `adapter_unavailable` и `fit_failed`;
 - `ClusterScoreComponents` хранит objective inputs и список
   `ClusterConstraintViolation` вместо неявного boolean-only результата;
+- `ClusterConsensusPlan` хранит нормированные source weights, weighted votes по `k`,
+  выбранное число clusters и размер sparse representation;
 - `ClusterSelectionUnavailableError` содержит весь plan и failures, если не удалось
   построить ни одного candidate.
 
 Старые поля `ClusterSelectionResult.candidates` и словарные diagnostics сохранены.
 Typed contracts являются внутренним source of truth, а словари материализуются на
 границе sampler/reporting для обратной совместимости.
+
+### Co-association Consensus
+
+Для каждого source partition `m` строится one-hot membership matrix `Z_m`, а score
+превращается в softmax weight `w_m`. Разреженное представление имеет вид
+
+\[
+H = [\sqrt{w_1}Z_1\;|\;\sqrt{w_2}Z_2\;|\;\cdots\;|\;\sqrt{w_M}Z_M].
+\]
+
+Его Gram matrix точно равна weighted co-association matrix:
+
+\[
+HH^\top = \sum_{m=1}^{M} w_m Z_m Z_m^\top,
+\]
+
+где элемент `(i,j)` показывает взвешенную долю candidates, поместивших строки `i`
+и `j` в один cluster. Реализация не создаёт `n_samples x n_samples` matrix: KMeans
+работает прямо на sparse `H`, где число non-zero элементов не превышает
+`n_samples * n_candidates`.
+
+Целевое `k` выбирается совместимым weighted vote. В отличие от legacy policy,
+финальные labels принадлежат consensus partition, а не одному source algorithm.
+Consensus повторно проходит balanced objective; при нарушении hard constraints
+selector возвращает лучший допустимый source candidate того же `k` и фиксирует
+`fallback_to_source_candidate`. Поле `score_delta_vs_best_source` отдельно показывает
+разницу objective, но не превращает policy в неявный best-of-two выбор.
 
 ### Balanced Silhouette
 
@@ -600,7 +632,7 @@ Typed contracts являются внутренним source of truth, а сло
 ### Text2Image Prompt: Cluster Selection
 
 ```text
-ICML-style scientific figure, clean academic vector infographic, white background, muted blue-gray palette with one accent color, minimal typography, precise arrows, thin lines, labeled panels, no photorealism, no 3D glossy rendering, no decorative background, conference-paper figure aesthetics, mathematically clean, visually balanced. Spectral cluster selection figure: a typed candidate plan separates requested cluster counts, counts rejected by minimum average partition size, fallback-reincluded counts, count-based adapter requests and one density-based HDBSCAN request; an effect shell executes adapters and records successful candidates or structured failures; each successful candidate has silhouette, imbalance, tiny cluster penalty, target contrast and explicit hard-constraint violations; weighted vote selects final partitions. Show pure-core and effect-shell boundary with precise arrows.
+ICML-style scientific figure, clean academic vector infographic, white background, muted blue-gray palette with one accent color, minimal typography, precise arrows, thin lines, labeled panels, no photorealism, no 3D glossy rendering, no decorative background, conference-paper figure aesthetics, mathematically clean, visually balanced. Spectral cluster consensus figure: a typed candidate plan branches into KMeans, bisecting KMeans, Gaussian mixture, and HDBSCAN; adapter failures remain structured; candidate scores become normalized weights; weighted one-hot membership blocks form a sparse matrix H; annotate H H transpose equals the weighted co-association matrix without materializing it; sparse KMeans produces consensus labels and hard-constraint validation can fall back to the best source partition. Show the pure-core and effect-shell boundary, labeled dimensions n by sum k, and a small valid/fallback decision panel.
 ```
 
 ## MatrixRMTBackend И TensorRMTBackend

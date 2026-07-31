@@ -100,11 +100,16 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 | `selected_cluster_algorithm` | Алгоритм, выбранный `SpectralClusterSelector`, если auto-selection включен. |
 | `cluster_algorithms` | Список алгоритмов-кандидатов. |
 | `cluster_selection_metric` | `silhouette` или `balanced_silhouette`. |
-| `cluster_ensemble_method` | `best_score` или `weighted_vote`. |
+| `cluster_ensemble_method` | `best_score`, legacy `weighted_vote` или `coassociation`. |
 | `partition_selection_scores` | Scores по кандидатам `k`. |
 | `partition_selection_candidate_details` | Подробности candidates: algorithm, score, valid flag, components. |
 | `partition_selection_candidate_plan` | Исходная и eligible count grid, size-guard rejections, fallback flag и planned adapter requests. |
 | `partition_selection_candidate_failures` | Structured failures: request, `adapter_unavailable`/`fit_failed`, тип и сообщение ошибки. |
+| `partition_selection_consensus.plan` | Source weights, votes по `k`, выбранное `k` и число columns в sparse membership representation. |
+| `partition_selection_consensus.representation_shape` / `representation_nnz` | Фактический размер и число non-zero элементов `H`; позволяют проверить отсутствие quadratic materialization. |
+| `partition_selection_consensus.fallback_to_source_candidate` | Consensus labels нарушили hard constraints, поэтому selector вернул допустимый source partition того же `k`. |
+| `partition_selection_consensus.score_delta_vs_best_source` | Разница balanced objective между consensus и лучшим source partition того же `k`; диагностическая величина, не hidden selection rule. |
+| `partition_selection_consensus.candidates` | Score, valid flag и components полученного consensus partition. |
 | `partition_count` / `n_partitions` | Число построенных partitions. |
 | `chunk_sizes` | Размеры chunks после selection/filtering. |
 
@@ -121,6 +126,7 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 - Если `size_guard_rejections` содержит ожидаемое `k`, оно не дошло до count-based adapters. При `size_guard_fallback_applied=True` вся исходная grid была возвращена после полного отсева.
 - `constraint_violations` внутри candidate components показывает конкретную hard constraint: `max_imbalance_ratio` и/или `min_cluster_fraction`.
 - Непустые `partition_selection_candidate_failures` не обязательно делают run failed: selector продолжает работу, если хотя бы один независимый adapter вернул candidate.
+- При `cluster_ensemble_method="coassociation"` ожидайте `representation_shape[0] == n_samples` и `representation_nnz <= n_samples * n_sources`. Большая fallback rate означает, что consensus систематически нарушает balance constraints и не должен становиться безусловным улучшением.
 - Если `encoded_feature_cap_applied=True`, downstream качество надо интерпретировать с учетом потери части one-hot признаков.
 
 ### Text2Image Prompt: RMT Diagnostics
@@ -165,7 +171,7 @@ flowchart LR
 4. randomized SVD дает spectral embedding;
 5. `embedding_mode="sv_scaled"` масштабирует `U` на `S`, чтобы clustering видел не только направление, но и spectral energy;
 6. если `partition_selection_method="fixed"`, KMeans делит embedding на `n_partitions` clusters;
-7. если `partition_selection_method="auto"`, `SpectralClusterSelector` сравнивает `kmeans`, `bisecting_kmeans`, `gmm`, optional `hdbscan` и выбирает partitions по `balanced_silhouette`/`weighted_vote`;
+7. если `partition_selection_method="auto"`, `SpectralClusterSelector` сравнивает `kmeans`, `bisecting_kmeans`, `gmm`, optional `hdbscan`; default benchmark policy `coassociation` агрегирует их memberships в consensus labels и повторно проверяет balanced objective;
 8. внутри каждого cluster выбираются строки по `selection_method`;
 9. partitions получают имена `chunk_0`, `chunk_1`, ...
 
