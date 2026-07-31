@@ -47,6 +47,10 @@ partition_selection_method = "auto"
 cluster_algorithms = ["kmeans", "bisecting_kmeans", "gmm", "hdbscan"]
 cluster_selection_metric = "balanced_silhouette"
 cluster_ensemble_method = "coassociation"
+cluster_target_type = problem_type
+missing_class_penalty_weight = 0.25
+single_class_penalty_weight = 0.50
+class_distribution_drift_weight = 0.25
 initial_rank_fraction = 0.25
 rank_selection_method = "explained_variance"
 explained_variance_threshold = 0.95
@@ -71,6 +75,7 @@ explained_variance_threshold = 0.95
 - `n_views`, `n_views_policy`, `spectrum_stability_change`, `estimated_feature_coverage`;
 - `selected_rank`, `explained_variance_at_selected_rank`;
 - `selected_n_partitions`, `selected_cluster_algorithm`, `partition_selection_scores`;
+- для classification: class counts per chunk, missing-class fraction, single-class chunk/sample fraction и class-distribution drift для каждого candidate;
 - `chunk_size_imbalance`, target drift per chunk;
 - `mean_max_probability`, routing entropy, hard assignment counts на validation/test;
 - EM diagnostics: `routing_refinement_status`, `routing_refinement_metric_improvement`, `routing_refinement_final_imbalance`.

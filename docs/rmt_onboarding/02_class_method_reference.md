@@ -218,6 +218,7 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 | `_create_support_model(...)` | Создает вспомогательную модель для supervised sampling. |
 | `_create_partitioner(...)` | Factory для sampler/partitioner class. |
 | `_fit_and_collect_partitions(...)` | Вызывает правильный fit-flow и возвращает partitions. |
+| `_fit_target_aware_partitioner(...)` | Передает `target` в `RMTContractionTensorSampler.fit(...)`, чтобы auto-selection могла оценить class coverage или regression target contrast. Для остальных unsupervised partitioners прежний fit-flow не меняется. |
 | `_apply_budget_policy_to_partitions(...)` | Сжимает partitions по `budget_ratio` после partitioning. |
 
 ### Training Методы
@@ -388,6 +389,10 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 | `cluster_ensemble_method` | `best_score`, legacy `weighted_vote` или `coassociation`, который строит consensus labels из всех candidates. |
 | `min_partitions`, `max_partitions` | Диапазон числа кластеров для auto-selection. |
 | `max_cluster_imbalance_ratio`, `min_cluster_fraction` | Hard constraints против слишком несбалансированных или слишком маленьких clusters. |
+| `cluster_target_type` | `auto`, `regression` или `classification`. Benchmark factory передает тип задачи явно; это особенно важно для целочисленной regression target, которую автоматический inference может принять за multiclass. |
+| `missing_class_penalty_weight` | Вес мягкого штрафа за отсутствующие пары chunk/class. |
+| `single_class_penalty_weight` | Вес дополнительного мягкого штрафа за долю одно-классовых chunks; сам факт такого chunk также является hard constraint violation. |
+| `class_distribution_drift_weight` | Вес среднего, взвешенного по размеру chunk, total-variation drift между локальным и глобальным распределениями классов. |
 | `n_views` | Сколько random feature views строить. Может быть integer или `"auto"`. |
 | `n_views_policy` | `auto`, `coverage` или `spectrum_stability`. Для `subsample` auto -> coverage, для `gaussian` auto -> spectrum stability. |
 | `min_views`, `max_views` | Границы автоматического выбора числа views. |
@@ -570,8 +575,9 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 | `_fit_candidate_request(...)` | Превращает исключение optional adapter-а в `ClusterCandidateFitFailure`, не скрывая причину. |
 | `_fit_count_based_candidate(...)` | Обучает `kmeans`, `bisecting_kmeans` или `gmm` для заданного `k`. |
 | `_fit_hdbscan_candidate(...)` | Строит HDBSCAN candidate через sklearn/external backend или возвращает typed unavailable failure. |
-| `_score_components(...)` | Делегирует pure core расчёт silhouette inputs, imbalance, tiny mass и constraint violations. |
-| `_candidate_score(...)` | Для `balanced_silhouette` считает `silhouette - imbalance_penalty - tiny_cluster_penalty + target_bonus - hard_constraint_penalty`. |
+| `_score_components(...)` | Определяет effective target type и делегирует pure core расчёт silhouette, balance, regression target contrast или classification partition profile. |
+| `_classification_components(...)` | Строит global и per-cluster class counts и передает их в pure `evaluate_classification_partition_components(...)`. |
+| `_candidate_score(...)` | Для `balanced_silhouette` применяет balance, classification и hard-constraint слагаемые к одному immutable `ClusterScoreComponents`. |
 | `_select_by_weighted_vote(...)` | Агрегирует candidates по числу clusters через soft weights от score. |
 | `_select_by_coassociation(...)` | Строит sparse weighted membership representation, получает consensus labels и проверяет их прежним balanced objective. |
 | `build_weighted_membership_embedding(...)` | Чисто строит разреженную матрицу memberships без материализации квадратной co-association matrix. |
@@ -584,6 +590,8 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 - `ClusterCandidateFitFailure` различает `adapter_unavailable` и `fit_failed`;
 - `ClusterScoreComponents` хранит objective inputs и список
   `ClusterConstraintViolation` вместо неявного boolean-only результата;
+- `ClassificationPartitionComponents` хранит class counts, missing-class fraction,
+  долю одно-классовых chunks/строк и class-distribution drift;
 - `ClusterConsensusPlan` хранит нормированные source weights, weighted votes по `k`,
   выбранное число clusters и размер sparse representation;
 - `ClusterSelectionUnavailableError` содержит весь plan и failures, если не удалось
@@ -627,12 +635,44 @@ selector возвращает лучший допустимый source candidate
 - penalty за `max_cluster_imbalance_ratio`;
 - penalty за tiny clusters ниже `min_cluster_fraction`;
 - optional `target_contrast`, если хочется поощрять target-различимость clusters;
+- для classification: penalty за отсутствующие классы, одно-классовые chunks и drift распределения классов;
 - hard constraint penalty, если cluster candidate нарушает ограничения.
+
+Для classification objective имеет вид
+
+\[
+S = s_{sil}
+- \lambda_{imb}p_{imb}
+- \lambda_{tiny}p_{tiny}
+- \lambda_{miss}p_{miss}
+- \lambda_{single}p_{single}
+- \lambda_{drift}p_{drift}
+- p_{hard}.
+\]
+
+Здесь `p_miss` — доля нулевых элементов в матрице chunk/class counts,
+`p_single` — доля chunks только с одним представленным классом, а `p_drift` —
+среднее total-variation distance локальных class distributions от глобального,
+взвешенное по размеру chunk. Одно-классовый chunk добавляет
+`single_class_cluster` в hard violations. Отсутствие отдельных редких классов
+остается мягким штрафом: требование иметь каждый класс в каждом chunk часто
+невыполнимо на multiclass datasets.
+
+Classification-слагаемые отсутствуют для regression, поэтому прежняя regression
+формула и candidate scores сохраняются. В benchmark-конфигах тип задачи задается
+явно; при прямом использовании sampler-а с целочисленной regression target следует
+также передавать `cluster_target_type="regression"`.
 
 ### Text2Image Prompt: Cluster Selection
 
 ```text
 ICML-style scientific figure, clean academic vector infographic, white background, muted blue-gray palette with one accent color, minimal typography, precise arrows, thin lines, labeled panels, no photorealism, no 3D glossy rendering, no decorative background, conference-paper figure aesthetics, mathematically clean, visually balanced. Spectral cluster consensus figure: a typed candidate plan branches into KMeans, bisecting KMeans, Gaussian mixture, and HDBSCAN; adapter failures remain structured; candidate scores become normalized weights; weighted one-hot membership blocks form a sparse matrix H; annotate H H transpose equals the weighted co-association matrix without materializing it; sparse KMeans produces consensus labels and hard-constraint validation can fall back to the best source partition. Show the pure-core and effect-shell boundary, labeled dimensions n by sum k, and a small valid/fallback decision panel.
+```
+
+### Text2Image Prompt: Class-Aware Partition Objective
+
+```text
+ICML-style scientific figure, clean academic vector infographic, white background, muted blue-gray palette with one accent color, minimal typography, precise arrows, thin lines, labeled panels, no photorealism, no 3D glossy rendering, no decorative background, conference-paper figure aesthetics, mathematically clean, visually balanced. Classification-aware spectral partition scoring figure with three candidate chunkings of the same binary dataset: balanced class coverage, missing-class chunks, and single-class chunks. Show a chunk-by-class count matrix, global class distribution, weighted total-variation drift, soft penalties for missing classes and drift, and a red hard-constraint marker for single-class chunks. End with a balanced-silhouette score equation and selected candidate panel.
 ```
 
 ## MatrixRMTBackend И TensorRMTBackend

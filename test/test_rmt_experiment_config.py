@@ -45,6 +45,10 @@ def test_chunking_configs_support_rmt_and_experiment_metadata() -> None:
     assert configs["rmt_contraction"]["max_partitions"] >= 4
     assert configs["rmt_contraction"]["max_cluster_imbalance_ratio"] == 5.0
     assert configs["rmt_contraction"]["min_cluster_fraction"] == 0.05
+    assert configs["rmt_contraction"]["cluster_target_type"] == "regression"
+    assert configs["rmt_contraction"]["missing_class_penalty_weight"] == 0.25
+    assert configs["rmt_contraction"]["single_class_penalty_weight"] == 0.50
+    assert configs["rmt_contraction"]["class_distribution_drift_weight"] == 0.25
     assert "approx_rank" not in configs["rmt_contraction"]
     assert configs["rmt_contraction"]["initial_rank_fraction"] == 0.25
     assert configs["rmt_contraction"]["rank_selection_method"] == "explained_variance"
@@ -60,6 +64,15 @@ def test_chunking_configs_support_rmt_and_experiment_metadata() -> None:
     assert "chunk_fraction" not in configs["feature_clustering"]
     assert configs["random"]["budget_ratio"] == 0.1
     assert configs["difficulty"]["problem"] == "regression"
+
+
+def test_classification_chunking_config_selects_class_aware_objective() -> None:
+    configs = make_chunking_strategy_configs(
+        problem_type="classification",
+        strategy_names=("rmt_contraction",),
+    )
+
+    assert configs["rmt_contraction"]["cluster_target_type"] == "classification"
 
 
 def test_routed_weighted_falls_back_for_non_routing_sampler() -> None:
