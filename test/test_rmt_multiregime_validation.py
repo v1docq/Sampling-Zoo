@@ -5,6 +5,9 @@ import json
 import numpy as np
 import pytest
 
+from examples.benchmark.multiregime_benchmark_reporting import (
+    MultiRegimeBenchmarkArtifactBuilder,
+)
 from examples.benchmark.run_rmt_multiregime_synthetic_experiment import (
     RMTMultiRegimeExperimentConfig,
     RMTMultiRegimeExperimentOrchestrator,
@@ -219,6 +222,8 @@ def test_tiny_multi_regime_experiment_persists_incremental_artifacts(
     assert all("selected_subspace_recall" in record for record in records)
     assert all("count_based_candidate_set" in record for record in records)
     assert all("density_candidate_rescued_true_n" in record for record in records)
+    assert all("planned_count_candidate_set" in record for record in records)
+    assert all("candidate_failure_count" in record for record in records)
     assert (output_dir / "metrics" / "rmt_multiregime_raw_runs.csv").exists()
     assert (output_dir / "metrics" / "rmt_multiregime_summary_by_snr.csv").exists()
     assert (output_dir / "metrics" / "rmt_multiregime_policy_regret.csv").exists()
@@ -229,3 +234,22 @@ def test_tiny_multi_regime_experiment_persists_incremental_artifacts(
     )
     assert manifest["status"] == "completed"
     assert manifest["record_count"] == 2
+
+    legacy_fields = {
+        "planned_count_candidate_set",
+        "planned_count_candidate_set_contains_true_n",
+        "size_guard_rejected_true_n",
+        "size_guard_fallback_applied",
+        "candidate_failure_count",
+        "candidate_failure_codes",
+    }
+    legacy_records = [
+        {key: value for key, value in record.items() if key not in legacy_fields}
+        for record in records
+    ]
+    legacy_dir = tmp_path / "legacy_rebuild"
+    legacy_paths = MultiRegimeBenchmarkArtifactBuilder().build(
+        legacy_records,
+        legacy_dir,
+    )
+    assert legacy_paths["summary_csv"].exists()

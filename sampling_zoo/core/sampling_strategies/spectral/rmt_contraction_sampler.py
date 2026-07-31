@@ -158,6 +158,8 @@ class PartitionSelectionInfo:
     candidates: Tuple[int, ...]
     scores: Tuple[Tuple[int, Optional[float]], ...]
     candidate_details: Tuple[Dict[str, Any], ...]
+    candidate_plan: Dict[str, Any]
+    candidate_failures: Tuple[Dict[str, Any], ...]
     min_auto_partition_size: int
     selection_sample_size: int
 
@@ -706,6 +708,8 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             candidates=(int(n_clusters),),
             scores=((int(n_clusters), None),),
             candidate_details=(),
+            candidate_plan={},
+            candidate_failures=(),
             min_auto_partition_size=int(self.min_auto_partition_size),
             selection_sample_size=0,
         )
@@ -731,6 +735,10 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             for candidate in result.candidates
         )
         candidate_details = tuple(result.diagnostics.get("candidates", ()))
+        candidate_plan = result.candidate_plan.to_dict()
+        candidate_failures = tuple(
+            failure.to_dict() for failure in result.candidate_failures
+        )
         return PartitionSelectionInfo(
             requested_n_partitions=int(self.n_partitions),
             selected_n_partitions=int(result.selected_n_clusters),
@@ -742,6 +750,8 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             candidates=candidate_counts,
             scores=candidate_scores,
             candidate_details=candidate_details,
+            candidate_plan=candidate_plan,
+            candidate_failures=candidate_failures,
             min_auto_partition_size=int(self.min_auto_partition_size),
             selection_sample_size=int(min(self.partition_selection_sample_size, result.labels.shape[0])),
         )
@@ -1225,6 +1235,8 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
                 for candidate, score in partition_info.scores
             } if partition_info else {},
             "partition_selection_candidate_details": list(partition_info.candidate_details) if partition_info else [],
+            "partition_selection_candidate_plan": dict(partition_info.candidate_plan) if partition_info else {},
+            "partition_selection_candidate_failures": list(partition_info.candidate_failures) if partition_info else [],
             "max_cluster_imbalance_ratio": float(self.max_cluster_imbalance_ratio),
             "min_cluster_fraction": float(self.min_cluster_fraction),
             "min_auto_partition_size": int(partition_info.min_auto_partition_size) if partition_info else None,

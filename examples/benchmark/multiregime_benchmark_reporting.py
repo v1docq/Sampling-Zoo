@@ -77,6 +77,18 @@ class MultiRegimeBenchmarkArtifactBuilder:
         rows = []
         for record in records:
             row = dict(record)
+            row.setdefault(
+                "planned_count_candidate_set",
+                row.get("count_based_candidate_set", []),
+            )
+            row.setdefault(
+                "planned_count_candidate_set_contains_true_n",
+                row.get("count_based_candidate_set_contains_true_n", False),
+            )
+            row.setdefault("size_guard_rejected_true_n", False)
+            row.setdefault("size_guard_fallback_applied", False)
+            row.setdefault("candidate_failure_count", 0)
+            row.setdefault("candidate_failure_codes", [])
             row["diagnostics_available"] = bool(row.pop("diagnostics", {}))
             row["extra_json"] = json.dumps(
                 row.pop("extra", {}),
@@ -126,8 +138,24 @@ class MultiRegimeBenchmarkArtifactBuilder:
                     "count_based_candidate_set_contains_true_n",
                     "mean",
                 ),
+                planned_count_candidate_set_contains_true_rate=(
+                    "planned_count_candidate_set_contains_true_n",
+                    "mean",
+                ),
+                size_guard_rejected_true_rate=(
+                    "size_guard_rejected_true_n",
+                    "mean",
+                ),
+                size_guard_fallback_rate=(
+                    "size_guard_fallback_applied",
+                    "mean",
+                ),
                 density_candidate_rescue_rate=(
                     "density_candidate_rescued_true_n",
+                    "mean",
+                ),
+                candidate_failure_count_mean=(
+                    "candidate_failure_count",
                     "mean",
                 ),
                 selected_subspace_recall_mean=(
@@ -288,6 +316,8 @@ class MultiRegimeBenchmarkArtifactBuilder:
                     "aligned_accuracy_mean",
                     "candidate_set_contains_true_rate",
                     "count_based_candidate_set_contains_true_rate",
+                    "planned_count_candidate_set_contains_true_rate",
+                    "size_guard_rejected_true_rate",
                     "density_candidate_rescue_rate",
                 ),
             ),

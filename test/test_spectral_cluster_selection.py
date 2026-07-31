@@ -37,6 +37,9 @@ def test_spectral_cluster_selector_builds_weighted_multi_algorithm_candidates() 
     assert result.selected_algorithm in {"kmeans", "gmm"}
     assert result.diagnostics["cluster_selection_metric"] == "balanced_silhouette"
     assert result.diagnostics["cluster_ensemble_method"] == "weighted_vote"
+    assert result.candidate_plan.total_fit_count == 8
+    assert result.diagnostics["candidate_plan"]["eligible_count_candidates"] == [2, 3, 4, 5]
+    assert result.diagnostics["candidate_failures"] == []
     assert {candidate.algorithm for candidate in result.candidates} == {"kmeans", "gmm"}
     assert any(candidate.valid for candidate in result.candidates)
 

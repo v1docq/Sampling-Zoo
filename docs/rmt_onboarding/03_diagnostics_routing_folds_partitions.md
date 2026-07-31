@@ -103,6 +103,8 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 | `cluster_ensemble_method` | `best_score` или `weighted_vote`. |
 | `partition_selection_scores` | Scores по кандидатам `k`. |
 | `partition_selection_candidate_details` | Подробности candidates: algorithm, score, valid flag, components. |
+| `partition_selection_candidate_plan` | Исходная и eligible count grid, size-guard rejections, fallback flag и planned adapter requests. |
+| `partition_selection_candidate_failures` | Structured failures: request, `adapter_unavailable`/`fit_failed`, тип и сообщение ошибки. |
 | `partition_count` / `n_partitions` | Число построенных partitions. |
 | `chunk_sizes` | Размеры chunks после selection/filtering. |
 
@@ -116,6 +118,9 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 - Если `leverage_entropy` очень низкая, sampler нашел небольшое число spectral-influential объектов. Это может быть полезно, но стоит проверить стабильность chunks.
 - Если `chunk_sizes` сильно несбалансированы, выбранный clustering candidate может разделять данные на плотное ядро и редкие regions.
 - Если `selected_n_partitions` сильно меньше `n_partitions_requested`, auto-selection решила, что дополнительные clusters ухудшают balanced objective или нарушают constraints.
+- Если `size_guard_rejections` содержит ожидаемое `k`, оно не дошло до count-based adapters. При `size_guard_fallback_applied=True` вся исходная grid была возвращена после полного отсева.
+- `constraint_violations` внутри candidate components показывает конкретную hard constraint: `max_imbalance_ratio` и/или `min_cluster_fraction`.
+- Непустые `partition_selection_candidate_failures` не обязательно делают run failed: selector продолжает работу, если хотя бы один независимый adapter вернул candidate.
 - Если `encoded_feature_cap_applied=True`, downstream качество надо интерпретировать с учетом потери части one-hot признаков.
 
 ### Text2Image Prompt: RMT Diagnostics

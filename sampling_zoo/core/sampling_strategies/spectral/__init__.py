@@ -1,4 +1,18 @@
-
+from .cluster_selection_contracts import (
+    ClusterCandidateFitFailure,
+    ClusterCandidateFitFailureCode,
+    ClusterCandidateKind,
+    ClusterCandidatePlan,
+    ClusterCandidateRejection,
+    ClusterCandidateRejectionReason,
+    ClusterCandidateRequest,
+    ClusterConstraintViolation,
+    ClusterScoreComponents,
+    ClusterSelectionUnavailableError,
+    build_cluster_candidate_plan,
+    evaluate_cluster_score_components,
+    score_cluster_components,
+)
 from .null_diagnostics import (
     NullDiagnosticStatus,
     NullModelPolicy,
@@ -15,6 +29,16 @@ from .subspace_diagnostics import (
 )
 
 __all__ = [
+    "ClusterCandidateFitFailure",
+    "ClusterCandidateFitFailureCode",
+    "ClusterCandidateKind",
+    "ClusterCandidatePlan",
+    "ClusterCandidateRejection",
+    "ClusterCandidateRejectionReason",
+    "ClusterCandidateRequest",
+    "ClusterConstraintViolation",
+    "ClusterScoreComponents",
+    "ClusterSelectionUnavailableError",
     "NullDiagnosticStatus",
     "NullModelPolicy",
     "RMTContractionTensorSampler",
@@ -25,4 +49,7 @@ __all__ = [
     "SpectralSubspaceDiagnosticConfig",
     "SpectralSubspaceDiagnosticResult",
     "SubspaceDiagnosticStatus",
+    "build_cluster_candidate_plan",
+    "evaluate_cluster_score_components",
+    "score_cluster_components",
 ]

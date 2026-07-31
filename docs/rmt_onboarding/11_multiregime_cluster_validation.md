@@ -86,9 +86,16 @@ r_{signal}=K r + (K-1),
 
 - `candidate_set_contains_true_n` - истинное K присутствует среди всех реально
   построенных candidates;
-- `count_based_candidate_set_contains_true_n` - истинное K прошло именно count grid;
+- `planned_count_candidate_set_contains_true_n` - истинное K присутствует в typed
+  count plan после size guard/fallback, до запуска adapters;
+- `count_based_candidate_set_contains_true_n` - count-based adapter фактически
+  построил candidate с истинным K;
+- `size_guard_rejected_true_n` и `size_guard_fallback_applied` отделяют первичный
+  rejection от возврата всей grid при полном отсеве;
 - `density_candidate_rescued_true_n` - count grid отсек истинное K, но HDBSCAN вернул
-  candidate с правильным числом clusters.
+  candidate с правильным числом clusters;
+- `candidate_failure_count` и `candidate_failure_codes` показывают недоступные или
+  упавшие adapters, которые раньше молча исчезали из результата.
 
 Если size guard отсекает все count-based значения, текущий selector возвращает
 исходную сетку как fallback. Этот behavior покрыт invariant test и должен учитываться

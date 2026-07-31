@@ -4,13 +4,26 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 from sklearn.mixture import GaussianMixture
 
+from .cluster_selection_contracts import (
+    ClusterCandidateFitFailure,
+    ClusterCandidateKind,
+    ClusterCandidatePlan,
+    ClusterCandidateRequest,
+    ClusterScoreComponents,
+    ClusterSelectionUnavailableError,
+    build_cluster_candidate_plan,
+    candidate_fit_failure,
+    evaluate_cluster_score_components,
+    normalize_cluster_algorithm,
+    score_cluster_components,
+)
 from ...utils.progress import progress_bar, progress_write
 
 try:  # scikit-learn >= 1.1
@@ -42,6 +55,13 @@ class ClusterCandidate:
 
 
 @dataclass(frozen=True)
+class _ClusterCandidateBatch:
+    plan: ClusterCandidatePlan
+    candidates: Tuple[ClusterCandidate, ...]
+    failures: Tuple[ClusterCandidateFitFailure, ...]
+
+
+@dataclass(frozen=True)
 class ClusterSelectionResult:
     labels: np.ndarray
     centers: np.ndarray
@@ -49,7 +69,13 @@ class ClusterSelectionResult:
     selected_algorithm: str
     selected_n_clusters: int
     candidates: Tuple[ClusterCandidate, ...]
+    candidate_plan: ClusterCandidatePlan
+    candidate_failures: Tuple[ClusterCandidateFitFailure, ...]
     diagnostics: Dict[str, Any]
+
+
+class _ClusterAdapterUnavailableError(RuntimeError):
+    pass
 
 
 class SpectralClusterSelector:
@@ -86,7 +112,9 @@ class SpectralClusterSelector:
             ("best_score", "weighted_vote"),
         )
         self.min_partitions = max(1, int(min_partitions))
-        self.max_partitions = None if max_partitions is None else max(1, int(max_partitions))
+        self.max_partitions = (
+            None if max_partitions is None else max(1, int(max_partitions))
+        )
         self.min_auto_partition_size = max(1, int(min_auto_partition_size))
         self.selection_sample_size = max(1, int(selection_sample_size))
         self.max_cluster_imbalance_ratio = float(max_cluster_imbalance_ratio)
@@ -106,11 +134,11 @@ class SpectralClusterSelector:
         embedding = np.asarray(embedding, dtype=float)
         if embedding.ndim != 2:
             raise ValueError("embedding must be a 2D matrix")
-        candidates = self._build_candidates(embedding, target)
-        if not candidates:
-            raise RuntimeError("No cluster candidates were generated")
+        batch = self._build_candidates(embedding, target)
+        if not batch.candidates:
+            raise ClusterSelectionUnavailableError(batch.plan, batch.failures)
 
-        selected = self._select_candidate(candidates)
+        selected = self._select_candidate(batch.candidates)
         progress_write(
             (
                 "Selected spectral clusters: "
@@ -127,34 +155,55 @@ class SpectralClusterSelector:
             estimator=selected.estimator,
             selected_algorithm=selected.algorithm,
             selected_n_clusters=selected.n_clusters,
-            candidates=tuple(candidates),
-            diagnostics=self._build_diagnostics(candidates, selected),
+            candidates=batch.candidates,
+            candidate_plan=batch.plan,
+            candidate_failures=batch.failures,
+            diagnostics=self._build_diagnostics(batch, selected),
         )
 
-    def _build_candidates(self, embedding: np.ndarray, target: Optional[Any]) -> List[ClusterCandidate]:
+    def build_candidate_plan(self, n_samples: int) -> ClusterCandidatePlan:
+        return build_cluster_candidate_plan(
+            n_samples=n_samples,
+            algorithms=self.algorithms,
+            min_partitions=self.min_partitions,
+            max_partitions=self.max_partitions,
+            min_auto_partition_size=self.min_auto_partition_size,
+        )
+
+    def _build_candidates(
+        self,
+        embedding: np.ndarray,
+        target: Optional[Any],
+    ) -> _ClusterCandidateBatch:
+        plan = self.build_candidate_plan(embedding.shape[0])
         candidates: List[ClusterCandidate] = []
-        counts = self._candidate_counts(embedding.shape[0])
-        total = self._candidate_fit_count(counts)
+        failures: List[ClusterCandidateFitFailure] = []
         with progress_bar(
             enabled=self.show_progress,
             desc="Spectral cluster candidates",
-            total=total,
+            total=max(plan.total_fit_count, 1),
         ) as bar:
-            for algorithm in self.algorithms:
-                if algorithm == "hdbscan":
-                    self._set_progress_postfix(bar, algorithm=algorithm, n_clusters=None)
-                    candidate = self._fit_hdbscan_candidate(embedding, target)
-                    if candidate is not None:
-                        candidates.append(candidate)
-                    bar.update(1)
-                    continue
-                for n_clusters in counts:
-                    self._set_progress_postfix(bar, algorithm=algorithm, n_clusters=n_clusters)
-                    candidate = self._fit_count_based_candidate(algorithm, embedding, n_clusters, target)
-                    if candidate is not None:
-                        candidates.append(candidate)
-                    bar.update(1)
-        return candidates
+            for request in plan.requests:
+                self._set_progress_postfix(
+                    bar,
+                    algorithm=request.algorithm,
+                    n_clusters=request.n_clusters,
+                )
+                outcome = self._fit_candidate_request(
+                    request,
+                    embedding,
+                    target,
+                )
+                if isinstance(outcome, ClusterCandidateFitFailure):
+                    failures.append(outcome)
+                else:
+                    candidates.append(outcome)
+                bar.update(1)
+        return _ClusterCandidateBatch(
+            plan=plan,
+            candidates=tuple(candidates),
+            failures=tuple(failures),
+        )
 
     def _candidate_fit_count(self, counts: Sequence[int]) -> int:
         total = 0
@@ -163,7 +212,9 @@ class SpectralClusterSelector:
         return max(total, 1)
 
     @staticmethod
-    def _set_progress_postfix(bar: Any, *, algorithm: str, n_clusters: Optional[int]) -> None:
+    def _set_progress_postfix(
+        bar: Any, *, algorithm: str, n_clusters: Optional[int]
+    ) -> None:
         postfix = {"algorithm": algorithm}
         if n_clusters is not None:
             postfix["k"] = n_clusters
@@ -173,19 +224,29 @@ class SpectralClusterSelector:
             return
 
     def _candidate_counts(self, n_samples: int) -> List[int]:
-        if n_samples <= 1:
-            return [1]
-        upper = self.max_partitions if self.max_partitions is not None else self.min_partitions
-        upper = max(self.min_partitions, int(upper))
-        upper = min(upper, n_samples - 1 if n_samples > 2 else n_samples)
-        lower = min(max(2, self.min_partitions), upper)
-        candidates = list(range(lower, upper + 1))
-        size_filtered = [
-            candidate
-            for candidate in candidates
-            if n_samples / max(candidate, 1) >= self.min_auto_partition_size
-        ]
-        return size_filtered or candidates or [min(self.min_partitions, n_samples)]
+        return list(self.build_candidate_plan(n_samples).eligible_count_candidates)
+
+    def _fit_candidate_request(
+        self,
+        request: ClusterCandidateRequest,
+        embedding: np.ndarray,
+        target: Optional[Any],
+    ) -> Union[ClusterCandidate, ClusterCandidateFitFailure]:
+        try:
+            if request.kind is ClusterCandidateKind.DENSITY_BASED:
+                return self._fit_hdbscan_candidate(embedding, target)
+            if request.n_clusters is None:
+                raise ValueError("Count-based request requires n_clusters")
+            return self._fit_count_based_candidate(
+                request.algorithm,
+                embedding,
+                request.n_clusters,
+                target,
+            )
+        except _ClusterAdapterUnavailableError as exc:
+            return candidate_fit_failure(request, exc, unavailable=True)
+        except Exception as exc:
+            return candidate_fit_failure(request, exc)
 
     def _fit_count_based_candidate(
         self,
@@ -193,24 +254,24 @@ class SpectralClusterSelector:
         embedding: np.ndarray,
         n_clusters: int,
         target: Optional[Any],
-    ) -> Optional[ClusterCandidate]:
-        try:
-            estimator = self._make_count_based_estimator(algorithm, n_clusters)
-            if algorithm == "gmm":
-                labels = estimator.fit_predict(embedding)
-            else:
-                labels = estimator.fit_predict(embedding)
-        except Exception:
-            return None
-        return self._make_candidate(algorithm, int(n_clusters), labels, embedding, target, estimator)
+    ) -> ClusterCandidate:
+        estimator = self._make_count_based_estimator(algorithm, n_clusters)
+        labels = estimator.fit_predict(embedding)
+        return self._make_candidate(
+            algorithm, int(n_clusters), labels, embedding, target, estimator
+        )
 
     def _make_count_based_estimator(self, algorithm: str, n_clusters: int) -> Any:
         if algorithm == "kmeans":
             return self._make_kmeans(n_clusters)
         if algorithm == "bisecting_kmeans":
             if BisectingKMeans is None:
-                raise RuntimeError("BisectingKMeans is not available in this sklearn version")
-            return BisectingKMeans(n_clusters=n_clusters, random_state=self.random_state)
+                raise _ClusterAdapterUnavailableError(
+                    "BisectingKMeans is not available in this sklearn version"
+                )
+            return BisectingKMeans(
+                n_clusters=n_clusters, random_state=self.random_state
+            )
         if algorithm == "gmm":
             return GaussianMixture(
                 n_components=n_clusters,
@@ -224,26 +285,24 @@ class SpectralClusterSelector:
         self,
         embedding: np.ndarray,
         target: Optional[Any],
-    ) -> Optional[ClusterCandidate]:
-        min_cluster_size = max(2, int(math.ceil(self.min_cluster_fraction * embedding.shape[0])))
-        estimator = None
-        labels = None
-        try:
-            if SklearnHDBSCAN is not None:
-                estimator = SklearnHDBSCAN(min_cluster_size=min_cluster_size)
-                labels = estimator.fit_predict(embedding)
-            elif hdbscan_package is not None:
-                estimator = hdbscan_package.HDBSCAN(min_cluster_size=min_cluster_size)
-                labels = estimator.fit_predict(embedding)
-        except Exception:
-            return None
-        if labels is None:
-            return None
+    ) -> ClusterCandidate:
+        min_cluster_size = max(
+            2, int(math.ceil(self.min_cluster_fraction * embedding.shape[0]))
+        )
+        if SklearnHDBSCAN is not None:
+            estimator = SklearnHDBSCAN(min_cluster_size=min_cluster_size)
+        elif hdbscan_package is not None:
+            estimator = hdbscan_package.HDBSCAN(min_cluster_size=min_cluster_size)
+        else:
+            raise _ClusterAdapterUnavailableError("No HDBSCAN adapter is installed")
+        labels = estimator.fit_predict(embedding)
         normalized = self._normalize_labels(labels)
         n_clusters = int(np.unique(normalized).size)
         if n_clusters < 1:
-            return None
-        return self._make_candidate("hdbscan", n_clusters, normalized, embedding, target, estimator)
+            raise ValueError("HDBSCAN returned no clusters")
+        return self._make_candidate(
+            "hdbscan", n_clusters, normalized, embedding, target, estimator
+        )
 
     def _make_candidate(
         self,
@@ -256,8 +315,9 @@ class SpectralClusterSelector:
     ) -> ClusterCandidate:
         labels = self._normalize_labels(labels)
         centers = self._centers_from_labels(embedding, labels)
-        components = self._score_components(embedding, labels, target)
-        score = self._candidate_score(components)
+        score_components = self._score_components(embedding, labels, target)
+        components = score_components.to_dict()
+        score = self._candidate_score(score_components)
         return ClusterCandidate(
             algorithm=algorithm,
             n_clusters=int(np.unique(labels).size),
@@ -265,7 +325,7 @@ class SpectralClusterSelector:
             centers=centers,
             estimator=estimator,
             score=score,
-            valid=bool(components["valid"]),
+            valid=score_components.valid,
             components=components,
         )
 
@@ -274,44 +334,30 @@ class SpectralClusterSelector:
         embedding: np.ndarray,
         labels: np.ndarray,
         target: Optional[Any],
-    ) -> Dict[str, Any]:
+    ) -> ClusterScoreComponents:
         counts = np.bincount(labels, minlength=int(labels.max()) + 1)
-        n_samples = int(labels.size)
-        min_count = int(counts.min()) if counts.size else 0
-        max_count = int(counts.max()) if counts.size else 0
-        min_fraction = min_count / max(n_samples, 1)
-        imbalance_ratio = max_count / max(min_count, 1)
         silhouette = self._safe_silhouette(embedding, labels)
-        tiny_mass = float(counts[counts / max(n_samples, 1) < self.min_cluster_fraction].sum() / max(n_samples, 1))
         target_contrast = self._target_contrast(labels, target)
-        valid = (
-            imbalance_ratio <= self.max_cluster_imbalance_ratio
-            and min_fraction >= self.min_cluster_fraction
+        return evaluate_cluster_score_components(
+            counts=counts,
+            silhouette=silhouette,
+            target_contrast=target_contrast,
+            max_cluster_imbalance_ratio=self.max_cluster_imbalance_ratio,
+            min_cluster_fraction=self.min_cluster_fraction,
         )
-        return {
-            "silhouette": silhouette,
-            "imbalance_ratio": float(imbalance_ratio),
-            "min_cluster_fraction": float(min_fraction),
-            "tiny_cluster_mass": tiny_mass,
-            "target_contrast": target_contrast,
-            "valid": bool(valid),
-            "counts": counts.astype(int).tolist(),
-        }
 
-    def _candidate_score(self, components: Dict[str, Any]) -> float:
-        silhouette = components["silhouette"]
-        if silhouette is None:
-            silhouette = -1.0
-        if self.selection_metric == "silhouette":
-            return float(silhouette)
-        imbalance_ratio = max(float(components["imbalance_ratio"]), 1.0)
-        imbalance_penalty = self.imbalance_penalty_weight * math.log(imbalance_ratio)
-        tiny_penalty = self.tiny_cluster_penalty_weight * float(components["tiny_cluster_mass"])
-        target_bonus = self.target_contrast_weight * float(components["target_contrast"] or 0.0)
-        hard_constraint_penalty = 0.0 if components["valid"] else 1.0
-        return float(silhouette - imbalance_penalty - tiny_penalty + target_bonus - hard_constraint_penalty)
+    def _candidate_score(self, components: ClusterScoreComponents) -> float:
+        return score_cluster_components(
+            components,
+            selection_metric=self.selection_metric,
+            imbalance_penalty_weight=self.imbalance_penalty_weight,
+            tiny_cluster_penalty_weight=self.tiny_cluster_penalty_weight,
+            target_contrast_weight=self.target_contrast_weight,
+        )
 
-    def _safe_silhouette(self, embedding: np.ndarray, labels: np.ndarray) -> Optional[float]:
+    def _safe_silhouette(
+        self, embedding: np.ndarray, labels: np.ndarray
+    ) -> Optional[float]:
         unique_labels = np.unique(labels)
         if unique_labels.size < 2 or unique_labels.size >= embedding.shape[0]:
             return None
@@ -321,7 +367,9 @@ class SpectralClusterSelector:
                 silhouette_score(
                     embedding,
                     labels,
-                    sample_size=sample_size if sample_size < embedding.shape[0] else None,
+                    sample_size=sample_size
+                    if sample_size < embedding.shape[0]
+                    else None,
                     random_state=self.random_state,
                 )
             )
@@ -354,27 +402,35 @@ class SpectralClusterSelector:
         between = float(np.sqrt(np.sum(weights_arr * (means - weighted_mean) ** 2)))
         return between / global_std
 
-    def _select_candidate(self, candidates: Sequence[ClusterCandidate]) -> ClusterCandidate:
+    def _select_candidate(
+        self, candidates: Sequence[ClusterCandidate]
+    ) -> ClusterCandidate:
         valid_candidates = [candidate for candidate in candidates if candidate.valid]
         pool = valid_candidates or list(candidates)
         if self.ensemble_method == "weighted_vote":
             return self._select_by_weighted_vote(pool)
         return max(pool, key=lambda candidate: candidate.score)
 
-    def _select_by_weighted_vote(self, candidates: Sequence[ClusterCandidate]) -> ClusterCandidate:
+    def _select_by_weighted_vote(
+        self, candidates: Sequence[ClusterCandidate]
+    ) -> ClusterCandidate:
         scores = np.asarray([candidate.score for candidate in candidates], dtype=float)
         scores = np.where(np.isfinite(scores), scores, -1e9)
         weights = np.exp((scores - scores.max()) / self.vote_temperature)
         votes: Dict[int, float] = {}
         for candidate, weight in zip(candidates, weights):
-            votes[candidate.n_clusters] = votes.get(candidate.n_clusters, 0.0) + float(weight)
+            votes[candidate.n_clusters] = votes.get(candidate.n_clusters, 0.0) + float(
+                weight
+            )
         selected_k = max(votes.items(), key=lambda item: (item[1], item[0]))[0]
-        same_k = [candidate for candidate in candidates if candidate.n_clusters == selected_k]
+        same_k = [
+            candidate for candidate in candidates if candidate.n_clusters == selected_k
+        ]
         return max(same_k, key=lambda candidate: candidate.score)
 
     def _build_diagnostics(
         self,
-        candidates: Sequence[ClusterCandidate],
+        batch: _ClusterCandidateBatch,
         selected: ClusterCandidate,
     ) -> Dict[str, Any]:
         return {
@@ -385,6 +441,8 @@ class SpectralClusterSelector:
             "cluster_ensemble_method": self.ensemble_method,
             "max_cluster_imbalance_ratio": float(self.max_cluster_imbalance_ratio),
             "min_cluster_fraction": float(self.min_cluster_fraction),
+            "candidate_plan": batch.plan.to_dict(),
+            "candidate_failures": [failure.to_dict() for failure in batch.failures],
             "candidates": [
                 {
                     "algorithm": candidate.algorithm,
@@ -393,28 +451,23 @@ class SpectralClusterSelector:
                     "valid": bool(candidate.valid),
                     "components": candidate.components,
                 }
-                for candidate in candidates
+                for candidate in batch.candidates
             ],
         }
 
     def _make_kmeans(self, n_clusters: int) -> KMeans:
         try:
-            return KMeans(n_clusters=n_clusters, random_state=self.random_state, n_init="auto")
+            return KMeans(
+                n_clusters=n_clusters, random_state=self.random_state, n_init="auto"
+            )
         except TypeError:
-            return KMeans(n_clusters=n_clusters, random_state=self.random_state, n_init=10)
+            return KMeans(
+                n_clusters=n_clusters, random_state=self.random_state, n_init=10
+            )
 
     @staticmethod
     def _normalize_algorithm(name: str) -> str:
-        normalized = str(name).strip().lower()
-        aliases = {
-            "bisecting-kmeans": "bisecting_kmeans",
-            "bisecting": "bisecting_kmeans",
-            "gaussian_mixture": "gmm",
-        }
-        normalized = aliases.get(normalized, normalized)
-        if normalized not in {"kmeans", "bisecting_kmeans", "gmm", "hdbscan"}:
-            raise ValueError(f"Unsupported cluster algorithm: {name}")
-        return normalized
+        return normalize_cluster_algorithm(name)
 
     @staticmethod
     def _validate_choice(name: str, value: str, choices: Sequence[str]) -> str:

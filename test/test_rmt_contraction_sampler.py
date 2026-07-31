@@ -148,6 +148,8 @@ def test_auto_partition_selection_records_diagnostics() -> None:
     assert 2 <= sampler.diagnostics_["selected_n_partitions"] <= 4
     assert sampler.diagnostics_["partition_selection_candidates"] == [2, 3, 4]
     assert sampler.diagnostics_["partition_selection_candidate_details"]
+    assert sampler.diagnostics_["partition_selection_candidate_plan"]["eligible_count_candidates"] == [2, 3, 4]
+    assert sampler.diagnostics_["partition_selection_candidate_failures"] == []
     assert len(sampler.partitions) == sampler.diagnostics_["selected_n_partitions"]
 
 
@@ -176,6 +178,8 @@ def test_auto_partition_selection_skips_unavailable_optional_algorithms() -> Non
         "gmm",
         "hdbscan",
     }
+    assert "partition_selection_candidate_plan" in sampler.diagnostics_
+    assert "partition_selection_candidate_failures" in sampler.diagnostics_
     assert sampler.predict_partition_proba(X.iloc[:5]).shape[1] == len(sampler.partition_names_)
 
 
