@@ -21,6 +21,7 @@ examples/benchmark/results/run_rmt_contraction_regression_<timestamp>/
 | `ensemble_summary.csv` | Aggregated summary по dataset/model/strategy. |
 | `rmt_raw_runs.csv` | RMT-focused raw table. |
 | `sample_efficiency_curve.csv` | Кривая sample efficiency по budget ratios. |
+| `partition_selection_comparison.csv` | Paired comparison `validation_proxy - balanced_silhouette` при одинаковых dataset/model/router/view/budget axes. Для RMSE отрицательная delta означает улучшение validation proxy. |
 | `minimal_effective_budget.csv` | Минимальный budget ratio для delta thresholds. |
 | `run_meta.json` | Metadata запуска: config, counts, status, timestamps, `experiment_plan`. |
 | `report.md` | Markdown summary report. |

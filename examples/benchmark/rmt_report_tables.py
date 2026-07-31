@@ -36,9 +36,22 @@ class RMTReportTableBuilder:
         efficiency = self._build_efficiency_table(raw)
         self._write_table(efficiency, output_dir / "sample_efficiency_curve.csv")
 
+        partition_comparison = self._build_partition_selection_comparison(
+            raw
+        )
+        self._write_table(
+            partition_comparison,
+            output_dir / "partition_selection_comparison.csv",
+        )
+
         minimal_budget = self._build_minimal_budget_table(efficiency)
         self._write_table(minimal_budget, output_dir / "minimal_effective_budget.csv")
-        return {"raw": raw, "efficiency": efficiency, "minimal_budget": minimal_budget}
+        return {
+            "raw": raw,
+            "efficiency": efficiency,
+            "partition_selection_comparison": partition_comparison,
+            "minimal_budget": minimal_budget,
+        }
 
     @staticmethod
     def _normalize_records(run_records: Sequence[Mapping[str, Any]]) -> pd.DataFrame:
@@ -48,7 +61,18 @@ class RMTReportTableBuilder:
     def _write_empty_tables(output_dir: Path) -> dict[str, pd.DataFrame]:
         empty = pd.DataFrame()
         empty.to_csv(output_dir / "rmt_raw_runs.csv", index=False)
-        return {"raw": empty, "efficiency": empty, "minimal_budget": empty}
+        empty.to_csv(output_dir / "sample_efficiency_curve.csv", index=False)
+        empty.to_csv(
+            output_dir / "partition_selection_comparison.csv",
+            index=False,
+        )
+        empty.to_csv(output_dir / "minimal_effective_budget.csv", index=False)
+        return {
+            "raw": empty,
+            "efficiency": empty,
+            "partition_selection_comparison": empty,
+            "minimal_budget": empty,
+        }
 
     @staticmethod
     def _write_table(table: pd.DataFrame, path: Path) -> None:
@@ -425,6 +449,109 @@ class RMTReportTableBuilder:
                 "router",
                 "budget_ratio",
             ])
+        )
+
+    @staticmethod
+    def _build_partition_selection_comparison(
+        raw: pd.DataFrame,
+    ) -> pd.DataFrame:
+        key_columns = [
+            "dataset",
+            "model",
+            "sampler",
+            "ensemble_method",
+            "router",
+            "view_strategy",
+            "partition_selection_method",
+            "cluster_ensemble_method",
+            "budget_ratio",
+        ]
+        metric_column = "cluster_selection_metric"
+        measure_columns = [
+            "rmse",
+            "rmse_drop",
+            "fit_time",
+            "inference_time",
+            "total_train_rows",
+            "selected_n_partitions",
+            "chunk_size_imbalance_ratio",
+            "validation_mean_max_routing_proba",
+            "validation_mean_routing_entropy",
+            "validation_proxy_relative_gain",
+        ]
+        required_columns = {*key_columns, metric_column, *measure_columns}
+        if raw.empty or not required_columns.issubset(raw.columns):
+            return pd.DataFrame(columns=key_columns)
+
+        selected = raw[
+            raw[metric_column].isin(
+                ("balanced_silhouette", "validation_proxy")
+            )
+        ]
+        if selected.empty:
+            return pd.DataFrame(columns=key_columns)
+
+        group_columns = [*key_columns, metric_column]
+        grouped = selected.groupby(
+            group_columns,
+            as_index=False,
+            dropna=False,
+        )
+        aggregated = grouped[measure_columns].mean().merge(
+            grouped.size().rename(columns={"size": "run_count"}),
+            on=group_columns,
+            how="left",
+            validate="one_to_one",
+        )
+        balanced = aggregated[
+            aggregated[metric_column] == "balanced_silhouette"
+        ].drop(columns=[metric_column])
+        validation = aggregated[
+            aggregated[metric_column] == "validation_proxy"
+        ].drop(columns=[metric_column])
+        result_columns = [*measure_columns, "run_count"]
+        balanced = balanced.rename(
+            columns={
+                column: f"{column}_balanced_silhouette"
+                for column in result_columns
+            }
+        )
+        validation = validation.rename(
+            columns={
+                column: f"{column}_validation_proxy"
+                for column in result_columns
+            }
+        )
+        comparison = balanced.merge(
+            validation,
+            on=key_columns,
+            how="outer",
+            validate="one_to_one",
+        )
+        for measure in measure_columns:
+            comparison[
+                f"{measure}_delta_validation_proxy_minus_balanced_silhouette"
+            ] = (
+                comparison[f"{measure}_validation_proxy"]
+                - comparison[f"{measure}_balanced_silhouette"]
+            )
+        comparison["paired_run_count"] = comparison[
+            [
+                "run_count_balanced_silhouette",
+                "run_count_validation_proxy",
+            ]
+        ].fillna(0).min(axis=1).astype(int)
+        comparison["pair_complete"] = (
+            comparison["run_count_balanced_silhouette"].notna()
+            & comparison["run_count_validation_proxy"].notna()
+            & (
+                comparison["run_count_balanced_silhouette"]
+                == comparison["run_count_validation_proxy"]
+            )
+        )
+        return comparison.sort_values(
+            ["dataset", "model", "budget_ratio"],
+            ignore_index=True,
         )
 
     def _build_minimal_budget_table(self, efficiency: pd.DataFrame) -> pd.DataFrame:
