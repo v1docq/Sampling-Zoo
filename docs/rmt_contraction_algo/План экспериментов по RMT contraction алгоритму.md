@@ -69,6 +69,26 @@ explained_variance_threshold = 0.95
 7. `routing_refinement`: `"none"` vs `"em_retraining"`.
 8. `cluster_selection_metric`: default `balanced_silhouette` vs opt-in `validation_proxy`; сравнение вести при одинаковых algorithms, budget, router и seed.
 
+## Изолированная абляция выбора партиций
+
+Для пункта 8 используется отдельный entrypoint
+`examples/benchmark/rmt_partition_selection_ablation.py`. Он намеренно фиксирует
+остальные оси эксперимента:
+
+- strategy: `rmt_contraction`;
+- ensemble: `routed_weighted`;
+- router: `spectral`;
+- view strategy: `gaussian`;
+- model по умолчанию: `lightgbm`;
+- budget grid: `(0.01, 0.03, 0.05, 0.10, 0.20)`.
+
+Варьируется только `cluster_selection_metric`: `balanced_silhouette` и
+`validation_proxy`. Каждый config name содержит явный `selection_*` tag, поэтому
+incremental resume не смешивает paired runs. Помимо общих RMT-таблиц формируется
+`partition_selection_comparison.csv`; delta определяется как
+`validation_proxy - balanced_silhouette`, поэтому отрицательная RMSE delta означает
+улучшение validation-driven policy.
+
 # Диагностики, которые обязательно анализировать
 
 Помимо `rmse`, `fit_time`, `inference_time`, в отчете нужно смотреть:

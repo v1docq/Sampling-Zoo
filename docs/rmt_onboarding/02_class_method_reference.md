@@ -750,6 +750,37 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 ICML-style scientific figure, clean academic vector infographic, white background, muted blue-gray palette with one accent color, minimal typography, precise arrows, thin lines, labeled panels, no photorealism, no 3D glossy rendering, no decorative background, conference-paper figure aesthetics, mathematically clean, visually balanced. Backend separation diagram: RMT sampler orchestration at top, MatrixRMTBackend on left with NumPy and sklearn kernels, TensorRMTBackend on right with torch CUDA kernels. Shared primitive interface in the center: unfolding, SVD, projection, routing.
 ```
 
+## RMTPartitionSelectionAblationOrchestrator
+
+Файл: `examples/benchmark/rmt_partition_selection_ablation.py`
+
+Назначение: запускает изолированное downstream-сравнение
+`balanced_silhouette` и `validation_proxy`, не умножая основной medium grid на
+новую ось.
+
+### Контракты и методы
+
+| Элемент | Назначение |
+|---|---|
+| `RMTPartitionSelectionAblationConfig` | Frozen scientific config. Нормализует datasets, models, budgets и selection metrics; фиксирует `routed_weighted`, spectral router и gaussian views через преобразование в основной regression config. |
+| `RMTPartitionSelectionGridPoint` | Typed leaf point из пары `(budget_ratio, cluster_selection_metric)` с уникальным config name. |
+| `make_rmt_partition_selection_grid(...)` | Чисто и детерминированно строит budget-paired grid. |
+| `make_rmt_partition_selection_strategy_configs(config)` | Материализует typed grid в legacy strategy kwargs только на границе benchmark runner. |
+| `_build_experiment_plan()` | Включает все scientific axes и proxy parameters в run identity и artifact manifest. |
+| `_build_strategy_grid()` | Нормализует materialized configs в `StrategyGridContract`. |
+| `_build_run_meta(...)` | Добавляет тип эксперимента и validation-proxy parameters в incremental metadata. |
+| `run_rmt_partition_selection_ablation(...)` | Публичный entrypoint; execution lifecycle наследуется от `RMTRegressionExperimentOrchestrator`. |
+
+Config names содержат `selection_balanced_silhouette` или
+`selection_validation_proxy`. Это часть resume identity: результаты разных
+критериев не считаются одним leaf run.
+
+### Text2Image Prompt: Partition Selection Ablation
+
+```text
+ICML-style scientific figure, clean academic vector infographic, white background, muted blue-gray palette with one accent color, minimal typography, precise arrows, thin lines, labeled panels, no photorealism, no 3D glossy rendering, no decorative background, conference-paper figure aesthetics, mathematically clean, visually balanced. Paired RMT partition-selection ablation figure: one shared dataset and spectral embedding branch into balanced silhouette and validation proxy selectors, both use identical Gaussian views, spectral router, routed weighted ensemble, model, seed and budget; downstream RMSE and timing flow into a paired delta table, with a clear label delta equals validation proxy minus balanced silhouette.
+```
+
 ## RMTReportTableBuilder
 
 Файл: `examples/benchmark/rmt_report_tables.py`
@@ -766,15 +797,16 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 | `_attach_rmse_baseline(raw)` | Добавляет baseline RMSE. |
 | `_attach_rmse_drop(raw)` | Считает относительное ухудшение/улучшение относительно baseline. |
 | `_build_efficiency_table(raw)` | Строит sample efficiency curve. |
+| `_build_partition_selection_comparison(efficiency)` | Строит paired comparison `validation_proxy - balanced_silhouette` по одинаковым dataset/model/router/view/budget axes. |
 | `_build_minimal_budget_table(efficiency)` | Находит минимальный budget для thresholds delta. |
 | `_write_table(table, path)` | Записывает CSV. |
 
-Raw RMT table дополнительно вытаскивает RMT-specific поля: `view_strategy`, `n_views`, `n_views_policy`, adaptive rank diagnostics, partition selection diagnostics, validation-proxy loss/gain/fallback columns и routing refinement columns (`routing_refinement_status`, `routing_refinement_stop_reason`, `routing_refinement_best_iteration`, `routing_refinement_metric_improvement`, `routing_refinement_final_imbalance`).
+Raw RMT table дополнительно вытаскивает RMT-specific поля: `view_strategy`, `n_views`, `n_views_policy`, adaptive rank diagnostics, partition selection diagnostics, validation-proxy loss/gain/fallback columns и routing refinement columns (`routing_refinement_status`, `routing_refinement_stop_reason`, `routing_refinement_best_iteration`, `routing_refinement_metric_improvement`, `routing_refinement_final_imbalance`). Builder также пишет `partition_selection_comparison.csv`; отрицательная `rmse_delta_validation_proxy_minus_balanced_silhouette` означает, что validation proxy лучше на данной paired-конфигурации.
 
 ### Text2Image Prompt: Report Builder
 
 ```text
-ICML-style scientific figure, clean academic vector infographic, white background, muted blue-gray palette with one accent color, minimal typography, precise arrows, thin lines, labeled panels, no photorealism, no 3D glossy rendering, no decorative background, conference-paper figure aesthetics, mathematically clean, visually balanced. Report table builder diagram: raw run records enter transformation pipeline, baseline RMSE attachment, RMSE drop computation, sample efficiency curve, minimal effective budget table, CSV artifacts.
+ICML-style scientific figure, clean academic vector infographic, white background, muted blue-gray palette with one accent color, minimal typography, precise arrows, thin lines, labeled panels, no photorealism, no 3D glossy rendering, no decorative background, conference-paper figure aesthetics, mathematically clean, visually balanced. Report table builder diagram: raw run records enter transformation pipeline, baseline RMSE attachment, RMSE drop computation, sample efficiency curve, paired partition-selection comparison, minimal effective budget table, CSV artifacts.
 ```
 
 ## BenchmarkLogger

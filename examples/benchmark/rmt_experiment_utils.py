@@ -35,6 +35,10 @@ def task_key(dataset_name: str) -> str:
     return str(dataset_name).split("__task_")[0]
 
 
+def budget_ratio_tag(budget_ratio: float) -> str:
+    return f"{int(round(float(budget_ratio) * 100)):02d}"
+
+
 def default_rmt_reference_metrics_path() -> Path:
     return Path(__file__).resolve().parent / "benchmark_metrics" / "AMLB_regression_suite_040526.csv"
 
