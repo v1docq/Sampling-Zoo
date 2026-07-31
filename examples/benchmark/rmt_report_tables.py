@@ -91,6 +91,38 @@ class RMTReportTableBuilder:
                     df,
                     "extra.sampler_diagnostics.selected_n_partitions",
                 ),
+                "validation_proxy_baseline_loss": self._numeric_series(
+                    df,
+                    (
+                        "extra.sampler_diagnostics."
+                        "partition_selection_selected_candidate.components."
+                        "validation_proxy.baseline_loss"
+                    ),
+                ),
+                "validation_proxy_candidate_loss": self._numeric_series(
+                    df,
+                    (
+                        "extra.sampler_diagnostics."
+                        "partition_selection_selected_candidate.components."
+                        "validation_proxy.candidate_loss"
+                    ),
+                ),
+                "validation_proxy_relative_gain": self._numeric_series(
+                    df,
+                    (
+                        "extra.sampler_diagnostics."
+                        "partition_selection_selected_candidate.components."
+                        "validation_proxy.relative_gain"
+                    ),
+                ),
+                "validation_proxy_fallback_fraction": self._numeric_series(
+                    df,
+                    (
+                        "extra.sampler_diagnostics."
+                        "partition_selection_selected_candidate.components."
+                        "validation_proxy.fallback_validation_fraction"
+                    ),
+                ),
                 "null_model_status": value_series(
                     df,
                     "extra.sampler_diagnostics.null_model_status",
@@ -336,6 +368,10 @@ class RMTReportTableBuilder:
                 {
                     "n_views": "mean",
                     "selected_n_partitions": "mean",
+                    "validation_proxy_baseline_loss": "mean",
+                    "validation_proxy_candidate_loss": "mean",
+                    "validation_proxy_relative_gain": "mean",
+                    "validation_proxy_fallback_fraction": "mean",
                     "null_empirical_bulk_edge": "mean",
                     "rank_by_null_edge": "mean",
                     "rank_by_stability": "mean",

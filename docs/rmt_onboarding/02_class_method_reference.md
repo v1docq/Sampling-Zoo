@@ -393,6 +393,9 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 | `missing_class_penalty_weight` | Вес мягкого штрафа за отсутствующие пары chunk/class. |
 | `single_class_penalty_weight` | Вес дополнительного мягкого штрафа за долю одно-классовых chunks; сам факт такого chunk также является hard constraint violation. |
 | `class_distribution_drift_weight` | Вес среднего, взвешенного по размеру chunk, total-variation drift между локальным и глобальным распределениями классов. |
+| `validation_proxy_fraction` | Доля outer-train fold, выделяемая во внутренний deterministic holdout при `cluster_selection_metric="validation_proxy"`. |
+| `validation_proxy_min_partition_rows` | Минимум proxy-train строк в partition; меньший local expert заменяется global baseline. |
+| `validation_proxy_smoothing` | Аддитивное сглаживание class probabilities для classification proxy. |
 | `n_views` | Сколько random feature views строить. Может быть integer или `"auto"`. |
 | `n_views_policy` | `auto`, `coverage` или `spectrum_stability`. Для `subsample` auto -> coverage, для `gaussian` auto -> spectrum stability. |
 | `min_views`, `max_views` | Границы автоматического выбора числа views. |
@@ -577,6 +580,7 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 | `_fit_hdbscan_candidate(...)` | Строит HDBSCAN candidate через sklearn/external backend или возвращает typed unavailable failure. |
 | `_score_components(...)` | Определяет effective target type и делегирует pure core расчёт silhouette, balance, regression target contrast или classification partition profile. |
 | `_classification_components(...)` | Строит global и per-cluster class counts и передает их в pure `evaluate_classification_partition_components(...)`. |
+| `_build_scoring_context(...)` | Один раз определяет target type и, для opt-in режима, создаёт общий `PartitionValidationProxyEvaluator` для всех candidates. |
 | `_candidate_score(...)` | Для `balanced_silhouette` применяет balance, classification и hard-constraint слагаемые к одному immutable `ClusterScoreComponents`. |
 | `_select_by_weighted_vote(...)` | Агрегирует candidates по числу clusters через soft weights от score. |
 | `_select_by_coassociation(...)` | Строит sparse weighted membership representation, получает consensus labels и проверяет их прежним balanced objective. |
@@ -592,6 +596,10 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
   `ClusterConstraintViolation` вместо неявного boolean-only результата;
 - `ClassificationPartitionComponents` хранит class counts, missing-class fraction,
   долю одно-классовых chunks/строк и class-distribution drift;
+- `PartitionValidationPlan` хранит единый deterministic train/validation split,
+  одинаковый для всех candidate algorithms и значений `k`;
+- `PartitionValidationComponents` хранит baseline/candidate loss, relative gain,
+  routed validation counts и долю fallback rows;
 - `ClusterConsensusPlan` хранит нормированные source weights, weighted votes по `k`,
   выбранное число clusters и размер sparse representation;
 - `ClusterSelectionUnavailableError` содержит весь plan и failures, если не удалось
@@ -663,6 +671,33 @@ Classification-слагаемые отсутствуют для regression, по
 явно; при прямом использовании sampler-а с целочисленной regression target следует
 также передавать `cluster_target_type="regression"`.
 
+### Validation Proxy
+
+`cluster_selection_metric="validation_proxy"` является явной ablation policy и
+не заменяет default `balanced_silhouette`. Selector создаёт один внутренний holdout
+внутри outer train fold и использует его для всех candidates. Для каждого candidate:
+
+1. centroids считаются только по proxy-train строкам;
+2. proxy-validation строки hard-route-ятся к ближайшему centroid;
+3. regression local expert предсказывает среднее target своего partition;
+4. classification local expert предсказывает сглаженное распределение классов;
+5. слишком маленький local expert заменяется global baseline.
+
+Для regression используется RMSE, для classification — log loss. Итоговый gain:
+
+\[
+G = \frac{L_{global} - L_{partition}}{\max(|L_{global}|, \varepsilon)}.
+\]
+
+Candidate score равен `G - hard_constraint_penalty`; valid pool по-прежнему
+учитывает imbalance, tiny clusters и одно-классовые chunks. Положительный `G`
+означает, что простые routed local experts лучше global constant baseline.
+
+Это proxy качества partition/router, а не вложенное обучение реальных TabPFN или
+LightGBM experts. Clustering candidates строятся на всём outer train fold, но test
+fold и внешняя validation выборка benchmark-а в selection не участвуют. Для
+подтверждения эффекта policy нужно сравнивать downstream benchmark metrics.
+
 ### Text2Image Prompt: Cluster Selection
 
 ```text
@@ -673,6 +708,12 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 
 ```text
 ICML-style scientific figure, clean academic vector infographic, white background, muted blue-gray palette with one accent color, minimal typography, precise arrows, thin lines, labeled panels, no photorealism, no 3D glossy rendering, no decorative background, conference-paper figure aesthetics, mathematically clean, visually balanced. Classification-aware spectral partition scoring figure with three candidate chunkings of the same binary dataset: balanced class coverage, missing-class chunks, and single-class chunks. Show a chunk-by-class count matrix, global class distribution, weighted total-variation drift, soft penalties for missing classes and drift, and a red hard-constraint marker for single-class chunks. End with a balanced-silhouette score equation and selected candidate panel.
+```
+
+### Text2Image Prompt: Validation-Driven Partition Proxy
+
+```text
+ICML-style scientific figure, clean academic vector infographic, white background, muted blue-gray palette with one accent color, minimal typography, precise arrows, thin lines, labeled panels, no photorealism, no 3D glossy rendering, no decorative background, conference-paper figure aesthetics, mathematically clean, visually balanced. Validation-driven spectral partition selection figure: one outer training fold creates a shared internal train and validation split; several clustering candidates with different k values use train-only centroids; validation rows route to local constant experts; regression RMSE or classification log loss is compared with a global baseline; relative validation gain and hard constraints select the candidate. Include a fallback arrow from undersized local experts to the global baseline and a clear note that the test fold is never used.
 ```
 
 ## MatrixRMTBackend И TensorRMTBackend
@@ -728,7 +769,7 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 | `_build_minimal_budget_table(efficiency)` | Находит минимальный budget для thresholds delta. |
 | `_write_table(table, path)` | Записывает CSV. |
 
-Raw RMT table дополнительно вытаскивает RMT-specific поля: `view_strategy`, `n_views`, `n_views_policy`, adaptive rank diagnostics, partition selection diagnostics и routing refinement columns (`routing_refinement_status`, `routing_refinement_stop_reason`, `routing_refinement_best_iteration`, `routing_refinement_metric_improvement`, `routing_refinement_final_imbalance`).
+Raw RMT table дополнительно вытаскивает RMT-specific поля: `view_strategy`, `n_views`, `n_views_policy`, adaptive rank diagnostics, partition selection diagnostics, validation-proxy loss/gain/fallback columns и routing refinement columns (`routing_refinement_status`, `routing_refinement_stop_reason`, `routing_refinement_best_iteration`, `routing_refinement_metric_improvement`, `routing_refinement_final_imbalance`).
 
 ### Text2Image Prompt: Report Builder
 

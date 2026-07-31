@@ -67,6 +67,7 @@ explained_variance_threshold = 0.95
 5. `cluster_algorithms`: исключение/добавление `gmm`, `bisecting_kmeans`, `hdbscan`.
 6. `cluster_ensemble_method`: `coassociation` vs legacy `weighted_vote` для изоляции эффекта consensus labels.
 7. `routing_refinement`: `"none"` vs `"em_retraining"`.
+8. `cluster_selection_metric`: default `balanced_silhouette` vs opt-in `validation_proxy`; сравнение вести при одинаковых algorithms, budget, router и seed.
 
 # Диагностики, которые обязательно анализировать
 
@@ -76,6 +77,7 @@ explained_variance_threshold = 0.95
 - `selected_rank`, `explained_variance_at_selected_rank`;
 - `selected_n_partitions`, `selected_cluster_algorithm`, `partition_selection_scores`;
 - для classification: class counts per chunk, missing-class fraction, single-class chunk/sample fraction и class-distribution drift для каждого candidate;
+- для `validation_proxy`: baseline/candidate loss, relative gain, routed validation counts и fallback validation fraction;
 - `chunk_size_imbalance`, target drift per chunk;
 - `mean_max_probability`, routing entropy, hard assignment counts на validation/test;
 - EM diagnostics: `routing_refinement_status`, `routing_refinement_metric_improvement`, `routing_refinement_final_imbalance`.
