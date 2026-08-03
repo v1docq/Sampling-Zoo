@@ -883,3 +883,47 @@ fine-tuning запуски.
 | `_create_finetuned_tabpfn_model(...)` | Проверяет CUDA policy и материализует typed fine-tuning config в kwargs публичного TabPFN estimator. |
 
 Правило: optional heavy packages нельзя импортировать на верхнем уровне benchmark module. Это особенно важно для окружений, где torch CUDA версия подбиралась вручную под конкретную GPU.
+
+## Final Full-Grid Contracts и Runner
+
+Файлы:
+
+- `sampling_zoo/core/experiment/contracts.py`;
+- `examples/benchmark/rmt_full_grid_plan.py`;
+- `examples/benchmark/rmt_regression_full_grid.py`.
+
+`ModelStrategyScenarioSpec` задаёт явный morphism между model factory и одним
+`StrategySpec`. `ModelStrategyScenarioGridContract` хранит упорядоченную
+не-декартову сетку таких связок, проверяет уникальность имён и предоставляет список
+реально необходимых моделей.
+
+`RMTFullGridExperimentOrchestrator` наследует общий lifecycle RMT runner, но заменяет
+обычную strategy grid на explicit scenario grid. Его публичный `run()` по-прежнему
+выполняет experiment plan, а внутренние методы отдельно строят typed plan, model
+pool, исполняют datasets и дополняют metadata.
+
+| Метод | Назначение |
+|---|---|
+| `_ensure_scenario_grid()` | Один раз строит и кеширует immutable scenario contract. |
+| `_make_model_pool()` | Материализует только модели, которые присутствуют в выбранных scenario groups. |
+| `_run_experiment(...)` | Итерирует datasets и передаёт explicit bindings в `run_scenario_grid(...)`. |
+| `_create_incremental_saver(...)` | Добавляет lifecycle hook, который после успешного завершения строит финальные plots. |
+| `_build_run_meta(...)` | Сохраняет scenario groups, полный typed grid и число сценариев. |
+
+Полная спецификация сетки и команды запуска приведены в
+`docs/rmt_onboarding/16_final_regression_full_grid.md`.
+
+## Model Complexity Diagnostics
+
+Файл: `examples/benchmark/benchmark_model_diagnostics.py`
+
+`summarize_model_complexity(...)` извлекает LightGBM tree structure, gain importance
+и SHAP contributions. `summarize_ensemble_complexity(...)` агрегирует эти значения
+по активным chunk models. Оба helper-а являются best-effort boundary: отсутствие
+поддерживаемого booster API возвращает typed-like status payload, но не прерывает
+benchmark run.
+
+`RMTReportPlotBuilder` из `examples/benchmark/rmt_report_plots.py` получает готовую
+raw report table и строит degradation, runtime-quality и tree-complexity figures.
+Он не читает run records напрямую и поэтому не дублирует правила baseline или
+агрегации из `RMTReportTableBuilder`.

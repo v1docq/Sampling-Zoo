@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pandas as pd
 import numpy as np
+import pytest
 from sklearn.linear_model import Ridge
 
 BENCHMARK_DIR = Path(__file__).resolve().parents[1] / "examples" / "benchmark"
@@ -16,7 +17,13 @@ from benchmark_datasets import RawDatasetBundle, RawDatasetMetadata  # noqa: E40
 from benchmark_logging import BenchmarkLogger  # noqa: E402
 from benchmark_runner import EnsembleChunkBenchmarkRunner  # noqa: E402
 from sampling_zoo.core.experiment.contracts import (  # noqa: E402
+    ModelStrategyScenarioGridContract,
+    ModelStrategyScenarioSpec,
     PartitionSizeDiagnosticsContract,
+    StrategySpec,
+)
+from sampling_zoo.core.experiment.errors import (  # noqa: E402
+    InvalidExperimentConfigError,
 )
 from sampling_zoo.core.experiment.resume import (  # noqa: E402
     build_resume_plan,
@@ -89,6 +96,84 @@ def test_ensemble_chunk_runner_delegates_fold_work_to_executor(tmp_path) -> None
         {"model": "ridge", "strategy": "feature_clustering"},
     ]
     assert recorded == records
+
+
+def test_ensemble_chunk_runner_executes_only_bound_scenarios(tmp_path) -> None:
+    recorded: list[dict] = []
+    runner = EnsembleChunkBenchmarkRunner(
+        logger=BenchmarkLogger(
+            run_id="scenario_grid_test",
+            artifacts_root=tmp_path,
+        ),
+        cv_folds=2,
+        show_progress=False,
+        on_record=recorded.append,
+    )
+
+    class FakeFoldExecutor:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, str]] = []
+
+        def run_strategy_folds(
+            self,
+            dataset,
+            strategy_name,
+            partitioner_config,
+            model_name,
+            model_factory,
+            openml_split_data=None,
+        ):
+            self.calls.append(
+                (
+                    model_name,
+                    strategy_name,
+                    partitioner_config["strategy"],
+                )
+            )
+            return [{"model": model_name, "scenario": strategy_name}]
+
+    fake_executor = FakeFoldExecutor()
+    runner.fold_executor = fake_executor
+    grid = ModelStrategyScenarioGridContract(
+        scenarios=(
+            ModelStrategyScenarioSpec(
+                name="ridge__random",
+                model_name="ridge",
+                strategy=StrategySpec(
+                    name="random",
+                    config={"strategy": "random"},
+                ),
+            ),
+            ModelStrategyScenarioSpec(
+                name="forest__difficulty",
+                model_name="forest",
+                strategy=StrategySpec(
+                    name="difficulty",
+                    config={"strategy": "difficulty"},
+                ),
+            ),
+        )
+    )
+
+    records = runner.run_scenario_grid(
+        _tiny_regression_dataset(),
+        grid,
+        model_pool={"ridge": object, "forest": object},
+    )
+
+    assert fake_executor.calls == [
+        ("ridge", "ridge__random", "random"),
+        ("forest", "forest__difficulty", "difficulty"),
+    ]
+    assert records == recorded
+    assert len(records) == 2
+
+    with pytest.raises(InvalidExperimentConfigError):
+        runner.run_scenario_grid(
+            _tiny_regression_dataset(),
+            grid,
+            model_pool={"ridge": object},
+        )
 
 
 def test_ensemble_chunk_runner_skips_fully_completed_dataset(

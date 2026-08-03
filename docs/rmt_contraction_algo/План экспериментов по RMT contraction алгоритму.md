@@ -25,11 +25,22 @@
 
 # Текущая RMT grid-логика
 
+В `rmt_regression_medium_datasets.py` историческая исследовательская сетка использует
+бюджеты `(0.1, 0.3, 0.5, 0.75, 0.9)`. Она сохраняется для воспроизводимости прошлых
+запусков и локальных ablations.
+
 Основная ось:
 
 ```python
 DEFAULT_BUDGET_RATIOS = (0.1, 0.3, 0.5, 0.75, 0.9)
 ```
+
+После завершения ablations финальный entrypoint
+`rmt_regression_full_grid.py` использует основную сравнительную сетку
+`(0.01, 0.05, 0.10, 0.20)`. Она строится как explicit non-Cartesian scenario grid и
+сравнивает LightGBM, TabPFN in-context и TabPFN fine-tuning в independent и
+concatenated постановках. Полное описание приведено в
+`docs/rmt_onboarding/16_final_regression_full_grid.md`.
 
 Для `rmt_contraction` дополнительно сравниваются:
 
@@ -101,3 +112,7 @@ incremental resume не смешивает paired runs. Помимо общих 
 - `chunk_size_imbalance`, target drift per chunk;
 - `mean_max_probability`, routing entropy, hard assignment counts на validation/test;
 - EM diagnostics: `routing_refinement_status`, `routing_refinement_metric_improvement`, `routing_refinement_final_imbalance`.
+- вычислительная эффективность: `fit_rows_per_second`,
+  `inference_rows_per_second`, фактическое число model-fit rows и активных моделей;
+- для LightGBM: суммарные trees/leaves/splits, средняя и максимальная глубина,
+  entropy gain importance и SHAP concentration.

@@ -30,6 +30,7 @@ class RMTReportTableBuilder:
         raw = self._build_raw_runs_table(normalized)
         raw = self._attach_rmse_baseline(raw)
         raw = self._attach_reference_metrics(raw, reference_metrics)
+        raw = self._prefer_foundational_tabpfn_baseline(raw)
         raw = self._attach_rmse_drop(raw)
         self._write_table(raw, output_dir / "rmt_raw_runs.csv")
 
@@ -87,13 +88,38 @@ class RMTReportTableBuilder:
         table.to_csv(path, index=False)
 
     def _build_raw_runs_table(self, df: pd.DataFrame) -> pd.DataFrame:
-        return pd.DataFrame(
+        raw = pd.DataFrame(
             {
                 "dataset": value_series(df, "dataset"),
                 "task_key": value_series(df, "dataset").map(task_key),
                 "model": value_series(df, "strategy_params.model"),
+                "split_label": value_series(
+                    df,
+                    "strategy_params.split_label",
+                    default="single_split",
+                ),
+                "experiment_scenario": value_series(
+                    df,
+                    "strategy_params.experiment_scenario",
+                    default=None,
+                ),
+                "scenario_group": value_series(
+                    df,
+                    "strategy_params.scenario_group",
+                    default=None,
+                ),
+                "scenario_family": value_series(
+                    df,
+                    "strategy_params.scenario_family",
+                    default=None,
+                ),
                 "sampler": value_series(df, "strategy_params.strategy"),
                 "ensemble_method": value_series(df, "strategy_params.ensemble_method"),
+                "partition_model_mode": value_series(
+                    df,
+                    "strategy_params.partition_model_mode",
+                    default=None,
+                ),
                 "router": value_series(df, "strategy_params.router", default=None),
                 "view_strategy": value_series(df, "strategy_params.view_strategy", default=None),
                 "n_views": self._numeric_series(df, "extra.sampler_diagnostics.n_views"),
@@ -321,9 +347,61 @@ class RMTReportTableBuilder:
                 ),
                 "budget_ratio": self._numeric_series(df, "strategy_params.budget_ratio"),
                 "total_train_rows": self._numeric_series(df, "sample_stats.sample_size"),
+                "model_fit_rows_total": self._numeric_series(
+                    df,
+                    "sample_stats.model_fit_rows_total",
+                ),
+                "active_model_count": self._numeric_series(
+                    df,
+                    "sample_stats.active_model_count",
+                ),
+                "n_test": self._numeric_series(df, "extra.n_test"),
                 "rmse": self._numeric_series(df, "model_metrics.rmse"),
                 "fit_time": self._numeric_series(df, "timings_sec.fit"),
                 "inference_time": self._numeric_series(df, "timings_sec.inference"),
+                "complexity_status": value_series(
+                    df,
+                    "extra.model_complexity_diagnostics.status",
+                    default=None,
+                ),
+                "tree_count_total": self._numeric_series(
+                    df,
+                    "extra.model_complexity_diagnostics.tree_count_total",
+                ),
+                "leaf_count_total": self._numeric_series(
+                    df,
+                    "extra.model_complexity_diagnostics.leaf_count_total",
+                ),
+                "split_count_total": self._numeric_series(
+                    df,
+                    "extra.model_complexity_diagnostics.split_count_total",
+                ),
+                "max_tree_depth": self._numeric_series(
+                    df,
+                    "extra.model_complexity_diagnostics.max_tree_depth",
+                ),
+                "mean_tree_depth": self._numeric_series(
+                    df,
+                    "extra.model_complexity_diagnostics.mean_tree_depth",
+                ),
+                "gain_importance_entropy": self._numeric_series(
+                    df,
+                    (
+                        "extra.model_complexity_diagnostics."
+                        "gain_importance_entropy"
+                    ),
+                ),
+                "shap_mean_abs_entropy": self._numeric_series(
+                    df,
+                    (
+                        "extra.model_complexity_diagnostics."
+                        "shap_mean_abs_entropy"
+                    ),
+                ),
+                "shap_top_5_share": self._numeric_series(
+                    df,
+                    "extra.model_complexity_diagnostics.shap_top_5_share",
+                ),
                 "sampler_fit_time": self._numeric_series(
                     df,
                     "extra.sampler_diagnostics.runtime.total_seconds",
@@ -471,23 +549,65 @@ class RMTReportTableBuilder:
                 ),
             }
         )
+        return self._attach_compute_efficiency_metrics(raw)
+
+    @staticmethod
+    def _attach_compute_efficiency_metrics(raw: pd.DataFrame) -> pd.DataFrame:
+        enriched = raw.copy()
+        positive_fit_time = enriched["fit_time"].where(
+            enriched["fit_time"] > 0
+        )
+        positive_inference_time = enriched["inference_time"].where(
+            enriched["inference_time"] > 0
+        )
+        enriched["fit_rows_per_second"] = (
+            enriched["model_fit_rows_total"] / positive_fit_time
+        )
+        enriched["inference_rows_per_second"] = (
+            enriched["n_test"] / positive_inference_time
+        )
+        return enriched
 
     @staticmethod
     def _numeric_series(df: pd.DataFrame, column: str) -> pd.Series:
         return pd.to_numeric(value_series(df, column), errors="coerce")
 
     def _attach_rmse_baseline(self, raw: pd.DataFrame) -> pd.DataFrame:
-        baseline = self._full_dataset_baseline(raw)
-        if baseline.empty:
-            baseline = self._best_observed_baseline(raw)
-        return raw.merge(baseline, on=["dataset", "model"], how="left")
+        full = self._full_dataset_baseline(raw).rename(
+            columns={"rmse_ref": "rmse_full_ref"}
+        )
+        best = self._best_observed_baseline(raw).rename(
+            columns={"rmse_ref": "rmse_best_observed_ref"}
+        )
+        baseline_keys = ["dataset", "model", "split_label"]
+        enriched = raw.merge(full, on=baseline_keys, how="left")
+        enriched = enriched.merge(
+            best,
+            on=baseline_keys,
+            how="left",
+        )
+        enriched["rmse_ref"] = enriched["rmse_full_ref"].fillna(
+            enriched["rmse_best_observed_ref"]
+        )
+        enriched["rmse_ref_source"] = np.where(
+            enriched["rmse_full_ref"].notna(),
+            "full_dataset",
+            "best_observed",
+        )
+        return enriched.drop(
+            columns=["rmse_full_ref", "rmse_best_observed_ref"]
+        )
 
     @staticmethod
     def _full_dataset_baseline(raw: pd.DataFrame) -> pd.DataFrame:
         return (
             raw[raw["sampler"] == "full_dataset"]
             .dropna(subset=["rmse"])
-            .groupby(["dataset", "model"], as_index=False)["rmse"]
+            .groupby(
+                ["dataset", "model", "split_label"],
+                as_index=False,
+                dropna=False,
+            )["rmse"]
             .min()
             .rename(columns={"rmse": "rmse_ref"})
         )
@@ -496,7 +616,11 @@ class RMTReportTableBuilder:
     def _best_observed_baseline(raw: pd.DataFrame) -> pd.DataFrame:
         return (
             raw.dropna(subset=["rmse"])
-            .groupby(["dataset", "model"], as_index=False)["rmse"]
+            .groupby(
+                ["dataset", "model", "split_label"],
+                as_index=False,
+                dropna=False,
+            )["rmse"]
             .min()
             .rename(columns={"rmse": "rmse_ref"})
         )
@@ -504,13 +628,33 @@ class RMTReportTableBuilder:
     @staticmethod
     def _attach_reference_metrics(raw: pd.DataFrame, reference_metrics: pd.DataFrame | None) -> pd.DataFrame:
         if reference_metrics is None or reference_metrics.empty or "Task" not in reference_metrics.columns:
-            return raw
+            return raw.assign(foundational_rmse_ref=np.nan)
         refs = reference_metrics.copy()
         refs["task_key"] = refs["Task"].astype(str)
         if "foundational" not in refs.columns:
-            return raw
+            return raw.assign(foundational_rmse_ref=np.nan)
         refs["foundational_rmse_ref"] = pd.to_numeric(refs["foundational"], errors="coerce")
         return raw.merge(refs[["task_key", "foundational_rmse_ref"]], on="task_key", how="left")
+
+    @staticmethod
+    def _prefer_foundational_tabpfn_baseline(raw: pd.DataFrame) -> pd.DataFrame:
+        if "foundational_rmse_ref" not in raw.columns:
+            return raw
+        enriched = raw.copy()
+        tabpfn_mask = enriched["model"].astype(str).str.startswith("tabpfn")
+        use_foundational = (
+            tabpfn_mask
+            & enriched["foundational_rmse_ref"].notna()
+            & enriched["rmse_ref_source"].ne("full_dataset")
+        )
+        enriched.loc[use_foundational, "rmse_ref"] = enriched.loc[
+            use_foundational,
+            "foundational_rmse_ref",
+        ]
+        enriched.loc[use_foundational, "rmse_ref_source"] = (
+            "amlb_foundational"
+        )
+        return enriched
 
     @staticmethod
     def _attach_rmse_drop(raw: pd.DataFrame) -> pd.DataFrame:
@@ -526,8 +670,11 @@ class RMTReportTableBuilder:
                 [
                     "dataset",
                     "model",
+                    "scenario_group",
+                    "scenario_family",
                     "sampler",
                     "ensemble_method",
+                    "partition_model_mode",
                     "router",
                     "view_strategy",
                     "partition_selection_method",
@@ -566,11 +713,26 @@ class RMTReportTableBuilder:
                     "subspace_stability_frequency": "mean",
                     "subspace_successful_resamples": "mean",
                     "total_train_rows": "mean",
+                    "model_fit_rows_total": "mean",
+                    "active_model_count": "mean",
                     "rmse": "mean",
                     "rmse_ref": "mean",
+                    "rmse_ref_source": "first",
+                    "foundational_rmse_ref": "mean",
                     "rmse_drop": "mean",
                     "fit_time": "mean",
                     "inference_time": "mean",
+                    "fit_rows_per_second": "mean",
+                    "inference_rows_per_second": "mean",
+                    "complexity_status": "first",
+                    "tree_count_total": "mean",
+                    "leaf_count_total": "mean",
+                    "split_count_total": "mean",
+                    "max_tree_depth": "mean",
+                    "mean_tree_depth": "mean",
+                    "gain_importance_entropy": "mean",
+                    "shap_mean_abs_entropy": "mean",
+                    "shap_top_5_share": "mean",
                     "leverage_entropy": "mean",
                     "effective_sample_count": "mean",
                     "chunk_size_imbalance_ratio": "mean",
@@ -593,6 +755,8 @@ class RMTReportTableBuilder:
             )
             .sort_values([
                 "dataset",
+                "scenario_group",
+                "scenario_family",
                 "sampler",
                 "view_strategy",
                 "partition_selection_method",
@@ -605,6 +769,7 @@ class RMTReportTableBuilder:
                 "subspace_stability_status",
                 "subspace_rank_source",
                 "ensemble_method",
+                "partition_model_mode",
                 "router",
                 "budget_ratio",
             ])
@@ -614,9 +779,13 @@ class RMTReportTableBuilder:
     def _build_partition_selection_comparison(
         raw: pd.DataFrame,
     ) -> pd.DataFrame:
+        raw = RMTReportTableBuilder._with_scenario_axes(raw)
         key_columns = [
             "dataset",
             "model",
+            "scenario_group",
+            "scenario_family",
+            "partition_model_mode",
             "sampler",
             "ensemble_method",
             "router",
@@ -630,6 +799,16 @@ class RMTReportTableBuilder:
             "rmse_drop",
             "fit_time",
             "inference_time",
+            "fit_rows_per_second",
+            "inference_rows_per_second",
+            "tree_count_total",
+            "leaf_count_total",
+            "split_count_total",
+            "max_tree_depth",
+            "mean_tree_depth",
+            "gain_importance_entropy",
+            "shap_mean_abs_entropy",
+            "shap_top_5_share",
             "sampler_fit_time",
             "partition_selection_time",
             "chunk_training_time",
@@ -767,7 +946,15 @@ class RMTReportTableBuilder:
 
     @staticmethod
     def _build_row_selection_comparison(raw: pd.DataFrame) -> pd.DataFrame:
-        key_columns = ["dataset", "model", "budget_ratio"]
+        raw = RMTReportTableBuilder._with_scenario_axes(raw)
+        key_columns = [
+            "dataset",
+            "model",
+            "scenario_group",
+            "scenario_family",
+            "partition_model_mode",
+            "budget_ratio",
+        ]
         method_column = "row_selection_method"
         required = {*key_columns, method_column, "rmse"}
         if raw.empty or not required.issubset(raw.columns):
@@ -787,6 +974,16 @@ class RMTReportTableBuilder:
                 "rmse_drop",
                 "fit_time",
                 "inference_time",
+                "fit_rows_per_second",
+                "inference_rows_per_second",
+                "tree_count_total",
+                "leaf_count_total",
+                "split_count_total",
+                "max_tree_depth",
+                "mean_tree_depth",
+                "gain_importance_entropy",
+                "shap_mean_abs_entropy",
+                "shap_top_5_share",
                 "total_train_rows",
                 "target_mean_abs_drift_avg",
                 "target_quantile_l1_drift_avg",
@@ -842,6 +1039,19 @@ class RMTReportTableBuilder:
             ignore_index=True,
         )
 
+    @staticmethod
+    def _with_scenario_axes(raw: pd.DataFrame) -> pd.DataFrame:
+        normalized = raw.copy()
+        defaults = {
+            "scenario_group": "legacy",
+            "scenario_family": "legacy",
+            "partition_model_mode": "independent",
+        }
+        for column, default in defaults.items():
+            if column not in normalized.columns:
+                normalized[column] = default
+        return normalized
+
     def _build_minimal_budget_table(self, efficiency: pd.DataFrame) -> pd.DataFrame:
         minimal_rows: list[dict[str, Any]] = []
         for delta in self.efficiency_deltas:
@@ -853,8 +1063,11 @@ class RMTReportTableBuilder:
                 [
                     "dataset",
                     "model",
+                    "scenario_group",
+                    "scenario_family",
                     "sampler",
                     "ensemble_method",
+                    "partition_model_mode",
                     "router",
                     "view_strategy",
                     "partition_selection_method",
