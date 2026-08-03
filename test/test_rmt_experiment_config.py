@@ -5,6 +5,8 @@ import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
 
+from examples.benchmark import rmt_regression_medium_datasets as medium_rmt
+from examples.benchmark.benchmark_model_profiles import TabPFNFinetuneConfig
 from examples.benchmark.benchmark_sampling_strategies import make_chunking_strategy_configs
 from examples.benchmark.rmt_regression_medium_datasets import (
     make_rmt_experiment_strategy_configs as make_medium_rmt_experiment_strategy_configs,
@@ -18,6 +20,36 @@ from examples.benchmark.run_rmt_contraction_regression_experiment import (
     make_rmt_strategy_grid,
 )
 from sampling_zoo.core.utils.sampling_ensemble import SamplingEnsemble
+
+
+def test_medium_rmt_runner_forwards_typed_tabpfn_finetune_config(
+    monkeypatch,
+) -> None:
+    captured: dict = {}
+
+    def fake_make_model_pool(**kwargs):
+        captured.update(kwargs)
+        return {"tabpfn_finetuned": object()}
+
+    monkeypatch.setattr(medium_rmt, "make_model_pool", fake_make_model_pool)
+    config = medium_rmt.RMTRegressionExperimentConfig(
+        models=("tabpfn_finetuned",),
+        show_progress=False,
+        tabpfn_finetune_config={"epochs": 6, "time_limit": 90},
+    )
+
+    result = medium_rmt.RMTRegressionExperimentOrchestrator(
+        config
+    )._make_model_pool()
+
+    assert tuple(result) == ("tabpfn_finetuned",)
+    assert config.tabpfn_finetune_config == TabPFNFinetuneConfig(
+        epochs=6,
+        time_limit=90,
+    )
+    assert captured["tabpfn_finetune_config"] is (
+        config.tabpfn_finetune_config
+    )
 
 
 def test_chunking_configs_support_rmt_and_experiment_metadata() -> None:
