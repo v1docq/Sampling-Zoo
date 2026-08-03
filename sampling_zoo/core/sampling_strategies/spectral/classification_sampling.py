@@ -1,0 +1,190 @@
+"""Pure class-coverage planning for spectral partition row selection."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Sequence
+
+import numpy as np
+from sklearn.utils.multiclass import type_of_target
+
+from .partition_sampling import select_partition_indices
+
+
+@dataclass(frozen=True)
+class ClassCoverageSelectionPlan:
+    """Result of exact-budget, class-aware row selection for one partition."""
+
+    selected_indices: np.ndarray
+    target_size: int
+    min_samples_per_class: int
+    source_class_counts: tuple[tuple[str, int], ...]
+    selected_class_counts: tuple[tuple[str, int], ...]
+    missing_classes: tuple[str, ...]
+    feasible: bool
+    violations: tuple[str, ...]
+    distribution_total_variation: float | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "target_size": int(self.target_size),
+            "selected_size": int(self.selected_indices.size),
+            "min_samples_per_class": int(self.min_samples_per_class),
+            "source_class_counts": dict(self.source_class_counts),
+            "selected_class_counts": dict(self.selected_class_counts),
+            "missing_classes": list(self.missing_classes),
+            "n_source_classes": len(self.source_class_counts),
+            "n_selected_classes": len(self.selected_class_counts),
+            "single_class_selection": len(self.selected_class_counts) <= 1,
+            "feasible": bool(self.feasible),
+            "violations": list(self.violations),
+            "distribution_total_variation": self.distribution_total_variation,
+        }
+
+
+def infer_target_type(target: Any, configured: str = "auto") -> str:
+    """Resolve a target kind without coupling the sampler to cluster selection."""
+
+    normalized = str(configured).strip().lower()
+    if normalized != "auto":
+        return normalized
+    if target is None:
+        return "none"
+    try:
+        inferred = type_of_target(np.asarray(target))
+    except (TypeError, ValueError):
+        return "none"
+    if inferred in {"binary", "multiclass"}:
+        return "classification"
+    if inferred == "continuous":
+        return "regression"
+    return "none"
+
+
+def select_class_aware_partition_indices(
+    candidate_indices: Sequence[int] | np.ndarray,
+    *,
+    target: Sequence[Any] | np.ndarray,
+    target_size: int,
+    min_samples_per_class: int,
+    selection_method: str,
+    scores: np.ndarray,
+    embedding: np.ndarray,
+    random_state: int | np.random.Generator | None = None,
+    leverage_cap_quantile: float = 0.95,
+) -> ClassCoverageSelectionPlan:
+    """Select an exact-size subset while preserving every locally observed class."""
+
+    indices = np.asarray(candidate_indices, dtype=int).reshape(-1)
+    target_values = np.asarray(target).reshape(-1)
+    resolved_size = max(0, min(int(target_size), indices.size))
+    minimum = int(min_samples_per_class)
+    if minimum < 1:
+        raise ValueError("min_samples_per_class must be positive")
+    if indices.size and target_values.size <= int(np.max(indices)):
+        raise ValueError("target must align with candidate indices")
+
+    local_target = target_values[indices]
+    classes, encoded = np.unique(local_target, return_inverse=True)
+    source_counts = np.bincount(encoded, minlength=classes.size)
+    labels = tuple(_class_label(value) for value in classes.tolist())
+    source_pairs = tuple(zip(labels, source_counts.astype(int).tolist()))
+    required_rows = int(classes.size * minimum)
+    violations: list[str] = []
+    if resolved_size < required_rows:
+        violations.append("budget_below_class_coverage_minimum")
+    if np.any(source_counts < minimum):
+        violations.append("source_class_below_required_minimum")
+    if classes.size < 2:
+        violations.append("source_partition_is_single_class")
+
+    if violations:
+        return ClassCoverageSelectionPlan(
+            selected_indices=np.asarray([], dtype=int),
+            target_size=resolved_size,
+            min_samples_per_class=minimum,
+            source_class_counts=source_pairs,
+            selected_class_counts=(),
+            missing_classes=labels,
+            feasible=False,
+            violations=tuple(violations),
+            distribution_total_variation=None,
+        )
+
+    rng = (
+        random_state
+        if isinstance(random_state, np.random.Generator)
+        else np.random.default_rng(random_state)
+    )
+    reserved: list[np.ndarray] = []
+    for class_index in range(classes.size):
+        class_candidates = indices[encoded == class_index]
+        reserved.append(
+            select_partition_indices(
+                class_candidates,
+                target_size=minimum,
+                selection_method=selection_method,
+                scores=scores,
+                embedding=embedding,
+                random_state=rng,
+                leverage_cap_quantile=leverage_cap_quantile,
+            )
+        )
+
+    selected = np.concatenate(reserved).astype(int, copy=False)
+    remaining_size = resolved_size - selected.size
+    if remaining_size > 0:
+        remaining = indices[~np.isin(indices, selected)]
+        selected = np.concatenate(
+            [
+                selected,
+                select_partition_indices(
+                    remaining,
+                    target_size=remaining_size,
+                    selection_method=selection_method,
+                    scores=scores,
+                    embedding=embedding,
+                    random_state=rng,
+                    leverage_cap_quantile=leverage_cap_quantile,
+                ),
+            ]
+        )
+
+    selected_target = target_values[selected]
+    selected_counts = np.asarray(
+        [np.sum(selected_target == value) for value in classes],
+        dtype=int,
+    )
+    selected_pairs = tuple(zip(labels, selected_counts.tolist()))
+    missing = tuple(
+        label for label, count in selected_pairs if int(count) < minimum
+    )
+    drift = _distribution_total_variation(source_counts, selected_counts)
+    return ClassCoverageSelectionPlan(
+        selected_indices=selected,
+        target_size=resolved_size,
+        min_samples_per_class=minimum,
+        source_class_counts=source_pairs,
+        selected_class_counts=selected_pairs,
+        missing_classes=missing,
+        feasible=selected.size == resolved_size and not missing,
+        violations=(() if selected.size == resolved_size and not missing else ("selection_invariant_failed",)),
+        distribution_total_variation=drift,
+    )
+
+
+def _class_label(value: Any) -> str:
+    if isinstance(value, np.generic):
+        value = value.item()
+    return str(value)
+
+
+def _distribution_total_variation(
+    source_counts: np.ndarray,
+    selected_counts: np.ndarray,
+) -> float:
+    source = np.asarray(source_counts, dtype=float)
+    selected = np.asarray(selected_counts, dtype=float)
+    source /= max(float(source.sum()), 1.0)
+    selected /= max(float(selected.sum()), 1.0)
+    return float(0.5 * np.sum(np.abs(source - selected)))

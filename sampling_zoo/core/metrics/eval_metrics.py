@@ -1,42 +1,145 @@
-import numpy as np
+"""Shared metric calculation and comparison helpers."""
+
+from __future__ import annotations
+
 import operator
-from sklearn.metrics import accuracy_score, f1_score, mean_squared_error, r2_score, log_loss
+from typing import Any, Optional, Sequence
 
-LOWER_IS_BETTER = {"rmse", "mae", "mse", "logloss", "cross_entropy"}
-HIGHER_IS_BETTER = {"accuracy", "f1", "f1_macro", "f1_weighted", "recall", "precision", "roc_auc"}
+import numpy as np
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    log_loss,
+    mean_squared_error,
+    r2_score,
+    roc_auc_score,
+)
 
-def calculate_metrics(y_true, y_labels, y_proba, problem_type):
-    """Вычисляет метрики качества"""
-    if problem_type == 'classification':
-        y_pred = y_labels.flatten()
-        metrics = {
-            'accuracy': accuracy_score(y_true, y_pred),
-            'f1_macro': f1_score(y_true, y_pred, average='macro'),
-            'f1_weighted': f1_score(y_true, y_pred, average='weighted')
-        }
-        if y_proba is not None:
-            try:
-                metrics['log_loss'] = log_loss(y_true=y_true, y_pred=y_proba)
-            except ValueError:
-                metrics['log_loss'] = float("nan")
-        else:
-            metrics['log_loss'] = float("nan")
+LOWER_IS_BETTER = {
+    "rmse",
+    "mae",
+    "mse",
+    "logloss",
+    "log_loss",
+    "cross_entropy",
+}
+HIGHER_IS_BETTER = {
+    "accuracy",
+    "f1",
+    "f1_macro",
+    "f1_weighted",
+    "recall",
+    "precision",
+    "roc_auc",
+}
+
+
+def calculate_metrics(
+    y_true: Any,
+    y_labels: Any,
+    y_proba: Optional[np.ndarray],
+    problem_type: str,
+    classes: Optional[Sequence[Any]] = None,
+) -> dict[str, float]:
+    """Calculate regression metrics or probability-first classification metrics."""
+
+    if problem_type == "classification":
+        return _classification_metrics(
+            y_true=y_true,
+            y_labels=y_labels,
+            y_proba=y_proba,
+            classes=classes,
+        )
+
+    y_pred = np.asarray(y_labels)
+    mse = mean_squared_error(y_true, y_pred)
+    return {
+        "mse": float(mse),
+        "rmse": float(np.sqrt(mse)),
+        "r2": float(r2_score(y_true, y_pred)),
+    }
+
+
+def _classification_metrics(
+    *,
+    y_true: Any,
+    y_labels: Any,
+    y_proba: Optional[np.ndarray],
+    classes: Optional[Sequence[Any]],
+) -> dict[str, float]:
+    y_true_array = np.asarray(y_true).reshape(-1)
+    y_pred = np.asarray(y_labels).reshape(-1)
+    global_classes = (
+        np.asarray(classes)
+        if classes is not None
+        else np.unique(y_true_array)
+    )
+    metrics = {
+        "accuracy": float(accuracy_score(y_true_array, y_pred)),
+        "f1_macro": float(
+            f1_score(y_true_array, y_pred, average="macro", zero_division=0)
+        ),
+        "f1_weighted": float(
+            f1_score(y_true_array, y_pred, average="weighted", zero_division=0)
+        ),
+        "roc_auc": float("nan"),
+        "log_loss": float("nan"),
+    }
+    if y_proba is None:
         return metrics
-    else:  # regression
-        y_pred = y_labels
-        return {
-            'mse': mean_squared_error(y_true, y_pred),
-            'rmse': np.sqrt(mean_squared_error(y_true, y_pred)),
-            'r2': r2_score(y_true, y_pred)}
+
+    probabilities = np.asarray(y_proba, dtype=float)
+    if (
+        probabilities.ndim != 2
+        or probabilities.shape[0] != y_true_array.size
+        or probabilities.shape[1] != global_classes.size
+    ):
+        return metrics
+
+    try:
+        metrics["log_loss"] = float(
+            log_loss(y_true_array, probabilities, labels=global_classes)
+        )
+        if global_classes.size == 2:
+            positive_class = global_classes[-1]
+            positive_index = int(
+                np.where(global_classes == positive_class)[0][0]
+            )
+            binary_target = (y_true_array == positive_class).astype(int)
+            metrics["roc_auc"] = float(
+                roc_auc_score(
+                    binary_target,
+                    probabilities[:, positive_index],
+                )
+            )
+    except ValueError:
+        pass
+    return metrics
 
 
 def get_metric_comparator(metric_name: str):
-    """Возвращает функцию comparator(a, b), которая возвращает True если a лучше b"""
-    name = metric_name.lower()
+    """Return comparator(a, b) that is true when metric value a is better."""
 
+    name = metric_name.lower()
     if name in LOWER_IS_BETTER:
         return operator.lt
-    elif name in HIGHER_IS_BETTER:
+    if name in HIGHER_IS_BETTER:
         return operator.gt
-    else:
-        raise ValueError(f"Unknown metric type for '{metric_name}'")
+    raise ValueError(f"Unknown metric type for '{metric_name}'")
+
+
+def primary_classification_metric(classes: Sequence[Any]) -> str:
+    """Return the AMLB-compatible primary metric for a class set."""
+
+    return "roc_auc" if np.asarray(classes).size == 2 else "log_loss"
+
+
+def metric_drop(metric_name: str, score: float, reference_score: float) -> float:
+    """Return positive degradation relative to a reference metric value."""
+
+    normalized = str(metric_name).strip().lower()
+    if normalized in HIGHER_IS_BETTER:
+        return float(reference_score - score)
+    if normalized in LOWER_IS_BETTER:
+        return float(score - reference_score)
+    raise ValueError(f"Unknown metric type for '{metric_name}'")

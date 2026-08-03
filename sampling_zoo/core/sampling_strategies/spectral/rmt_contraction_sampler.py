@@ -13,6 +13,11 @@ from .backend.matrix_backend import MatrixRMTBackend
 from .backend.tensor_backend import TensorRMTBackend
 from .base_sampler import SpectralSamplerBase
 from .cluster_selection import ClusterSelectionResult, SpectralClusterSelector
+from .classification_sampling import (
+    ClassCoverageSelectionPlan,
+    infer_target_type,
+    select_class_aware_partition_indices,
+)
 from .partition_sampling import (
     partition_membership_fingerprint,
     select_partition_indices,
@@ -66,6 +71,8 @@ class RMTContractionConfig:
     missing_class_penalty_weight: float = 0.25
     single_class_penalty_weight: float = 0.50
     class_distribution_drift_weight: float = 0.25
+    class_coverage_policy: str = "auto"
+    min_samples_per_class: int = 1
     validation_proxy_fraction: float = 0.2
     validation_proxy_min_partition_rows: int = 8
     validation_proxy_smoothing: float = 1.0
@@ -312,6 +319,15 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             "class_distribution_drift_weight",
             cfg.class_distribution_drift_weight,
         )
+        self.class_coverage_policy = self._validate_choice(
+            "class_coverage_policy",
+            cfg.class_coverage_policy,
+            ("auto", "off", "preserve_local_classes"),
+        )
+        self.min_samples_per_class = self._validate_positive_int(
+            "min_samples_per_class",
+            cfg.min_samples_per_class,
+        )
         self.validation_proxy_fraction = self._validate_fraction(
             "validation_proxy_fraction",
             cfg.validation_proxy_fraction,
@@ -453,6 +469,11 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self.n_views_selection_info_: Optional[NViewsSelectionInfo] = None
         self.partition_selection_info_: Optional[PartitionSelectionInfo] = None
         self.partition_budget_plan_: Optional[PartitionBudgetPlan] = None
+        self.class_coverage_selection_plans_: Dict[
+            str, ClassCoverageSelectionPlan
+        ] = {}
+        self.resolved_class_coverage_policy_ = "off"
+        self.class_coverage_guaranteed_ = False
 
     @staticmethod
     def _normalize_config_inputs(
@@ -676,6 +697,9 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self.n_views_selection_info_ = None
         self.partition_selection_info_ = None
         self.partition_budget_plan_ = None
+        self.class_coverage_selection_plans_ = {}
+        self.resolved_class_coverage_policy_ = "off"
+        self.class_coverage_guaranteed_ = False
         self.cluster_centers_ = None
         if self.n_views_requested == "auto":
             self.n_views = self.min_views
@@ -1294,15 +1318,43 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             )
         allocation = self.partition_budget_plan_.allocation_map
 
+        resolved_target_type = infer_target_type(target, self.cluster_target_type)
+        self.resolved_class_coverage_policy_ = self._resolve_class_coverage_policy(
+            resolved_target_type
+        )
+        target_values = None if target is None else np.asarray(target).reshape(-1)
+        if target_values is not None and target_values.size != labels.size:
+            raise ValueError("target must align with cluster labels")
+
         row_selection_rng = np.random.default_rng(self.random_state)
         for cluster_id, cluster_idx in cluster_indices.items():
             name = f"chunk_{cluster_id}"
-            selected = self._select_from_cluster(
-                cluster_idx,
-                scores,
-                target_size=allocation[name],
-                random_state=row_selection_rng,
-            )
+            if self.resolved_class_coverage_policy_ == "preserve_local_classes":
+                if target_values is None:
+                    raise ValueError(
+                        "class-aware row selection requires a classification target"
+                    )
+                coverage_plan = self._select_class_aware_from_cluster(
+                    cluster_idx,
+                    scores,
+                    target_values,
+                    target_size=allocation[name],
+                    random_state=row_selection_rng,
+                )
+                self.class_coverage_selection_plans_[name] = coverage_plan
+                if not coverage_plan.feasible:
+                    raise ValueError(
+                        "Classification partition is infeasible for exact-budget "
+                        f"class coverage ({name}): {coverage_plan.to_dict()}"
+                    )
+                selected = coverage_plan.selected_indices
+            else:
+                selected = self._select_from_cluster(
+                    cluster_idx,
+                    scores,
+                    target_size=allocation[name],
+                    random_state=row_selection_rng,
+                )
             if selected.size == 0:
                 continue
             partitions[name] = selected
@@ -1318,6 +1370,33 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self.partitions = partitions
         self.partition_names_ = list(partitions.keys())
         self.partition_to_cluster_ = {name: int(name.split("_")[-1]) for name in self.partition_names_}
+        self.class_coverage_guaranteed_ = bool(
+            self.resolved_class_coverage_policy_ == "preserve_local_classes"
+            and partitions
+            and all(
+                plan.feasible
+                and len(plan.selected_class_counts) >= 2
+                for name, plan in self.class_coverage_selection_plans_.items()
+                if name in partitions
+            )
+        )
+
+    def _resolve_class_coverage_policy(self, resolved_target_type: str) -> str:
+        if self.class_coverage_policy == "auto":
+            return (
+                "preserve_local_classes"
+                if resolved_target_type == "classification"
+                else "off"
+            )
+        if (
+            self.class_coverage_policy == "preserve_local_classes"
+            and resolved_target_type != "classification"
+        ):
+            raise ValueError(
+                "class_coverage_policy='preserve_local_classes' requires a "
+                "classification target"
+            )
+        return self.class_coverage_policy
 
     def _cluster_selection_capacity(self, cluster_size: int) -> int:
         target_size = int(math.ceil(cluster_size * self.chunk_fraction))
@@ -1346,6 +1425,29 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         return select_partition_indices(
             cluster_idx,
             target_size=resolved_target_size,
+            selection_method=self.selection_method,
+            scores=scores,
+            embedding=self.sample_embedding_,
+            random_state=random_state,
+            leverage_cap_quantile=self.leverage_cap_quantile,
+        )
+
+    def _select_class_aware_from_cluster(
+        self,
+        cluster_idx: np.ndarray,
+        scores: np.ndarray,
+        target: np.ndarray,
+        *,
+        target_size: int,
+        random_state: int | np.random.Generator | None,
+    ) -> ClassCoverageSelectionPlan:
+        if self.sample_embedding_ is None:
+            raise RuntimeError("Sample embedding is not available")
+        return select_class_aware_partition_indices(
+            cluster_idx,
+            target=target,
+            target_size=target_size,
+            min_samples_per_class=self.min_samples_per_class,
             selection_method=self.selection_method,
             scores=scores,
             embedding=self.sample_embedding_,
@@ -1486,6 +1588,18 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             "class_distribution_drift_weight": float(
                 self.class_distribution_drift_weight
             ),
+            "class_coverage_policy": self.class_coverage_policy,
+            "resolved_class_coverage_policy": (
+                self.resolved_class_coverage_policy_
+            ),
+            "min_samples_per_class": int(self.min_samples_per_class),
+            "class_coverage_guaranteed": bool(
+                self.class_coverage_guaranteed_
+            ),
+            "class_coverage_by_partition": {
+                name: plan.to_dict()
+                for name, plan in self.class_coverage_selection_plans_.items()
+            },
             "validation_proxy_fraction": float(
                 self.validation_proxy_fraction
             ),

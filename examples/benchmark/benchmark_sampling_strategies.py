@@ -268,6 +268,8 @@ def make_chunking_strategy_configs(
                 "missing_class_penalty_weight": 0.25,
                 "single_class_penalty_weight": 0.50,
                 "class_distribution_drift_weight": 0.25,
+                "class_coverage_policy": "auto",
+                "min_samples_per_class": 1,
                 "cluster_vote_temperature": 0.05,
                 "projection_dim": 8,
                 "initial_rank_fraction": 0.25,

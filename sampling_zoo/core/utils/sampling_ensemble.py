@@ -2,9 +2,9 @@
 import pickle
 import os
 from time import perf_counter
-from scipy.stats import mode
 import pandas as pd
 import numpy as np
+from scipy.stats import mode
 from typing import List, Dict, Any, Optional, Callable
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 
@@ -15,6 +15,9 @@ from sampling_zoo.core.experiment.contracts import (
     PartitionTrainingRequest,
     PartitionTrainingResult,
     RuntimeDiagnosticsContract,
+)
+from sampling_zoo.core.experiment.errors import (
+    ClassificationProbabilitiesRequiredError,
 )
 from sampling_zoo.core.experiment.morphisms import (
     chunk_models_to_contracts,
@@ -86,6 +89,8 @@ class SamplingEnsemble:
         self.runtime_diagnostics_ = {}
         self.runtime_contract_ = None
         self.partition_size_diagnostics_contract_ = None
+        self.classes_ = None
+        self.class_coverage_repairs_ = {}
 
     def _log(self, message: str) -> None:
         progress_write(message, enabled=self.show_progress)
@@ -489,6 +494,11 @@ class SamplingEnsemble:
         )
 
     def _build_partition_target_diagnostics(self, partitions: Dict[str, Any], target: pd.Series) -> Dict[str, Any]:
+        if self.problem == 'classification':
+            return self._build_classification_partition_diagnostics(
+                partitions,
+                target,
+            )
         global_values = self._numeric_target_values(target)
         global_summary = self._target_summary(global_values)
         global_quantiles = global_summary.get('quantiles', {})
@@ -531,6 +541,94 @@ class SamplingEnsemble:
             'chunks': chunk_diagnostics,
         }
 
+    def _build_classification_partition_diagnostics(
+        self,
+        partitions: Dict[str, Any],
+        target: pd.Series,
+    ) -> Dict[str, Any]:
+        global_values = np.asarray(target).reshape(-1)
+        classes, global_counts = np.unique(global_values, return_counts=True)
+        global_distribution = global_counts / max(global_counts.sum(), 1)
+        chunks: Dict[str, Any] = {}
+        sizes: List[int] = []
+        missing_chunk_count = 0
+        single_class_count = 0
+        drifts: List[float] = []
+
+        for name, partition_data in partitions.items():
+            chunk_values = self._partition_raw_target_values(partition_data)
+            class_counts = np.asarray(
+                [np.sum(chunk_values == label) for label in classes],
+                dtype=int,
+            )
+            size = int(class_counts.sum())
+            sizes.append(size)
+            present_mask = class_counts > 0
+            missing = [
+                str(label)
+                for label, present in zip(classes, present_mask)
+                if not present
+            ]
+            if missing:
+                missing_chunk_count += 1
+            single_class = int(np.sum(present_mask)) <= 1
+            if single_class:
+                single_class_count += 1
+            chunk_distribution = class_counts / max(size, 1)
+            drift = float(
+                0.5 * np.sum(np.abs(chunk_distribution - global_distribution))
+            )
+            drifts.append(drift)
+            positive_counts = class_counts[present_mask]
+            chunks[str(name)] = {
+                'count': size,
+                'class_counts': {
+                    str(label): int(count)
+                    for label, count in zip(classes, class_counts)
+                },
+                'present_classes': [
+                    str(label)
+                    for label, present in zip(classes, present_mask)
+                    if present
+                ],
+                'missing_classes': missing,
+                'single_class_chunk': bool(single_class),
+                'min_present_class_count': (
+                    int(np.min(positive_counts))
+                    if positive_counts.size
+                    else 0
+                ),
+                'class_distribution_drift': drift,
+            }
+
+        sampler_diagnostics = getattr(self.partitioner, 'diagnostics_', {}) or {}
+        return {
+            'global_target': {
+                'count': int(global_values.size),
+                'n_classes': int(classes.size),
+                'classes': [str(label) for label in classes],
+                'class_counts': {
+                    str(label): int(count)
+                    for label, count in zip(classes, global_counts)
+                },
+            },
+            'chunk_size_imbalance': self._chunk_size_imbalance(sizes),
+            'class_balance_summary': {
+                'chunks_with_missing_classes': int(missing_chunk_count),
+                'single_class_chunks': int(single_class_count),
+                'class_distribution_drift_avg': (
+                    float(np.mean(drifts)) if drifts else None
+                ),
+                'class_distribution_drift_max': (
+                    float(np.max(drifts)) if drifts else None
+                ),
+            },
+            'sampler_class_coverage': dict(
+                sampler_diagnostics.get('class_coverage_by_partition', {})
+            ),
+            'chunks': chunks,
+        }
+
     @staticmethod
     def _numeric_target_values(target: Any) -> np.ndarray:
         values = pd.to_numeric(pd.Series(target), errors='coerce').to_numpy(dtype=float)
@@ -541,6 +639,12 @@ class SamplingEnsemble:
         if isinstance(partition_data, dict) and 'target' in partition_data:
             return SamplingEnsemble._numeric_target_values(partition_data['target'])
         return np.asarray([], dtype=float)
+
+    @staticmethod
+    def _partition_raw_target_values(partition_data: Any) -> np.ndarray:
+        if isinstance(partition_data, dict) and 'target' in partition_data:
+            return np.asarray(partition_data['target']).reshape(-1)
+        return np.asarray([], dtype=object)
 
     @staticmethod
     def _target_summary(values: np.ndarray) -> Dict[str, Any]:
@@ -639,6 +743,113 @@ class SamplingEnsemble:
             raise ValueError("Model class is not configured.")
         return self.model_class(**self.model_params)
 
+    def _ensure_classification_classes(self, y_train: Any, y_val: Any = None) -> None:
+        if self.problem != 'classification':
+            return
+        values = [pd.Series(y_train)]
+        if y_val is not None:
+            values.append(pd.Series(y_val))
+        combined = pd.concat(values, ignore_index=True).dropna()
+        self.classes_ = np.asarray(np.unique(combined.to_numpy()))
+
+    def _classification_classes(self) -> np.ndarray:
+        if self.classes_ is not None:
+            return np.asarray(self.classes_)
+        observed = []
+        for model_info in self.models:
+            model_classes = model_info.get('classes')
+            if model_classes is not None:
+                observed.extend(np.asarray(model_classes).tolist())
+        if observed:
+            self.classes_ = np.asarray(np.unique(observed))
+            return np.asarray(self.classes_)
+        raise ClassificationProbabilitiesRequiredError(
+            scope="SamplingEnsemble.classes",
+            message="Global classification labels are not initialized.",
+        )
+
+    def _labels_from_proba(self, probabilities: np.ndarray) -> np.ndarray:
+        classes = self._classification_classes()
+        return classes[np.argmax(probabilities, axis=1)]
+
+    def _predict_model_proba(
+        self,
+        model: Callable,
+        features: pd.DataFrame,
+        *,
+        model_name: str = "model",
+    ) -> np.ndarray:
+        if not hasattr(model, 'predict_proba'):
+            raise ClassificationProbabilitiesRequiredError(
+                scope=f"SamplingEnsemble.{model_name}",
+                details={"model": type(model).__name__},
+            )
+        probabilities = np.asarray(model.predict_proba(features), dtype=float)
+        return self._align_model_proba(
+            probabilities,
+            getattr(model, 'classes_', None),
+            model_name=model_name,
+        )
+
+    def _align_model_proba(
+        self,
+        probabilities: np.ndarray,
+        model_classes: Any,
+        *,
+        model_name: str = "model",
+    ) -> np.ndarray:
+        global_classes = self._classification_classes()
+        if probabilities.ndim != 2 or probabilities.shape[1] == 0:
+            raise ClassificationProbabilitiesRequiredError(
+                scope=f"SamplingEnsemble.{model_name}",
+                message="predict_proba returned an invalid probability matrix.",
+                details={"shape": tuple(probabilities.shape)},
+            )
+        if model_classes is None:
+            if probabilities.shape[1] != global_classes.size:
+                raise ClassificationProbabilitiesRequiredError(
+                    scope=f"SamplingEnsemble.{model_name}",
+                    message="Probability columns cannot be aligned without classes_.",
+                    details={
+                        "probability_columns": int(probabilities.shape[1]),
+                        "global_classes": int(global_classes.size),
+                    },
+                )
+            model_classes = global_classes
+
+        model_classes = np.asarray(model_classes)
+        if model_classes.size != probabilities.shape[1]:
+            raise ClassificationProbabilitiesRequiredError(
+                scope=f"SamplingEnsemble.{model_name}",
+                message="classes_ does not align with predict_proba columns.",
+                details={
+                    "probability_columns": int(probabilities.shape[1]),
+                    "model_classes": int(model_classes.size),
+                },
+            )
+
+        aligned = np.zeros(
+            (probabilities.shape[0], global_classes.size),
+            dtype=float,
+        )
+        for model_index, label in enumerate(model_classes):
+            matches = np.where(global_classes == label)[0]
+            if matches.size != 1:
+                raise ClassificationProbabilitiesRequiredError(
+                    scope=f"SamplingEnsemble.{model_name}",
+                    message="Model exposes a class absent from the global class set.",
+                    details={"model_class": str(label)},
+                )
+            aligned[:, int(matches[0])] = probabilities[:, model_index]
+
+        aligned = np.clip(aligned, 1e-15, 1.0)
+        row_sums = aligned.sum(axis=1, keepdims=True)
+        return np.where(
+            row_sums > 0,
+            aligned / row_sums,
+            1.0 / max(global_classes.size, 1),
+        )
+
     def _run_inference(self, fitted_model: Callable, test_data: pd.DataFrame,
                        calculation_mode: str = 'batch', batch_size: int = None):
         if calculation_mode == 'batch':
@@ -656,12 +867,8 @@ class SamplingEnsemble:
                     predict_labels.append(labels)
                     predict_proba.append(labels)
                 else:
-                    proba = fitted_model.predict_proba(batch)
-                    classes = getattr(fitted_model, "classes_", None)
-                    if classes is not None:
-                        labels = classes[np.argmax(proba, axis=1)]
-                    else:
-                        labels = np.argmax(proba, axis=1)
+                    proba = self._predict_model_proba(fitted_model, batch)
+                    labels = self._labels_from_proba(proba)
                     predict_labels.append(labels)
                     predict_proba.append(proba)
             return np.concatenate(predict_labels), np.concatenate(predict_proba)
@@ -670,12 +877,8 @@ class SamplingEnsemble:
                 labels = fitted_model.predict(test_data)
                 proba = labels
             else:
-                proba = fitted_model.predict_proba(test_data)
-                classes = getattr(fitted_model, "classes_", None)
-                if classes is not None:
-                    labels = classes[np.argmax(proba, axis=1)]
-                else:
-                    labels = np.argmax(proba, axis=1)
+                proba = self._predict_model_proba(fitted_model, test_data)
+                labels = self._labels_from_proba(proba)
             return labels, proba
         else:
             raise ValueError("Calculation mode must be 'batch' or 'non-batch'")
@@ -738,6 +941,8 @@ class SamplingEnsemble:
         Train one model per prepared data partition.
         """
         training_started = perf_counter()
+        self._ensure_classification_classes(y_train, y_val)
+        self.class_coverage_repairs_ = {}
         started = perf_counter()
         partitions = self._load_or_prepare_partitions(
             X_train=X_train,
@@ -937,6 +1142,8 @@ class SamplingEnsemble:
                     train_all_chunks=train_all_chunks,
                 ):
                     break
+            except ClassificationProbabilitiesRequiredError:
+                raise
             except Exception as exc:
                 self._log(f"Error while training chunk {partition_name}: {str(exc)}")
                 continue
@@ -978,7 +1185,11 @@ class SamplingEnsemble:
         save_models_to_disk: bool,
     ) -> Dict[str, Any]:
         self._log(f"Training model for chunk {partition_name}...")
-        partition_data = self._ensure_partition_class_coverage(partition_data, class_samples)
+        partition_data = self._ensure_partition_class_coverage(
+            partition_name,
+            partition_data,
+            class_samples,
+        )
         model = self._create_model_instance()
         fit_started = perf_counter()
         model.fit(partition_data['feature'], partition_data['target'])
@@ -993,6 +1204,11 @@ class SamplingEnsemble:
             problem_type=self.problem,
             y_labels=predict_labels,
             y_proba=predict_proba if self.problem == "classification" else None,
+            classes=(
+                self._classification_classes()
+                if self.problem == "classification"
+                else None
+            ),
         )
         model_info = self._build_partition_model_info(
             partition_name,
@@ -1000,6 +1216,7 @@ class SamplingEnsemble:
             partition_data,
             metrics,
             predict_labels,
+            predict_proba,
             timings={
                 'fit': model_fit_time,
                 'validation_inference': validation_inference_time,
@@ -1009,10 +1226,78 @@ class SamplingEnsemble:
         self._log_partition_model_result(partition_name, model_info, metrics)
         return model_info
 
-    def _ensure_partition_class_coverage(self, partition_data: Dict[str, Any], class_samples: Any) -> Dict[str, Any]:
+    def _ensure_partition_class_coverage(
+        self,
+        partition_name: str,
+        partition_data: Dict[str, Any],
+        class_samples: Any,
+    ) -> Dict[str, Any]:
+        before = self._class_count_map(partition_data.get('target', []))
+        if getattr(self.partitioner, 'class_coverage_guaranteed_', False):
+            self._record_class_coverage_repair(
+                partition_name,
+                before,
+                before,
+                status='sampler_guaranteed',
+            )
+            return partition_data
         if self.problem == 'classification' and class_samples:
-            return self.ensure_all_classes_in_chunk(partition_data, class_samples)
+            repaired = self.ensure_all_classes_in_chunk(
+                partition_data,
+                class_samples,
+            )
+            self._record_class_coverage_repair(
+                partition_name,
+                before,
+                self._class_count_map(repaired.get('target', [])),
+                status='representatives_added',
+            )
+            return repaired
+        self._record_class_coverage_repair(
+            partition_name,
+            before,
+            before,
+            status='not_applied',
+        )
         return partition_data
+
+    @staticmethod
+    def _class_count_map(target: Any) -> Dict[str, int]:
+        values = np.asarray(target).reshape(-1)
+        if values.size == 0:
+            return {}
+        classes, counts = np.unique(values, return_counts=True)
+        return {
+            str(label): int(count)
+            for label, count in zip(classes, counts)
+        }
+
+    def _record_class_coverage_repair(
+        self,
+        partition_name: str,
+        before: Dict[str, int],
+        after: Dict[str, int],
+        *,
+        status: str,
+    ) -> None:
+        all_classes = set(before) | set(after)
+        rows_before = int(sum(before.values()))
+        rows_after = int(sum(after.values()))
+        self.class_coverage_repairs_[str(partition_name)] = {
+            'status': status,
+            'class_counts_before': dict(before),
+            'class_counts_after': dict(after),
+            'missing_classes_before': sorted(
+                label for label in all_classes if before.get(label, 0) == 0
+            ),
+            'missing_classes_after': sorted(
+                label for label in all_classes if after.get(label, 0) == 0
+            ),
+            'rows_added': int(rows_after - rows_before),
+        }
+        self.partition_diagnostics_['class_coverage_repairs'] = dict(
+            self.class_coverage_repairs_
+        )
 
     @staticmethod
     def _build_partition_model_info(
@@ -1021,6 +1306,7 @@ class SamplingEnsemble:
         partition_data: Dict[str, Any],
         metrics: Dict[str, Any],
         predict_labels: np.ndarray,
+        predict_proba: Optional[np.ndarray] = None,
         timings: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
         return {
@@ -1029,6 +1315,8 @@ class SamplingEnsemble:
             'data_size': len(partition_data['feature']),
             'metrics': metrics,
             'val_predictions': predict_labels,
+            'val_probabilities': predict_proba,
+            'classes': getattr(model, 'classes_', None),
             'timings': dict(timings or {}),
         }
 
@@ -1053,12 +1341,26 @@ class SamplingEnsemble:
             pickle.dump(model, handle)
 
     def _evaluate_current_ensemble(self, X_val: pd.DataFrame, y_val: pd.Series) -> Dict[str, Any]:
-        predictions = self.ensemble_predict(X_val, stage='validation')
+        probabilities = (
+            self.ensemble_predict_proba(X_val, stage='validation')
+            if self.problem == 'classification'
+            else None
+        )
+        predictions = (
+            self._labels_from_proba(probabilities)
+            if probabilities is not None
+            else self.ensemble_predict(X_val, stage='validation')
+        )
         return calculate_metrics(
             y_true=y_val,
             y_labels=predictions,
-            y_proba=None,
+            y_proba=probabilities,
             problem_type=self.problem,
+            classes=(
+                self._classification_classes()
+                if self.problem == 'classification'
+                else None
+            ),
         )
 
     @staticmethod
@@ -1239,13 +1541,35 @@ class SamplingEnsemble:
             selected_models = [self.models[i] for i in indices]
             if not selected_models:
                 return None
-            preds = self.ensemble_predict(X_val, stage='validation', models=selected_models)
+            probabilities = (
+                self.ensemble_predict_proba(
+                    X_val,
+                    stage='validation',
+                    models=selected_models,
+                )
+                if self.problem == 'classification'
+                else None
+            )
+            preds = (
+                self._labels_from_proba(probabilities)
+                if probabilities is not None
+                else self.ensemble_predict(
+                    X_val,
+                    stage='validation',
+                    models=selected_models,
+                )
+            )
 
             return calculate_metrics(
                 y_true=y_val,
                 y_labels=preds,
-                y_proba=None,
+                y_proba=probabilities,
                 problem_type=self.problem,
+                classes=(
+                    self._classification_classes()
+                    if self.problem == 'classification'
+                    else None
+                ),
             )[validation_metric]
 
         with progress_bar(
@@ -1366,7 +1690,7 @@ class SamplingEnsemble:
             partitioner=self.partitioner,
         )
 
-    def ensemble_predict(self, features: pd.DataFrame, stage: str = 'inference', models: Optional[List[Dict[str, Any]]] = None) -> np.ndarray:
+    def _legacy_ensemble_predict(self, features: pd.DataFrame, stage: str = 'inference', models: Optional[List[Dict[str, Any]]] = None) -> np.ndarray:
         """
         Ансамблирование предсказаний всех моделей
         """
@@ -1461,6 +1785,215 @@ class SamplingEnsemble:
         else:
             raise ValueError(f"Неизвестный метод ансамблирования: {self.ensemble_method}")
 
+    def _ensure_active_models(
+        self,
+        models: Optional[List[Dict[str, Any]]],
+    ) -> List[Dict[str, Any]]:
+        active_models = list(self.models if models is None else models)
+        if not active_models:
+            raise ValueError(
+                "No trained chunk models are available. Call "
+                "train_partition_models() first."
+            )
+        return active_models
+
+    @staticmethod
+    def _normalize_combined_weights(
+        weights: np.ndarray,
+        n_models: int,
+    ) -> np.ndarray:
+        row_sums = weights.sum(axis=1, keepdims=True)
+        return np.where(
+            row_sums > 0,
+            weights / row_sums,
+            1.0 / max(n_models, 1),
+        )
+
+    def _combined_routing_weights(
+        self,
+        features: pd.DataFrame,
+        active_models: List[Dict[str, Any]],
+    ) -> np.ndarray:
+        validation_weights = self._validation_weights(active_models)
+        routing_weights = self._routing_weights(features, active_models)
+        combined = (
+            routing_weights
+            if self.router.weights_are_final()
+            else routing_weights * validation_weights.reshape(1, -1)
+        )
+        return self._normalize_combined_weights(combined, len(active_models))
+
+    def _model_proba_predictions(
+        self,
+        features: pd.DataFrame,
+        stage: str,
+        active_models: List[Dict[str, Any]],
+    ) -> List[np.ndarray]:
+        probabilities: List[np.ndarray] = []
+        for model_info in active_models:
+            name = str(model_info.get('name', 'model'))
+            if stage == 'validation':
+                stored = model_info.get('val_probabilities')
+                if stored is None:
+                    raise ClassificationProbabilitiesRequiredError(
+                        scope=f"SamplingEnsemble.{name}",
+                        message="Validation probabilities were not stored for a chunk model.",
+                    )
+                value = np.asarray(stored, dtype=float)
+                expected_columns = self._classification_classes().size
+                if value.ndim != 2 or value.shape[1] != expected_columns:
+                    raise ClassificationProbabilitiesRequiredError(
+                        scope=f"SamplingEnsemble.{name}",
+                        message="Stored validation probabilities are not globally aligned.",
+                        details={"shape": tuple(value.shape)},
+                    )
+                probabilities.append(value)
+            elif stage == 'inference':
+                probabilities.append(
+                    self._predict_model_proba(
+                        model_info['model'],
+                        features,
+                        model_name=name,
+                    )
+                )
+            else:
+                raise ValueError("stage must be 'validation' or 'inference'")
+        return probabilities
+
+    def ensemble_predict_proba(
+        self,
+        features: pd.DataFrame,
+        stage: str = 'inference',
+        models: Optional[List[Dict[str, Any]]] = None,
+    ) -> np.ndarray:
+        """Return class-aligned probabilities for a classification ensemble."""
+
+        if self.problem != 'classification':
+            raise ValueError(
+                "ensemble_predict_proba is only available for classification"
+            )
+        active_models = self._ensure_active_models(models)
+        model_probabilities = self._model_proba_predictions(
+            features,
+            stage,
+            active_models,
+        )
+        if self.ensemble_method == 'voting':
+            probabilities = np.mean(model_probabilities, axis=0)
+        elif self.ensemble_method == 'weighted':
+            probabilities = np.average(
+                model_probabilities,
+                axis=0,
+                weights=self._validation_weights(active_models),
+            )
+        elif self.ensemble_method == 'routed_weighted':
+            combined_weights = self._combined_routing_weights(
+                features,
+                active_models,
+            )
+            probabilities = np.zeros_like(model_probabilities[0], dtype=float)
+            for model_index, model_proba in enumerate(model_probabilities):
+                probabilities += (
+                    model_proba
+                    * combined_weights[:, model_index:model_index + 1]
+                )
+        else:
+            raise ValueError(f"Unknown ensemble method: {self.ensemble_method}")
+
+        probabilities = np.clip(
+            np.asarray(probabilities, dtype=float),
+            1e-15,
+            1.0,
+        )
+        row_sums = probabilities.sum(axis=1, keepdims=True)
+        return np.where(
+            row_sums > 0,
+            probabilities / row_sums,
+            1.0 / probabilities.shape[1],
+        )
+
+    def ensemble_predict(
+        self,
+        features: pd.DataFrame,
+        stage: str = 'inference',
+        models: Optional[List[Dict[str, Any]]] = None,
+    ) -> np.ndarray:
+        active_models = self._ensure_active_models(models)
+        if self.problem == 'classification':
+            return self._labels_from_proba(
+                self.ensemble_predict_proba(
+                    features,
+                    stage=stage,
+                    models=active_models,
+                )
+            )
+
+        predictions = [
+            (
+                np.asarray(model_info['val_predictions'])
+                if stage == 'validation'
+                else np.asarray(model_info['model'].predict(features))
+            )
+            for model_info in active_models
+        ]
+        if self.ensemble_method == 'voting':
+            return np.mean(predictions, axis=0)
+        if self.ensemble_method == 'weighted':
+            return np.average(
+                predictions,
+                axis=0,
+                weights=self._validation_weights(active_models),
+            )
+        if self.ensemble_method == 'routed_weighted':
+            combined_weights = self._combined_routing_weights(
+                features,
+                active_models,
+            )
+            return np.sum(
+                np.column_stack(predictions) * combined_weights,
+                axis=1,
+            )
+        raise ValueError(f"Unknown ensemble method: {self.ensemble_method}")
+
+    def ensemble_predict_proba_batch(
+        self,
+        features: pd.DataFrame,
+        stage: str = 'inference',
+        models: Optional[List[Dict[str, Any]]] = None,
+        batch_size: Optional[int] = None,
+    ) -> np.ndarray:
+        if stage == 'validation':
+            return self.ensemble_predict_proba(
+                features,
+                stage=stage,
+                models=models,
+            )
+        batch_size = batch_size or self.bs_size
+        total_batches = (len(features) + batch_size - 1) // batch_size
+        batches = []
+        batch_iter = progress_iter(
+            range(total_batches),
+            enabled=self.show_progress,
+            total=total_batches,
+            desc="Ensemble probability batches",
+        )
+        for batch_index in batch_iter:
+            start = batch_index * batch_size
+            end = min(start + batch_size, len(features))
+            batch = (
+                features.iloc[start:end]
+                if isinstance(features, pd.DataFrame)
+                else features[start:end]
+            )
+            batches.append(
+                self.ensemble_predict_proba(
+                    batch,
+                    stage=stage,
+                    models=models,
+                )
+            )
+        return np.vstack(batches)
+
     def ensemble_predict_batch(
             self,
             features: pd.DataFrame,
@@ -1468,6 +2001,12 @@ class SamplingEnsemble:
             models: Optional[List[Dict[str, Any]]] = None,
             batch_size: Optional[int] = None,
     ) -> np.ndarray:
+        if stage == 'validation':
+            return self.ensemble_predict(
+                features,
+                stage=stage,
+                models=models,
+            )
         batch_size = batch_size or self.bs_size
         n_samples = len(features)
         batches = []

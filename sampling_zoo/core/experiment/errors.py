@@ -39,6 +39,26 @@ class EmptyExperimentInputError(ExperimentContractError):
     """Expected empty dataset, partition, or model collection failure."""
 
 
+class ClassificationProbabilitiesRequiredError(ExperimentContractError):
+    """A classification benchmark model cannot provide aligned probabilities."""
+
+    def __init__(
+        self,
+        *,
+        scope: str,
+        message: str = (
+            "Classification benchmarking requires predict_proba output."
+        ),
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(
+            scope=scope,
+            message=message,
+            code="classification_probabilities_required",
+            details={} if details is None else details,
+        )
+
+
 class ResumeContractError(ExperimentContractError):
     """Invalid resume record, policy, or state transition."""
 

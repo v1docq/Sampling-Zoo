@@ -19,7 +19,13 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from sampling_zoo.core.metrics.eval_metrics import calculate_metrics
+from sampling_zoo.core.metrics.eval_metrics import (
+    calculate_metrics,
+    primary_classification_metric,
+)
+from sampling_zoo.core.experiment.errors import (
+    ClassificationProbabilitiesRequiredError,
+)
 from sampling_zoo.core.experiment.contracts import StrategyGridContract
 from sampling_zoo.core.experiment.morphisms import (
     dataset_to_contract,
@@ -662,7 +668,17 @@ class EnsembleFoldBenchmarkExecutor:
         fold_stage.update(1)
 
         infer_started = perf_counter()
-        predictions, y_proba = self._predict_direct_model(model, X_test_df, dataset.problem_type)
+        direct_classes = (
+            np.unique(np.asarray(fold.y_train))
+            if dataset.problem_type == "classification"
+            else None
+        )
+        predictions, y_proba = self._predict_direct_model(
+            model,
+            X_test_df,
+            dataset.problem_type,
+            classes=direct_classes,
+        )
         infer_time = perf_counter() - infer_started
         fold_stage.update(1)
 
@@ -671,6 +687,11 @@ class EnsembleFoldBenchmarkExecutor:
             y_labels=predictions,
             y_proba=y_proba if dataset.problem_type == "classification" else None,
             problem_type=dataset.problem_type,
+            classes=(
+                direct_classes
+                if dataset.problem_type == "classification"
+                else None
+            ),
         )
         sample_stats = self._build_train_sample_stats(
             y_train=fold.y_train,
@@ -695,16 +716,52 @@ class EnsembleFoldBenchmarkExecutor:
         return payload
 
     @staticmethod
-    def _predict_direct_model(model: Any, X_test_df: pd.DataFrame, problem_type: str) -> tuple[Any, Any]:
+    def _predict_direct_model(
+        model: Any,
+        X_test_df: pd.DataFrame,
+        problem_type: str,
+        *,
+        classes: Optional[np.ndarray] = None,
+    ) -> tuple[Any, Any]:
         if problem_type != "classification":
             return model.predict(X_test_df), None
 
-        y_proba = model.predict_proba(X_test_df) if hasattr(model, "predict_proba") else None
-        if y_proba is not None and getattr(y_proba, "ndim", 0) == 2 and y_proba.shape[1] > 0:
-            classes = np.asarray(getattr(model, "classes_", np.arange(y_proba.shape[1])))
-            if classes.shape[0] == y_proba.shape[1]:
-                return classes[np.argmax(y_proba, axis=1)], y_proba
-        return model.predict(X_test_df), y_proba
+        if not hasattr(model, "predict_proba"):
+            raise ClassificationProbabilitiesRequiredError(
+                scope="EnsembleFoldBenchmarkExecutor.direct_model",
+                details={"model": type(model).__name__},
+            )
+        y_proba = np.asarray(model.predict_proba(X_test_df), dtype=float)
+        model_classes = getattr(model, "classes_", None)
+        global_classes = (
+            np.asarray(classes)
+            if classes is not None
+            else np.asarray(model_classes)
+        )
+        if (
+            y_proba.ndim == 2
+            and y_proba.shape[1] > 0
+            and model_classes is not None
+            and len(model_classes) == y_proba.shape[1]
+        ):
+            aligned = np.zeros((y_proba.shape[0], global_classes.size), dtype=float)
+            for model_index, label in enumerate(np.asarray(model_classes)):
+                matches = np.where(global_classes == label)[0]
+                if matches.size != 1:
+                    raise ClassificationProbabilitiesRequiredError(
+                        scope="EnsembleFoldBenchmarkExecutor.direct_model",
+                        message="Direct model classes cannot be aligned.",
+                        details={"model_class": str(label)},
+                    )
+                aligned[:, int(matches[0])] = y_proba[:, model_index]
+            aligned = np.clip(aligned, 1e-15, 1.0)
+            aligned /= aligned.sum(axis=1, keepdims=True)
+            return global_classes[np.argmax(aligned, axis=1)], aligned
+        raise ClassificationProbabilitiesRequiredError(
+            scope="EnsembleFoldBenchmarkExecutor.direct_model",
+            message="Direct model returned probabilities that cannot be aligned.",
+            details={"model": type(model).__name__},
+        )
 
     def _run_ensemble_fold(
         self,
@@ -741,7 +798,11 @@ class EnsembleFoldBenchmarkExecutor:
             y_val=fold.y_val,
             class_samples=class_samples,
             cv_fold=fold.fold_idx,
-            validation_metric="f1_weighted" if dataset.problem_type == "classification" else "rmse",
+            validation_metric=(
+                primary_classification_metric(np.unique(np.asarray(fold.y_train)))
+                if dataset.problem_type == "classification"
+                else "rmse"
+            ),
             train_all_chunks=True,
             save_models_to_disk=False,
         )
@@ -749,7 +810,19 @@ class EnsembleFoldBenchmarkExecutor:
         fold_stage.update(1)
 
         infer_started = perf_counter()
-        predictions = ensemble.ensemble_predict_batch(X_test_df, batch_size=10000)
+        y_proba = (
+            ensemble.ensemble_predict_proba_batch(
+                X_test_df,
+                batch_size=10000,
+            )
+            if dataset.problem_type == "classification"
+            else None
+        )
+        predictions = (
+            ensemble._labels_from_proba(y_proba)
+            if y_proba is not None
+            else ensemble.ensemble_predict_batch(X_test_df, batch_size=10000)
+        )
         infer_time = perf_counter() - infer_started
         test_routing_diagnostics = ensemble.build_routing_diagnostics(X_test_df)
         fold_stage.update(1)
@@ -757,8 +830,13 @@ class EnsembleFoldBenchmarkExecutor:
         model_metrics = calculate_metrics(
             y_true=fold.y_test,
             y_labels=predictions,
-            y_proba=None,
+            y_proba=y_proba,
             problem_type=dataset.problem_type,
+            classes=(
+                ensemble._classification_classes()
+                if dataset.problem_type == "classification"
+                else None
+            ),
         )
         sample_stats, chunk_sizes = self._build_ensemble_sample_stats(
             ensemble=ensemble,
@@ -1024,6 +1102,12 @@ class EnsembleFoldBenchmarkExecutor:
                 "effective_partitions": plan.effective_partitions,
                 "chunks_percent": plan.chunks_percent,
                 "error": str(error),
+                "error_code": getattr(error, "code", type(error).__name__),
+                "error_details": (
+                    error.to_dict()
+                    if hasattr(error, "to_dict")
+                    else {}
+                ),
             },
         )
 
@@ -1036,6 +1120,11 @@ class EnsembleFoldBenchmarkExecutor:
         partitioner_config: Mapping[str, Any],
     ) -> dict[str, Any]:
         task_id = getattr(dataset, "task_id", None)
+        classification_classes = (
+            np.unique(np.asarray(fold.y_train))
+            if dataset.problem_type == "classification"
+            else np.asarray([])
+        )
         leaf_run = self._leaf_run_key(
             dataset=dataset,
             strategy_name=strategy_name,
@@ -1045,6 +1134,16 @@ class EnsembleFoldBenchmarkExecutor:
         )
         return {
             "problem_type": dataset.problem_type,
+            "n_classes": (
+                int(classification_classes.size)
+                if dataset.problem_type == "classification"
+                else None
+            ),
+            "primary_metric": (
+                primary_classification_metric(classification_classes)
+                if dataset.problem_type == "classification"
+                else "rmse"
+            ),
             "strategy": strategy_name,
             "model": model_name,
             "cv_fold": self._fold_value(fold),

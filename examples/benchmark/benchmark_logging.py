@@ -188,8 +188,8 @@ class BenchmarkLogger:
                     "",
                     "## Classification",
                     "",
-                    "| Dataset | Strategy | ROC-AUC | F1 macro | F1 weighted | fit(s) | sample(s) | inference(s) |",
-                    "|---|---|---:|---:|---:|---:|---:|---:|",
+                    "| Dataset | Strategy | ROC-AUC | Log loss | F1 macro | F1 weighted | fit(s) | sample(s) | inference(s) |",
+                    "|---|---|---:|---:|---:|---:|---:|---:|---:|",
                 ]
             )
             for record in classification_records:
@@ -198,10 +198,11 @@ class BenchmarkLogger:
                 metrics = record.get("model_metrics", {})
                 timings = record.get("timings_sec", {})
                 lines.append(
-                    "| {dataset} | {strategy} | {roc_auc:.4f} | {f1_macro:.4f} | {f1_weighted:.4f} | {fit:.4f} | {sample:.4f} | {inference:.4f} |".format(
+                    "| {dataset} | {strategy} | {roc_auc:.4f} | {log_loss:.4f} | {f1_macro:.4f} | {f1_weighted:.4f} | {fit:.4f} | {sample:.4f} | {inference:.4f} |".format(
                         dataset=dataset_name,
                         strategy=record.get("strategy", "-"),
                         roc_auc=float(metrics.get("roc_auc", float("nan"))),
+                        log_loss=float(metrics.get("log_loss", float("nan"))),
                         f1_macro=float(metrics.get("f1_macro", float("nan"))),
                         f1_weighted=float(metrics.get("f1_weighted", float("nan"))),
                         fit=float(timings.get("fit", 0.0)),
@@ -249,11 +250,22 @@ class BenchmarkLogger:
                 lines.append(f"- Worst (RMSE): **{worst.get('strategy', '-') }** ({float(worst.get('model_metrics', {}).get('rmse', float('nan'))):.4f})")
                 lines.append("")
             else:
-                best = max(dataset_records, key=lambda r: float(r.get("model_metrics", {}).get("f1_macro", float("-inf"))))
-                worst = min(dataset_records, key=lambda r: float(r.get("model_metrics", {}).get("f1_macro", float("inf"))))
+                has_binary_auc = any(
+                    np.isfinite(
+                        float(record.get("model_metrics", {}).get("roc_auc", float("nan")))
+                    )
+                    for record in dataset_records
+                )
+                primary_metric = "roc_auc" if has_binary_auc else "log_loss"
+                if primary_metric == "roc_auc":
+                    best = max(dataset_records, key=lambda r: float(r.get("model_metrics", {}).get(primary_metric, float("-inf"))))
+                    worst = min(dataset_records, key=lambda r: float(r.get("model_metrics", {}).get(primary_metric, float("inf"))))
+                else:
+                    best = min(dataset_records, key=lambda r: float(r.get("model_metrics", {}).get(primary_metric, float("inf"))))
+                    worst = max(dataset_records, key=lambda r: float(r.get("model_metrics", {}).get(primary_metric, float("-inf"))))
                 lines.append(f"### {dataset_name}")
-                lines.append(f"- Best (F1 macro): **{best.get('strategy', '-') }** ({float(best.get('model_metrics', {}).get('f1_macro', float('nan'))):.4f})")
-                lines.append(f"- Worst (F1 macro): **{worst.get('strategy', '-') }** ({float(worst.get('model_metrics', {}).get('f1_macro', float('nan'))):.4f})")
+                lines.append(f"- Best ({primary_metric}): **{best.get('strategy', '-') }** ({float(best.get('model_metrics', {}).get(primary_metric, float('nan'))):.4f})")
+                lines.append(f"- Worst ({primary_metric}): **{worst.get('strategy', '-') }** ({float(worst.get('model_metrics', {}).get(primary_metric, float('nan'))):.4f})")
                 lines.append("")
 
         report_path.write_text("\n".join(lines), encoding="utf-8")

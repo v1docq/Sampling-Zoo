@@ -534,7 +534,7 @@ class RoutedWeightedRouter:
             n_estimators=max(1, int(self.config.get("router_n_estimators", 64))),
             max_depth=None if self.config.get("router_max_depth", 4) is None else int(self.config.get("router_max_depth", 4)),
             random_state=int(self.config.get("random_state", 42)),
-            n_jobs=-1,
+            n_jobs=1,
         )
         router.fit(base_weights, labels)
         predicted = router.predict(base_weights)
