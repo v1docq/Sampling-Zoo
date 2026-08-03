@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -21,6 +21,10 @@ from benchmark_dataset_interfaces import cap_openml_dataset, make_synthetic_regr
 from benchmark_datasets import OpenMLRawDatasetBundle, RawDatasetBundle, load_suite_raw_datasets  # noqa: E402
 from benchmark_incremental import IncrementalExperimentSaver  # noqa: E402
 from benchmark_logging import BenchmarkLogger  # noqa: E402
+from examples.benchmark.benchmark_model_profiles import (  # noqa: E402
+    TabPFNFinetuneConfig,
+    normalize_tabpfn_finetune_config,
+)
 from benchmark_models import make_model_pool  # noqa: E402
 from benchmark_repo import OPENML_REGRESSION_SUITE  # noqa: E402
 from benchmark_runner import EnsembleChunkBenchmarkRunner  # noqa: E402
@@ -106,9 +110,19 @@ class RMTRegressionExperimentConfig:
     synthetic_smoke: bool = False
     resume_from: str | Path | None = None
     resume_policy: str = ResumePolicy.RETRY_FAILED.value
+    tabpfn_finetune_config: TabPFNFinetuneConfig | Mapping[str, Any] = field(
+        default_factory=TabPFNFinetuneConfig
+    )
 
     def __post_init__(self) -> None:
         ResumePolicy.parse(self.resume_policy)
+        object.__setattr__(
+            self,
+            "tabpfn_finetune_config",
+            normalize_tabpfn_finetune_config(
+                self.tabpfn_finetune_config
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -470,6 +484,7 @@ class RMTRegressionExperimentOrchestrator:
             seed=self.config.seed,
             model_names=self.config.models,
             problem_type="regression",
+            tabpfn_finetune_config=self.config.tabpfn_finetune_config,
         )
 
     def _run_experiment(
@@ -517,6 +532,9 @@ class RMTRegressionExperimentOrchestrator:
             "regression_tasks": list(self.config.regression_tasks or []),
             "strategies": list(self.config.strategies),
             "models": list(self.config.models),
+            "tabpfn_finetune_config": asdict(
+                self.config.tabpfn_finetune_config
+            ),
             "ensemble_methods": list(self.config.ensemble_methods),
             "budget_ratios": list(self.config.budget_ratios),
             "view_strategies": list(self.config.view_strategies),
@@ -602,6 +620,9 @@ def run_rmt_contraction_regression_experiment(
         show_progress: bool = True,
         resume_from: str | Path | None = None,
         resume_policy: str = ResumePolicy.RETRY_FAILED.value,
+        tabpfn_finetune_config: (
+            TabPFNFinetuneConfig | Mapping[str, Any] | None
+        ) = None,
 ) -> Path:
     config = RMTRegressionExperimentConfig(
         regression_tasks=regression_tasks or DEFAULT_RMT_REGRESSION_TASKS,
@@ -610,6 +631,11 @@ def run_rmt_contraction_regression_experiment(
         show_progress=show_progress,
         resume_from=resume_from,
         resume_policy=resume_policy,
+        tabpfn_finetune_config=(
+            TabPFNFinetuneConfig()
+            if tabpfn_finetune_config is None
+            else tabpfn_finetune_config
+        ),
     )
     return RMTRegressionExperimentOrchestrator(config).run()
 

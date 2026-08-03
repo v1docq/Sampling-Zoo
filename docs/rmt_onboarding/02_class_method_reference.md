@@ -853,14 +853,33 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 
 Назначение: строит model pool для benchmark-а и изолирует optional dependencies.
 
+Typed-профили находятся в
+`examples/benchmark/benchmark_model_profiles.py`. Для TabPFN используются два
+разных экспериментальных режима:
+
+- `tabpfn_in_context` выполняет стандартный pretrained TabPFN inference: метод
+  `fit` передает контекстные train rows, но веса foundation model не
+  обновляются. Старый ключ `tabpfn` оставлен как совместимый алиас;
+- `tabpfn_finetuned` использует публичный `FinetunedTabPFNRegressor` или
+  `FinetunedTabPFNClassifier` и обновляет веса градиентно.
+
+`TabPFNFinetuneConfig` валидирует epochs, time limit, learning rate,
+validation split, early stopping и число estimators. По умолчанию fine-tuning
+требует CUDA. Medium RMT runner хранит этот typed config в experiment plan,
+config hash и `run_meta.json`, поэтому resume не смешивает несовместимые
+fine-tuning запуски.
+
 ### Важные Helpers
 
 | Helper | Назначение |
 |---|---|
 | `_load_torch_modules()` | Лениво импортирует torch/nn/optim и кеширует результат через `_TORCH_IMPORT_ATTEMPTED`. |
 | `_load_tabpfn_classes()` | Лениво импортирует `TabPFNClassifier`, `TabPFNRegressor`, `ModelVersion`; отсутствие пакета не ломает import module. |
+| `_load_tabpfn_finetuning_classes()` | Лениво импортирует публичные `FinetunedTabPFNClassifier` и `FinetunedTabPFNRegressor`. |
 | `_load_tabicl_classes()` | Лениво импортирует TabICL classes. |
 | `_resolve_tabpfn_device()` | Выбирает `cuda`, если активный torch backend видит CUDA, иначе `cpu`, с env override `TABPFN_DEVICE`. |
+| `_prepare_tabpfn_runtime()` | Через `setdefault` отключает optional telemetry для изолированных benchmark/server runs, сохраняя явный пользовательский override. |
 | `_make_tabpfn_kwargs(...)` | Передает TabPFN `device`, `random_state`, `n_estimators`; на CPU включает `ignore_pretraining_limits` только при явном env override. |
+| `_create_finetuned_tabpfn_model(...)` | Проверяет CUDA policy и материализует typed fine-tuning config в kwargs публичного TabPFN estimator. |
 
 Правило: optional heavy packages нельзя импортировать на верхнем уровне benchmark module. Это особенно важно для окружений, где torch CUDA версия подбиралась вручную под конкретную GPU.

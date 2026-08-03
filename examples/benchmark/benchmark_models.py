@@ -1,35 +1,30 @@
 from __future__ import annotations
 
-import json
+import os
 import sys
 from dataclasses import dataclass
-from datetime import datetime
 from numbers import Integral
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence
 
-import os
-
-from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping
-
-import sys
-
 import numpy as np
-import pandas as pd
 from scipy import sparse
 from sklearn.base import ClassifierMixin
 from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier, RandomForestRegressor
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.linear_model import LogisticRegression, Ridge
-from sklearn.metrics import f1_score
 from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.neural_network import MLPClassifier
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
+
+from examples.benchmark.benchmark_model_profiles import (  # noqa: E402
+    TabPFNFinetuneConfig,
+    TabPFNModelProfile,
+    normalize_tabpfn_finetune_config,
+)
 
 try:
     from lightgbm import LGBMClassifier, LGBMRegressor
@@ -46,6 +41,10 @@ TabPFNClassifier = None
 TabPFNRegressor = None
 ModelVersion = None
 _TABPFN_IMPORT_ATTEMPTED = False
+
+FinetunedTabPFNClassifier = None
+FinetunedTabPFNRegressor = None
+_TABPFN_FINETUNING_IMPORT_ATTEMPTED = False
 
 TabICLClassifier = None
 TabICLRegressor = None
@@ -208,8 +207,14 @@ def _resolve_tabpfn_device() -> str:
     return "cuda" if _torch_cuda_is_available() else "cpu"
 
 
+def _prepare_tabpfn_runtime() -> None:
+    """Keep benchmark runs independent from optional telemetry endpoints."""
+    os.environ.setdefault("TABPFN_DISABLE_TELEMETRY", "1")
+
+
 def _load_tabpfn_classes() -> tuple[Any, Any, Any]:
     global ModelVersion, TabPFNClassifier, TabPFNRegressor, _TABPFN_IMPORT_ATTEMPTED
+    _prepare_tabpfn_runtime()
     if not _TABPFN_IMPORT_ATTEMPTED:
         _TABPFN_IMPORT_ATTEMPTED = True
         try:
@@ -225,6 +230,30 @@ def _load_tabpfn_classes() -> tuple[Any, Any, Any]:
             TabPFNRegressor = _TabPFNRegressor
             ModelVersion = _ModelVersion
     return TabPFNClassifier, TabPFNRegressor, ModelVersion
+
+
+def _load_tabpfn_finetuning_classes() -> tuple[Any, Any]:
+    global FinetunedTabPFNClassifier
+    global FinetunedTabPFNRegressor
+    global _TABPFN_FINETUNING_IMPORT_ATTEMPTED
+
+    _prepare_tabpfn_runtime()
+    if not _TABPFN_FINETUNING_IMPORT_ATTEMPTED:
+        _TABPFN_FINETUNING_IMPORT_ATTEMPTED = True
+        try:
+            from tabpfn.finetuning import (
+                FinetunedTabPFNClassifier as _FinetunedTabPFNClassifier,
+            )
+            from tabpfn.finetuning import (
+                FinetunedTabPFNRegressor as _FinetunedTabPFNRegressor,
+            )
+        except Exception:  # pragma: no cover - optional
+            FinetunedTabPFNClassifier = None
+            FinetunedTabPFNRegressor = None
+        else:
+            FinetunedTabPFNClassifier = _FinetunedTabPFNClassifier
+            FinetunedTabPFNRegressor = _FinetunedTabPFNRegressor
+    return FinetunedTabPFNClassifier, FinetunedTabPFNRegressor
 
 
 def _load_tabicl_classes() -> tuple[Any, Any]:
@@ -268,6 +297,21 @@ def _create_tabpfn_model(model_cls: Any, seed: int) -> Any:
     )
 
 
+def _create_finetuned_tabpfn_model(
+    model_cls: Any,
+    seed: int,
+    config: TabPFNFinetuneConfig,
+) -> Any:
+    device = _resolve_tabpfn_device()
+    if config.require_cuda and not device.lower().startswith("cuda"):
+        raise ValueError(
+            "tabpfn_finetuned requires a CUDA device by default. "
+            "Install a CUDA-enabled torch build or explicitly set "
+            "require_cuda=False for a small CPU smoke run."
+        )
+    return model_cls(**config.model_kwargs(device=device, seed=seed))
+
+
 
 
 def make_model_pool(
@@ -275,6 +319,9 @@ def make_model_pool(
     model_names: Optional[Sequence[str]] = None,
     problem_type: Optional[str] = None,
     n_jobs: int | None = None,
+    tabpfn_finetune_config: (
+        TabPFNFinetuneConfig | Mapping[str, Any] | None
+    ) = None,
 ) -> Dict[str, Any]:
     """Build model factories, optionally limiting parallel estimator workers.
 
@@ -292,7 +339,16 @@ def make_model_pool(
             raise ValueError("n_jobs must be None, -1, or a positive integer")
         n_jobs = int(n_jobs)
 
-    available_names = {"random_forest", "lightgbm", "hist_gradient_boosting", "ridge", "tabpfn", "tabicl"}
+    available_names = {
+        "random_forest",
+        "lightgbm",
+        "hist_gradient_boosting",
+        "ridge",
+        "tabpfn",
+        TabPFNModelProfile.IN_CONTEXT.value,
+        TabPFNModelProfile.FINETUNED.value,
+        "tabicl",
+    }
     if model_names is None:
         requested = {"random_forest", "lightgbm"}
     else:
@@ -363,14 +419,50 @@ def make_model_pool(
         else:
             model_pool["ridge"] = lambda: LogisticRegression(max_iter=500, random_state=seed)
 
-    if "tabpfn" in requested:
+    tabpfn_in_context_names = requested.intersection(
+        {"tabpfn", TabPFNModelProfile.IN_CONTEXT.value}
+    )
+    if tabpfn_in_context_names:
         tabpfn_classifier, tabpfn_regressor, _model_version = _load_tabpfn_classes()
         if tabpfn_classifier is None or tabpfn_regressor is None:
             raise ValueError("tabpfn is not available. Install tabpfn to use this model.")
-        if normalized_problem == "classification":
-            model_pool["tabpfn"] = lambda: _create_tabpfn_model(tabpfn_classifier, seed)
-        else:
-            model_pool["tabpfn"] = lambda: _create_tabpfn_model(tabpfn_regressor, seed)
+        model_cls = (
+            tabpfn_classifier
+            if normalized_problem == "classification"
+            else tabpfn_regressor
+        )
+        for model_name in sorted(tabpfn_in_context_names):
+            model_pool[model_name] = (
+                lambda model_cls=model_cls: _create_tabpfn_model(
+                    model_cls,
+                    seed,
+                )
+            )
+
+    if TabPFNModelProfile.FINETUNED.value in requested:
+        finetuned_classifier, finetuned_regressor = (
+            _load_tabpfn_finetuning_classes()
+        )
+        if finetuned_classifier is None or finetuned_regressor is None:
+            raise ValueError(
+                "TabPFN fine-tuning is not available. Install a TabPFN "
+                "version that exposes tabpfn.finetuning."
+            )
+        finetune_config = normalize_tabpfn_finetune_config(
+            tabpfn_finetune_config
+        )
+        finetuned_model_cls = (
+            finetuned_classifier
+            if normalized_problem == "classification"
+            else finetuned_regressor
+        )
+        model_pool[TabPFNModelProfile.FINETUNED.value] = (
+            lambda: _create_finetuned_tabpfn_model(
+                finetuned_model_cls,
+                seed,
+                finetune_config,
+            )
+        )
 
     if "tabicl" in requested:
         tabicl_classifier, tabicl_regressor = _load_tabicl_classes()
