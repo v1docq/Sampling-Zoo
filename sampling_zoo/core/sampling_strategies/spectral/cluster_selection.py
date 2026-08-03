@@ -151,6 +151,7 @@ class SpectralClusterSelector:
         downstream_proxy_shortlist_size: int = 3,
         downstream_complexity_penalty_weight: float = 0.01,
         selection_method: str = "hybrid",
+        leverage_cap_quantile: float = 0.95,
         routing_temperature: float = 1.0,
         routing_shrinkage: float = 0.05,
         vote_temperature: float = 0.05,
@@ -256,7 +257,11 @@ class SpectralClusterSelector:
         self.selection_method = self._validate_choice(
             "selection_method",
             selection_method,
-            ("all", "leverage", "maxvol", "hybrid"),
+            ("all", "leverage", "capped_leverage", "maxvol", "hybrid"),
+        )
+        self.leverage_cap_quantile = self._validate_unit_fraction(
+            "leverage_cap_quantile",
+            leverage_cap_quantile,
         )
         self.routing_temperature = self._validate_positive_float(
             "routing_temperature",
@@ -643,6 +648,7 @@ class SpectralClusterSelector:
                 max_imbalance_ratio=self.budget_max_imbalance_ratio,
                 min_partition_fraction=self.budget_min_partition_fraction,
                 selection_method=self.selection_method,
+                leverage_cap_quantile=self.leverage_cap_quantile,
                 routing_temperature=self.routing_temperature,
                 routing_shrinkage=self.routing_shrinkage,
                 validation_fraction=self.validation_proxy_fraction,

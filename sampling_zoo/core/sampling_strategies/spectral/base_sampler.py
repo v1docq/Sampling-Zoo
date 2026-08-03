@@ -24,6 +24,7 @@ class SpectralSamplerBase(BaseSampler):
         min_chunk_size: int = 1,
         max_chunk_size: Optional[int] = None,
         selection_method: str = "all",
+        leverage_cap_quantile: float = 0.95,
         routing_temperature: float = 1.0,
         routing_shrinkage: float = 0.0,
         backend: str = "auto",
@@ -54,7 +55,11 @@ class SpectralSamplerBase(BaseSampler):
         self.selection_method = self._validate_choice(
             "selection_method",
             selection_method,
-            ("all", "leverage", "maxvol", "hybrid"),
+            ("all", "leverage", "capped_leverage", "maxvol", "hybrid"),
+        )
+        self.leverage_cap_quantile = self._validate_fraction(
+            "leverage_cap_quantile",
+            leverage_cap_quantile,
         )
         self.routing_temperature = float(routing_temperature)
         self.routing_shrinkage = float(routing_shrinkage)

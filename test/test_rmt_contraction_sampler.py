@@ -47,6 +47,26 @@ def test_numpy_backend_predict_partition_proba_rows_sum_to_one() -> None:
     assert "approx_rank" not in sampler.diagnostics_
 
 
+def test_capped_leverage_sampler_records_row_selection_diagnostics() -> None:
+    X = _frame(60)
+    sampler = RMTContractionTensorSampler(
+        n_partitions=3,
+        n_views=3,
+        projection_dim=2,
+        chunk_fraction=0.4,
+        selection_method="capped_leverage",
+        leverage_cap_quantile=0.9,
+        backend="numpy",
+        random_state=11,
+        show_progress=False,
+    ).fit(X)
+
+    assert sampler.diagnostics_["row_selection_method"] == "capped_leverage"
+    assert sampler.diagnostics_["leverage_cap_quantile"] == pytest.approx(0.9)
+    assert len(sampler.diagnostics_["partition_membership_fingerprint"]) == 64
+    assert sum(len(indices) for indices in sampler.partitions.values()) < len(X)
+
+
 def test_auto_n_views_subsample_uses_feature_coverage_policy() -> None:
     rng = np.random.default_rng(123)
     X = pd.DataFrame(rng.normal(size=(50, 20)), columns=[f"x_{idx}" for idx in range(20)])

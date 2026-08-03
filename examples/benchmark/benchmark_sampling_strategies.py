@@ -291,6 +291,7 @@ def make_chunking_strategy_configs(
                 "subspace_max_normalized_projection_distance": 0.25,
                 "subspace_max_rank": 64,
                 "selection_method": "hybrid",
+                "leverage_cap_quantile": 0.95,
                 "routing_temperature": 1.0,
                 "routing_shrinkage": 0.05,
                 "backend": "auto",

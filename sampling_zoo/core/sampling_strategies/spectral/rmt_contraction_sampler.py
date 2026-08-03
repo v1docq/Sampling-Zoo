@@ -13,7 +13,10 @@ from .backend.matrix_backend import MatrixRMTBackend
 from .backend.tensor_backend import TensorRMTBackend
 from .base_sampler import SpectralSamplerBase
 from .cluster_selection import ClusterSelectionResult, SpectralClusterSelector
-from .partition_sampling import select_partition_indices
+from .partition_sampling import (
+    partition_membership_fingerprint,
+    select_partition_indices,
+)
 from .null_diagnostics import (
     SpectralNullDiagnostic,
     SpectralNullDiagnosticConfig,
@@ -115,6 +118,7 @@ class RMTContractionConfig:
     min_chunk_size: int = 1
     max_chunk_size: Optional[int] = None
     selection_method: str = "hybrid"
+    leverage_cap_quantile: float = 0.95
     routing_temperature: float = 1.0
     routing_shrinkage: float = 0.05
     include_categorical: bool = True
@@ -229,6 +233,7 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             min_chunk_size=cfg.min_chunk_size,
             max_chunk_size=cfg.max_chunk_size,
             selection_method=cfg.selection_method,
+            leverage_cap_quantile=cfg.leverage_cap_quantile,
             routing_temperature=cfg.routing_temperature,
             routing_shrinkage=cfg.routing_shrinkage,
             backend=cfg.backend,
@@ -592,6 +597,7 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
                 self.downstream_complexity_penalty_weight
             ),
             selection_method=self.selection_method,
+            leverage_cap_quantile=self.leverage_cap_quantile,
             routing_temperature=self.routing_temperature,
             routing_shrinkage=self.routing_shrinkage,
             vote_temperature=self.cluster_vote_temperature,
@@ -1288,12 +1294,14 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             )
         allocation = self.partition_budget_plan_.allocation_map
 
+        row_selection_rng = np.random.default_rng(self.random_state)
         for cluster_id, cluster_idx in cluster_indices.items():
             name = f"chunk_{cluster_id}"
             selected = self._select_from_cluster(
                 cluster_idx,
                 scores,
                 target_size=allocation[name],
+                random_state=row_selection_rng,
             )
             if selected.size == 0:
                 continue
@@ -1324,6 +1332,7 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         scores: np.ndarray,
         *,
         target_size: Optional[int] = None,
+        random_state: int | np.random.Generator | None = None,
     ) -> np.ndarray:
         if cluster_idx.size == 0:
             return cluster_idx
@@ -1340,6 +1349,8 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             selection_method=self.selection_method,
             scores=scores,
             embedding=self.sample_embedding_,
+            random_state=random_state,
+            leverage_cap_quantile=self.leverage_cap_quantile,
         )
 
     def _project_new_unfolding(self, M_new: np.ndarray) -> np.ndarray:
@@ -1442,6 +1453,13 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             "spectral_subspace_diagnostic": subspace_diagnostic,
             "leverage_entropy": entropy,
             "effective_sample_count": eff_n,
+            "row_selection_method": self.selection_method,
+            "leverage_cap_quantile": float(self.leverage_cap_quantile),
+            "partition_membership_fingerprint": (
+                partition_membership_fingerprint(self.cluster_labels_)
+                if self.cluster_labels_ is not None
+                else None
+            ),
             "n_partitions_requested": int(self.n_partitions),
             "selected_n_partitions": int(partition_info.selected_n_partitions) if partition_info else int(len(self.partitions)),
             "partition_selection_method": partition_info.partition_selection_method if partition_info else "fixed",

@@ -43,6 +43,11 @@ class RMTReportTableBuilder:
             partition_comparison,
             output_dir / "partition_selection_comparison.csv",
         )
+        row_selection_comparison = self._build_row_selection_comparison(raw)
+        self._write_table(
+            row_selection_comparison,
+            output_dir / "row_selection_comparison.csv",
+        )
 
         minimal_budget = self._build_minimal_budget_table(efficiency)
         self._write_table(minimal_budget, output_dir / "minimal_effective_budget.csv")
@@ -50,6 +55,7 @@ class RMTReportTableBuilder:
             "raw": raw,
             "efficiency": efficiency,
             "partition_selection_comparison": partition_comparison,
+            "row_selection_comparison": row_selection_comparison,
             "minimal_budget": minimal_budget,
         }
 
@@ -66,11 +72,13 @@ class RMTReportTableBuilder:
             output_dir / "partition_selection_comparison.csv",
             index=False,
         )
+        empty.to_csv(output_dir / "row_selection_comparison.csv", index=False)
         empty.to_csv(output_dir / "minimal_effective_budget.csv", index=False)
         return {
             "raw": empty,
             "efficiency": empty,
             "partition_selection_comparison": empty,
+            "row_selection_comparison": empty,
             "minimal_budget": empty,
         }
 
@@ -226,6 +234,20 @@ class RMTReportTableBuilder:
                         "partition_selection_selected_candidate.components."
                         "downstream_proxy.budget_violations"
                     ),
+                    default=None,
+                ),
+                "row_selection_method": value_series(
+                    df,
+                    "extra.sampler_diagnostics.row_selection_method",
+                    default=None,
+                ),
+                "leverage_cap_quantile": self._numeric_series(
+                    df,
+                    "extra.sampler_diagnostics.leverage_cap_quantile",
+                ),
+                "partition_membership_fingerprint": value_series(
+                    df,
+                    "extra.sampler_diagnostics.partition_membership_fingerprint",
                     default=None,
                 ),
                 "null_model_status": value_series(
@@ -509,6 +531,7 @@ class RMTReportTableBuilder:
                     "router",
                     "view_strategy",
                     "partition_selection_method",
+                    "row_selection_method",
                     "selected_cluster_algorithm",
                     "cluster_selection_metric",
                     "cluster_ensemble_method",
@@ -524,6 +547,8 @@ class RMTReportTableBuilder:
             .agg(
                 {
                     "n_views": "mean",
+                    "leverage_cap_quantile": "mean",
+                    "partition_membership_fingerprint": "first",
                     "selected_n_partitions": "mean",
                     "validation_proxy_baseline_loss": "mean",
                     "validation_proxy_candidate_loss": "mean",
@@ -571,6 +596,7 @@ class RMTReportTableBuilder:
                 "sampler",
                 "view_strategy",
                 "partition_selection_method",
+                "row_selection_method",
                 "selected_cluster_algorithm",
                 "cluster_selection_metric",
                 "cluster_ensemble_method",
@@ -640,6 +666,7 @@ class RMTReportTableBuilder:
             how="left",
             validate="one_to_one",
         )
+
         method_names = (
             selected.groupby(group_columns, as_index=False, dropna=False)[
                 "cluster_ensemble_method"
@@ -738,6 +765,83 @@ class RMTReportTableBuilder:
             ignore_index=True,
         )
 
+    @staticmethod
+    def _build_row_selection_comparison(raw: pd.DataFrame) -> pd.DataFrame:
+        key_columns = ["dataset", "model", "budget_ratio"]
+        method_column = "row_selection_method"
+        required = {*key_columns, method_column, "rmse"}
+        if raw.empty or not required.issubset(raw.columns):
+            return pd.DataFrame(columns=key_columns)
+
+        selected = raw[
+            (raw["sampler"] == "rmt_contraction")
+            & raw[method_column].notna()
+        ].copy()
+        if selected.empty:
+            return pd.DataFrame(columns=key_columns)
+
+        measures = [
+            column
+            for column in (
+                "rmse",
+                "rmse_drop",
+                "fit_time",
+                "inference_time",
+                "total_train_rows",
+                "target_mean_abs_drift_avg",
+                "target_quantile_l1_drift_avg",
+            )
+            if column in selected.columns
+        ]
+        grouped = (
+            selected.groupby(
+                [*key_columns, method_column],
+                as_index=False,
+                dropna=False,
+            )
+            .agg(
+                **{column: (column, "mean") for column in measures},
+                partition_membership_fingerprints=(
+                    "partition_membership_fingerprint",
+                    lambda values: "|".join(
+                        sorted(
+                            {
+                                str(value)
+                                for value in values
+                                if pd.notna(value)
+                            }
+                        )
+                    ),
+                ),
+            )
+        )
+        fingerprint_counts = (
+            grouped.groupby(key_columns, dropna=False)[
+                "partition_membership_fingerprints"
+            ]
+            .nunique(dropna=False)
+            .rename("partition_fingerprint_count")
+            .reset_index()
+        )
+        grouped = grouped.merge(fingerprint_counts, on=key_columns, how="left")
+        grouped["partition_fingerprint_consistent"] = (
+            (grouped["partition_fingerprint_count"] == 1)
+            & grouped["partition_membership_fingerprints"].ne("")
+        )
+
+        hybrid = grouped[grouped[method_column] == "hybrid"][
+            [*key_columns, *measures]
+        ].rename(columns={column: f"hybrid_{column}" for column in measures})
+        comparison = grouped.merge(hybrid, on=key_columns, how="left")
+        for column in measures:
+            comparison[f"{column}_delta_vs_hybrid"] = (
+                comparison[column] - comparison[f"hybrid_{column}"]
+            )
+        return comparison.sort_values(
+            [*key_columns, method_column],
+            ignore_index=True,
+        )
+
     def _build_minimal_budget_table(self, efficiency: pd.DataFrame) -> pd.DataFrame:
         minimal_rows: list[dict[str, Any]] = []
         for delta in self.efficiency_deltas:
@@ -754,6 +858,7 @@ class RMTReportTableBuilder:
                     "router",
                     "view_strategy",
                     "partition_selection_method",
+                    "row_selection_method",
                     "selected_cluster_algorithm",
                     "cluster_selection_metric",
                     "cluster_ensemble_method",
