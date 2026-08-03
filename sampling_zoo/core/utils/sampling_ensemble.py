@@ -11,6 +11,7 @@ from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sampling_zoo.core.api.api_main import SamplingStrategyFactory
 from sampling_zoo.core.metrics.eval_metrics import calculate_metrics, get_metric_comparator
 from sampling_zoo.core.experiment.contracts import (
+    PartitionModelMode,
     PartitionSizeDiagnosticsContract,
     PartitionTrainingRequest,
     PartitionTrainingResult,
@@ -25,6 +26,10 @@ from sampling_zoo.core.experiment.morphisms import (
     routing_to_contract,
 )
 from sampling_zoo.core.utils.ensemble_routing import RoutedWeightedRouter
+from sampling_zoo.core.utils.partition_training import (
+    build_model_training_partitions,
+    normalize_partition_model_mode,
+)
 from sampling_zoo.core.utils.progress import progress_bar, progress_iter, progress_write
 from sampling_zoo.core.utils.routed_em_refiner import RoutedEMModelRefiner
 
@@ -71,6 +76,18 @@ class SamplingEnsemble:
         self.model_factory = model_factory
         self.ensemble_method = ensemble_method
         self.show_progress = show_progress
+        self.partition_model_mode = normalize_partition_model_mode(
+            self.partitioner_config.get('partition_model_mode')
+        )
+        if (
+            self.partition_model_mode is PartitionModelMode.CONCATENATED
+            and self.ensemble_method == 'routed_weighted'
+        ):
+            raise ValueError(
+                "partition_model_mode='concatenated' is incompatible with "
+                "ensemble_method='routed_weighted'; use voting for the "
+                "single-model control"
+            )
         self.router = RoutedWeightedRouter(
             problem=self.problem,
             config=self.partitioner_config,
@@ -167,6 +184,7 @@ class SamplingEnsemble:
             'experiment_chunk_fraction',
             'force_chunking',
             'force_direct_model',
+            'partition_model_mode',
             'show_progress',
             'router',
             'router_n_estimators',
@@ -938,7 +956,7 @@ class SamplingEnsemble:
             save_models_to_disk: bool = True,
     ):
         """
-        Train one model per prepared data partition.
+        Train models from independent or concatenated prepared partitions.
         """
         training_started = perf_counter()
         self._ensure_classification_classes(y_train, y_val)
@@ -951,13 +969,21 @@ class SamplingEnsemble:
             save_models_to_disk=save_models_to_disk,
         )
         partition_preparation_time = perf_counter() - started
+        training_partitions = build_model_training_partitions(
+            partitions,
+            self.partition_model_mode,
+        )
         validation_metric = self._normalize_validation_metric(validation_metric)
         metric_is_better = get_metric_comparator(validation_metric)
-        training_request = self._build_partition_training_request(partitions, validation_metric)
+        training_request = self._build_partition_training_request(
+            source_partitions=partitions,
+            training_partitions=training_partitions,
+            validation_metric=validation_metric,
+        )
 
         started = perf_counter()
         self._train_partition_loop(
-            partitions=partitions,
+            partitions=training_partitions,
             X_val=X_val,
             y_val=y_val,
             class_samples=class_samples,
@@ -970,7 +996,7 @@ class SamplingEnsemble:
         model_training_time = perf_counter() - started
         started = perf_counter()
         self._finalize_partition_training(
-            partitions=partitions,
+            partitions=training_partitions,
             X_val=X_val,
             y_val=y_val,
             metric_is_better=metric_is_better,
@@ -1017,20 +1043,25 @@ class SamplingEnsemble:
             metadata={
                 'strategy': self._strategy_name(),
                 'n_partitions': len(partitions),
+                'n_training_partitions': len(training_partitions),
+                'partition_model_mode': self.partition_model_mode.value,
             },
         )
 
     def _build_partition_training_request(
         self,
-        partitions: Dict[str, Any],
+        source_partitions: Dict[str, Any],
+        training_partitions: Dict[str, Any],
         validation_metric: str,
     ) -> PartitionTrainingRequest:
         return PartitionTrainingRequest(
             problem=self.problem,
             ensemble_method=self.ensemble_method,
             validation_metric=validation_metric,
-            n_partitions=len(partitions),
+            n_partitions=len(source_partitions),
             routing_refinement=str(self.partitioner_config.get('routing_refinement', 'none')),
+            partition_model_mode=self.partition_model_mode.value,
+            n_training_partitions=len(training_partitions),
         )
 
     def _build_partition_training_result(
@@ -1627,6 +1658,7 @@ class SamplingEnsemble:
             'validation_metric': validation_metric,
             'best_validation_metric': self._safe_float(best_score),
             'selection_policy': selection_policy,
+            'partition_model_mode': self.partition_model_mode.value,
             'active_model_names': [str(model_info.get('name')) for model_info in active_models],
             'full_ensemble_metrics_before_pruning': dict(full_metrics),
             'ensemble_metrics_after_pruning': dict(reduced_metrics),
