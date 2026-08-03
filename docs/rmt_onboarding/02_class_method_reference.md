@@ -241,6 +241,24 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 | `_finalize_partition_training(...)` | Завершает обучение и выбирает active model subset. |
 | `select_best_models_forward(...)` | Forward selection: добавляет модели, которые улучшают validation metric. |
 
+### Режим обучения partition-моделей
+
+`SamplingEnsemble` поддерживает два явных режима через
+`partition_model_mode`:
+
+- `independent` сохраняет основной MoE-сценарий: отдельная модель обучается
+  на каждом sampled partition;
+- `concatenated` строит одну выборку из объединения всех sampled partitions и
+  обучает одну модель при том же суммарном бюджете строк.
+
+`concatenated` нужен как контроль эксперимента: он отделяет эффект выбора строк
+RMT-семплером от эффекта разбиения на экспертов и routing. Исходные partitions
+остаются в `PartitionTrainingResult`, а `PartitionTrainingRequest` отдельно
+фиксирует `n_partitions`, `n_training_partitions` и `partition_model_mode`.
+Комбинация `concatenated + routed_weighted` запрещена: при единственной модели
+роутинг вырождается в постоянный вес 1, поэтому для контроля используется
+`ensemble_method="voting"`.
+
 ### Inference Методы
 
 | Метод | Назначение |

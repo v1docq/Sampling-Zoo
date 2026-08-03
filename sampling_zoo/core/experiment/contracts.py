@@ -37,6 +37,11 @@ class RoutingRefinementMode(_StrEnum):
     EM_RETRAINING = "em_retraining"
 
 
+class PartitionModelMode(_StrEnum):
+    INDEPENDENT = "independent"
+    CONCATENATED = "concatenated"
+
+
 @dataclass(frozen=True)
 class DatasetContract:
     name: str
@@ -312,6 +317,8 @@ class PartitionTrainingRequest:
     validation_metric: str
     n_partitions: int
     routing_refinement: str = RoutingRefinementMode.NONE.value
+    partition_model_mode: str = PartitionModelMode.INDEPENDENT.value
+    n_training_partitions: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
