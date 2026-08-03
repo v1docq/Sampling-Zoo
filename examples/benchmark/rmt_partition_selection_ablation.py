@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 from dataclasses import asdict, dataclass
 from datetime import datetime
 import math
@@ -39,7 +40,15 @@ from sampling_zoo.core.experiment.stages import ExperimentPlan  # noqa: E402
 DEFAULT_PARTITION_SELECTION_METRICS: tuple[str, ...] = (
     "balanced_silhouette",
     "validation_proxy",
+    "budget_aware_validation_proxy",
+    "downstream_proxy",
 )
+DEFAULT_MECHANISM_SMOKE_TASKS: tuple[str, ...] = (
+    "Brazilian_houses",
+    "diamonds",
+    "pol",
+)
+DEFAULT_MECHANISM_SMOKE_BUDGET_RATIOS: tuple[float, ...] = (0.01, 0.05, 0.20)
 DEFAULT_PARTITION_ABLATION_BUDGET_RATIOS: tuple[float, ...] = (
     0.01,
     0.03,
@@ -48,7 +57,13 @@ DEFAULT_PARTITION_ABLATION_BUDGET_RATIOS: tuple[float, ...] = (
     0.20,
 )
 SUPPORTED_PARTITION_SELECTION_METRICS = frozenset(
-    {"silhouette", "balanced_silhouette", "validation_proxy"}
+    {
+        "silhouette",
+        "balanced_silhouette",
+        "validation_proxy",
+        "budget_aware_validation_proxy",
+        "downstream_proxy",
+    }
 )
 
 
@@ -116,6 +131,13 @@ class RMTPartitionSelectionAblationConfig:
     validation_proxy_fraction: float = 0.2
     validation_proxy_min_partition_rows: int = 8
     validation_proxy_smoothing: float = 1.0
+    min_sampled_rows_per_partition: int = 32
+    budget_max_imbalance_ratio: float = 5.0
+    budget_min_partition_fraction: float = 0.05
+    include_single_partition_candidate: bool = True
+    downstream_proxy_shortlist_size: int = 3
+    downstream_proxy_n_estimators: int = 32
+    downstream_complexity_penalty_weight: float = 0.01
     model_n_jobs: int = 1
     max_train_rows: int | None = 300_000
     seed: int = 42
@@ -148,6 +170,20 @@ class RMTPartitionSelectionAblationConfig:
             raise ValueError("validation_proxy_fraction must be in (0, 0.5)")
         if self.validation_proxy_min_partition_rows < 1:
             raise ValueError("validation_proxy_min_partition_rows must be positive")
+        if self.min_sampled_rows_per_partition < 1:
+            raise ValueError("min_sampled_rows_per_partition must be positive")
+        if self.budget_max_imbalance_ratio < 1:
+            raise ValueError("budget_max_imbalance_ratio must be at least 1")
+        if not 0 <= self.budget_min_partition_fraction <= 1:
+            raise ValueError("budget_min_partition_fraction must be in [0, 1]")
+        if self.downstream_proxy_shortlist_size < 1:
+            raise ValueError("downstream_proxy_shortlist_size must be positive")
+        if self.downstream_proxy_n_estimators < 1:
+            raise ValueError("downstream_proxy_n_estimators must be positive")
+        if self.downstream_complexity_penalty_weight < 0:
+            raise ValueError(
+                "downstream_complexity_penalty_weight must be non-negative"
+            )
         if not math.isfinite(float(self.validation_proxy_smoothing)):
             raise ValueError("validation_proxy_smoothing must be finite")
         if self.validation_proxy_smoothing <= 0:
@@ -277,6 +313,42 @@ def make_rmt_partition_selection_strategy_configs(
                     "validation_proxy_smoothing": (
                         config.validation_proxy_smoothing
                     ),
+                    "budget_feasibility_mode": (
+                        "hard"
+                        if grid_point.cluster_selection_metric
+                        in {
+                            "budget_aware_validation_proxy",
+                            "downstream_proxy",
+                        }
+                        else "off"
+                    ),
+                    "min_sampled_rows_per_partition": (
+                        config.min_sampled_rows_per_partition
+                    ),
+                    "budget_max_imbalance_ratio": (
+                        config.budget_max_imbalance_ratio
+                    ),
+                    "budget_min_partition_fraction": (
+                        config.budget_min_partition_fraction
+                    ),
+                    "include_single_partition_candidate": (
+                        config.include_single_partition_candidate
+                    ),
+                    "cluster_ensemble_method": (
+                        "best_score"
+                        if grid_point.cluster_selection_metric
+                        == "downstream_proxy"
+                        else "coassociation"
+                    ),
+                    "downstream_proxy_shortlist_size": (
+                        config.downstream_proxy_shortlist_size
+                    ),
+                    "downstream_proxy_n_estimators": (
+                        config.downstream_proxy_n_estimators
+                    ),
+                    "downstream_complexity_penalty_weight": (
+                        config.downstream_complexity_penalty_weight
+                    ),
                 }
             },
         )["rmt_contraction"]
@@ -352,6 +424,24 @@ class RMTPartitionSelectionAblationOrchestrator(
                 "validation_proxy_smoothing": (
                     self.ablation_config.validation_proxy_smoothing
                 ),
+                "min_sampled_rows_per_partition": (
+                    self.ablation_config.min_sampled_rows_per_partition
+                ),
+                "budget_max_imbalance_ratio": (
+                    self.ablation_config.budget_max_imbalance_ratio
+                ),
+                "budget_min_partition_fraction": (
+                    self.ablation_config.budget_min_partition_fraction
+                ),
+                "downstream_proxy_shortlist_size": (
+                    self.ablation_config.downstream_proxy_shortlist_size
+                ),
+                "downstream_proxy_n_estimators": (
+                    self.ablation_config.downstream_proxy_n_estimators
+                ),
+                "downstream_complexity_penalty_weight": (
+                    self.ablation_config.downstream_complexity_penalty_weight
+                ),
                 "model_n_jobs": self.ablation_config.model_n_jobs,
             }
         )
@@ -389,5 +479,51 @@ def run_rmt_partition_selection_ablation(
     return RMTPartitionSelectionAblationOrchestrator(config).run()
 
 
+def run_rmt_partition_selection_mechanism_smoke(
+    *,
+    regression_tasks: Sequence[str] = DEFAULT_MECHANISM_SMOKE_TASKS,
+    models: Sequence[str] = ("lightgbm",),
+    max_train_rows: int | None = 300_000,
+    seed: int = 42,
+    show_progress: bool = True,
+) -> Path:
+    """Run the first post-refactor gate before the full seven-dataset grid."""
+
+    config = RMTPartitionSelectionAblationConfig(
+        regression_tasks=regression_tasks,
+        models=models,
+        budget_ratios=DEFAULT_MECHANISM_SMOKE_BUDGET_RATIOS,
+        cluster_selection_metrics=DEFAULT_PARTITION_SELECTION_METRICS,
+        max_train_rows=max_train_rows,
+        model_n_jobs=1,
+        seed=seed,
+        show_progress=show_progress,
+    )
+    return RMTPartitionSelectionAblationOrchestrator(config).run()
+
+
+def _run_cli() -> Path:
+    parser = argparse.ArgumentParser(
+        description="Compare RMT partition-selection objectives."
+    )
+    parser.add_argument(
+        "--mechanism-smoke",
+        action="store_true",
+        help="Run the three-dataset, three-budget preflight grid.",
+    )
+    parser.add_argument("--max-train-rows", type=int, default=300_000)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--no-progress", action="store_true")
+    args = parser.parse_args()
+    common = {
+        "max_train_rows": args.max_train_rows,
+        "seed": args.seed,
+        "show_progress": not args.no_progress,
+    }
+    if args.mechanism_smoke:
+        return run_rmt_partition_selection_mechanism_smoke(**common)
+    return run_rmt_partition_selection_ablation(**common)
+
+
 if __name__ == "__main__":
-    run_rmt_partition_selection_ablation()
+    _run_cli()

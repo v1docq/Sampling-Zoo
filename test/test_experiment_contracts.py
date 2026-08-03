@@ -3,6 +3,10 @@ from __future__ import annotations
 import pytest
 
 from sampling_zoo.core.experiment.errors import EmptyExperimentInputError, InvalidExperimentConfigError
+from sampling_zoo.core.experiment.contracts import (
+    PartitionSizeDiagnosticsContract,
+    RuntimeDiagnosticsContract,
+)
 from sampling_zoo.core.experiment.morphisms import (
     build_standard_rmt_experiment_plan,
     materialize_strategy_grid,
@@ -60,3 +64,44 @@ def test_standard_rmt_experiment_stage_plan_order_is_stable() -> None:
         ExperimentStageId.FINALIZE,
     )
     assert plan.effective_config["seed"] == 42
+
+
+def test_partition_size_diagnostics_require_consistent_counts() -> None:
+    contract = PartitionSizeDiagnosticsContract(
+        pre_budget_sizes={"chunk_0": 70, "chunk_1": 30},
+        post_budget_sizes={"chunk_0": 14, "chunk_1": 6},
+        requested_budget_size=20,
+        selected_rows=20,
+        unique_selected_rows=20,
+        duplicate_rows=0,
+    )
+
+    assert contract.to_dict()["post_budget_sizes"] == {
+        "chunk_0": 14,
+        "chunk_1": 6,
+    }
+
+    with pytest.raises(ValueError, match="must sum to selected_rows"):
+        PartitionSizeDiagnosticsContract(
+            pre_budget_sizes={"chunk_0": 10},
+            post_budget_sizes={"chunk_0": 5},
+            selected_rows=5,
+            unique_selected_rows=4,
+            duplicate_rows=0,
+        )
+
+
+def test_runtime_diagnostics_require_finite_non_negative_values() -> None:
+    contract = RuntimeDiagnosticsContract(
+        stage_seconds={"preprocessing": 0.25, "training": 0.75},
+        total_seconds=1.1,
+        cold_start=False,
+    )
+
+    assert contract.to_dict()["stage_seconds"]["training"] == 0.75
+
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        RuntimeDiagnosticsContract(
+            stage_seconds={"preprocessing": float("nan")},
+            total_seconds=1.0,
+        )

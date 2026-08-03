@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from dataclasses import dataclass, replace
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 from sklearn.cluster import KMeans
@@ -30,7 +30,11 @@ from .cluster_selection_contracts import (
     normalize_cluster_algorithm,
     score_cluster_components,
 )
-from .partition_validation import PartitionValidationProxyEvaluator
+from .partition_validation import (
+    PartitionDownstreamProxyEvaluator,
+    PartitionValidationProxyEvaluator,
+)
+from ...experiment.budgeting import build_partition_budget_plan
 from ...utils.progress import progress_bar, progress_write
 
 try:  # scikit-learn >= 1.1
@@ -73,6 +77,7 @@ class _ClusterScoringContext:
     target: Optional[Any]
     resolved_target_type: str
     validation_proxy: Optional[PartitionValidationProxyEvaluator] = None
+    downstream_proxy: Optional[PartitionDownstreamProxyEvaluator] = None
 
 
 @dataclass(frozen=True)
@@ -136,6 +141,18 @@ class SpectralClusterSelector:
         validation_proxy_fraction: float = 0.2,
         validation_proxy_min_partition_rows: int = 8,
         validation_proxy_smoothing: float = 1.0,
+        sampling_budget_ratio: float = 1.0,
+        budget_feasibility_mode: str = "off",
+        min_sampled_rows_per_partition: int = 1,
+        budget_max_imbalance_ratio: Optional[float] = None,
+        budget_min_partition_fraction: float = 0.0,
+        include_single_partition_candidate: bool = False,
+        downstream_proxy_model_factory: Optional[Callable[[], Any]] = None,
+        downstream_proxy_shortlist_size: int = 3,
+        downstream_complexity_penalty_weight: float = 0.01,
+        selection_method: str = "hybrid",
+        routing_temperature: float = 1.0,
+        routing_shrinkage: float = 0.05,
         vote_temperature: float = 0.05,
         random_state: Optional[int] = 42,
         show_progress: bool = True,
@@ -144,7 +161,13 @@ class SpectralClusterSelector:
         self.selection_metric = self._validate_choice(
             "cluster_selection_metric",
             selection_metric,
-            ("silhouette", "balanced_silhouette", "validation_proxy"),
+            (
+                "silhouette",
+                "balanced_silhouette",
+                "validation_proxy",
+                "budget_aware_validation_proxy",
+                "downstream_proxy",
+            ),
         )
         self.ensemble_method = self._validate_choice(
             "cluster_ensemble_method",
@@ -191,6 +214,65 @@ class SpectralClusterSelector:
             "validation_proxy_smoothing",
             validation_proxy_smoothing,
         )
+        self.sampling_budget_ratio = self._validate_unit_fraction(
+            "sampling_budget_ratio",
+            sampling_budget_ratio,
+        )
+        self.budget_feasibility_mode = self._validate_choice(
+            "budget_feasibility_mode",
+            budget_feasibility_mode,
+            ("off", "hard"),
+        )
+        self.min_sampled_rows_per_partition = max(
+            1,
+            int(min_sampled_rows_per_partition),
+        )
+        self.budget_max_imbalance_ratio = (
+            None
+            if budget_max_imbalance_ratio is None
+            else self._validate_positive_float(
+                "budget_max_imbalance_ratio",
+                budget_max_imbalance_ratio,
+            )
+        )
+        self.budget_min_partition_fraction = self._validate_zero_one_fraction(
+            "budget_min_partition_fraction",
+            budget_min_partition_fraction,
+        )
+        self.include_single_partition_candidate = bool(
+            include_single_partition_candidate
+        )
+        self.downstream_proxy_model_factory = downstream_proxy_model_factory
+        self.downstream_proxy_shortlist_size = max(
+            1,
+            int(downstream_proxy_shortlist_size),
+        )
+        self.downstream_complexity_penalty_weight = (
+            self._validate_nonnegative_float(
+                "downstream_complexity_penalty_weight",
+                downstream_complexity_penalty_weight,
+            )
+        )
+        self.selection_method = self._validate_choice(
+            "selection_method",
+            selection_method,
+            ("all", "leverage", "maxvol", "hybrid"),
+        )
+        self.routing_temperature = self._validate_positive_float(
+            "routing_temperature",
+            routing_temperature,
+        )
+        self.routing_shrinkage = self._validate_zero_one_fraction(
+            "routing_shrinkage",
+            routing_shrinkage,
+        )
+        if (
+            self.selection_metric == "downstream_proxy"
+            and self.ensemble_method != "best_score"
+        ):
+            raise ValueError(
+                "downstream_proxy requires cluster_ensemble_method='best_score'"
+            )
         self.vote_temperature = max(float(vote_temperature), 1e-6)
         self.random_state = random_state
         self.show_progress = bool(show_progress)
@@ -199,17 +281,31 @@ class SpectralClusterSelector:
         self,
         embedding: np.ndarray,
         target: Optional[Any] = None,
+        *,
+        downstream_features: Optional[np.ndarray] = None,
+        sample_scores: Optional[np.ndarray] = None,
     ) -> ClusterSelectionResult:
         embedding = np.asarray(embedding, dtype=float)
         if embedding.ndim != 2:
             raise ValueError("embedding must be a 2D matrix")
-        scoring_context = self._build_scoring_context(embedding, target)
+        scoring_context = self._build_scoring_context(
+            embedding,
+            target,
+            downstream_features=downstream_features,
+            sample_scores=sample_scores,
+        )
         batch = self._build_candidates(embedding, scoring_context)
         if not batch.candidates:
             raise ClusterSelectionUnavailableError(batch.plan, batch.failures)
 
+        selection_candidates = batch.candidates
+        if self.selection_metric == "downstream_proxy":
+            batch, selection_candidates = self._rerank_downstream_candidates(
+                batch,
+                scoring_context,
+            )
         decision = self._select_candidate(
-            batch.candidates,
+            selection_candidates,
             embedding,
             scoring_context,
         )
@@ -251,6 +347,9 @@ class SpectralClusterSelector:
             min_partitions=self.min_partitions,
             max_partitions=self.max_partitions,
             min_auto_partition_size=self.min_auto_partition_size,
+            include_single_partition_candidate=(
+                self.include_single_partition_candidate
+            ),
         )
 
     def _build_candidates(
@@ -449,6 +548,19 @@ class SpectralClusterSelector:
             if scoring_context.validation_proxy is not None
             else None
         )
+        budget_plan = None
+        if self.budget_feasibility_mode == "hard":
+            budget_plan = build_partition_budget_plan(
+                {
+                    f"chunk_{cluster_id}": int(count)
+                    for cluster_id, count in enumerate(counts.tolist())
+                },
+                total_rows=int(labels.size),
+                budget_ratio=self.sampling_budget_ratio,
+                min_rows_per_partition=self.min_sampled_rows_per_partition,
+                max_imbalance_ratio=self.budget_max_imbalance_ratio,
+                min_partition_fraction=self.budget_min_partition_fraction,
+            )
         return evaluate_cluster_score_components(
             counts=counts,
             silhouette=silhouette,
@@ -457,12 +569,16 @@ class SpectralClusterSelector:
             min_cluster_fraction=self.min_cluster_fraction,
             classification=classification,
             validation_proxy=validation_proxy,
+            budget_plan=budget_plan,
         )
 
     def _candidate_score(self, components: ClusterScoreComponents) -> float:
+        selection_metric = self.selection_metric
+        if selection_metric == "downstream_proxy" and components.downstream_proxy is None:
+            selection_metric = "balanced_silhouette"
         return score_cluster_components(
             components,
-            selection_metric=self.selection_metric,
+            selection_metric=selection_metric,
             imbalance_penalty_weight=self.imbalance_penalty_weight,
             tiny_cluster_penalty_weight=self.tiny_cluster_penalty_weight,
             target_contrast_weight=self.target_contrast_weight,
@@ -471,16 +587,25 @@ class SpectralClusterSelector:
             class_distribution_drift_weight=(
                 self.class_distribution_drift_weight
             ),
+            downstream_complexity_penalty_weight=(
+                self.downstream_complexity_penalty_weight
+            ),
         )
 
     def _build_scoring_context(
         self,
         embedding: np.ndarray,
         target: Optional[Any],
+        *,
+        downstream_features: Optional[np.ndarray],
+        sample_scores: Optional[np.ndarray],
     ) -> _ClusterScoringContext:
         resolved_target_type = self._resolve_target_type(target)
         validation_proxy = None
-        if self.selection_metric == "validation_proxy":
+        if self.selection_metric in {
+            "validation_proxy",
+            "budget_aware_validation_proxy",
+        }:
             if resolved_target_type not in {"regression", "classification"}:
                 raise ValueError(
                     "validation_proxy cluster selection requires a supported target"
@@ -496,11 +621,104 @@ class SpectralClusterSelector:
                 classification_smoothing=self.validation_proxy_smoothing,
                 random_state=self.random_state,
             )
+        downstream_proxy = None
+        if self.selection_metric == "downstream_proxy":
+            if resolved_target_type != "regression":
+                raise ValueError(
+                    "downstream_proxy cluster selection requires a regression target"
+                )
+            if downstream_features is None or sample_scores is None:
+                raise ValueError(
+                    "downstream_proxy requires downstream_features and sample_scores"
+                )
+            downstream_proxy = PartitionDownstreamProxyEvaluator(
+                embedding,
+                downstream_features,
+                target,
+                sample_scores,
+                target_type=resolved_target_type,
+                model_factory=self.downstream_proxy_model_factory,
+                budget_ratio=self.sampling_budget_ratio,
+                min_partition_rows=self.min_sampled_rows_per_partition,
+                max_imbalance_ratio=self.budget_max_imbalance_ratio,
+                min_partition_fraction=self.budget_min_partition_fraction,
+                selection_method=self.selection_method,
+                routing_temperature=self.routing_temperature,
+                routing_shrinkage=self.routing_shrinkage,
+                validation_fraction=self.validation_proxy_fraction,
+                random_state=self.random_state,
+            )
         return _ClusterScoringContext(
             target=target,
             resolved_target_type=resolved_target_type,
             validation_proxy=validation_proxy,
+            downstream_proxy=downstream_proxy,
         )
+
+    def _rerank_downstream_candidates(
+        self,
+        batch: _ClusterCandidateBatch,
+        scoring_context: _ClusterScoringContext,
+    ) -> tuple[_ClusterCandidateBatch, Tuple[ClusterCandidate, ...]]:
+        evaluator = scoring_context.downstream_proxy
+        if evaluator is None:
+            raise RuntimeError("Downstream proxy evaluator is not initialized")
+        preliminary = tuple(
+            sorted(
+                (candidate for candidate in batch.candidates if candidate.valid),
+                key=lambda candidate: (
+                    -candidate.score,
+                    candidate.n_clusters,
+                    candidate.algorithm,
+                ),
+            )[: self.downstream_proxy_shortlist_size]
+        )
+        if not preliminary:
+            raise ValueError(
+                "No budget-feasible partition candidate is available for downstream reranking"
+            )
+
+        reranked_by_identity: Dict[int, ClusterCandidate] = {}
+        reranked: List[ClusterCandidate] = []
+        for candidate in preliminary:
+            components = evaluator.evaluate(candidate.labels)
+            payload = dict(candidate.components)
+            payload["preliminary_score"] = float(candidate.score)
+            payload["downstream_proxy"] = components.to_dict()
+            score = float(
+                components.relative_gain_vs_global
+                - self.downstream_complexity_penalty_weight
+                * max(candidate.n_clusters - 1, 0)
+            )
+            updated = replace(
+                candidate,
+                score=score,
+                valid=(candidate.valid and components.status == "ok"),
+                components=payload,
+            )
+            reranked.append(updated)
+            reranked_by_identity[id(candidate)] = updated
+
+        all_candidates = tuple(
+            reranked_by_identity.get(
+                id(candidate),
+                replace(
+                    candidate,
+                    score=-math.inf,
+                    valid=False,
+                    components={
+                        **candidate.components,
+                        "preliminary_score": float(candidate.score),
+                        "downstream_proxy": {"status": "not_shortlisted"},
+                    },
+                ),
+            )
+            for candidate in batch.candidates
+        )
+        selected_pool = tuple(candidate for candidate in reranked if candidate.valid)
+        if not selected_pool:
+            raise ValueError("Every downstream partition candidate evaluation failed")
+        return replace(batch, candidates=all_candidates), selected_pool
 
     def _resolve_target_type(self, target: Optional[Any]) -> str:
         if target is None:
@@ -735,6 +953,24 @@ class SpectralClusterSelector:
             "validation_proxy_smoothing": float(
                 self.validation_proxy_smoothing
             ),
+            "sampling_budget_ratio": float(self.sampling_budget_ratio),
+            "budget_feasibility_mode": self.budget_feasibility_mode,
+            "min_sampled_rows_per_partition": int(
+                self.min_sampled_rows_per_partition
+            ),
+            "budget_max_imbalance_ratio": self.budget_max_imbalance_ratio,
+            "budget_min_partition_fraction": float(
+                self.budget_min_partition_fraction
+            ),
+            "include_single_partition_candidate": bool(
+                self.include_single_partition_candidate
+            ),
+            "downstream_proxy_shortlist_size": int(
+                self.downstream_proxy_shortlist_size
+            ),
+            "downstream_complexity_penalty_weight": float(
+                self.downstream_complexity_penalty_weight
+            ),
             "candidate_plan": batch.plan.to_dict(),
             "candidate_failures": [failure.to_dict() for failure in batch.failures],
             "selected_candidate": self._candidate_diagnostic(selected),
@@ -811,6 +1047,20 @@ class SpectralClusterSelector:
         normalized = float(value)
         if not np.isfinite(normalized) or not 0 < normalized < 0.5:
             raise ValueError(f"{name} must be in (0, 0.5)")
+        return normalized
+
+    @staticmethod
+    def _validate_unit_fraction(name: str, value: float) -> float:
+        normalized = float(value)
+        if not np.isfinite(normalized) or not 0 < normalized <= 1:
+            raise ValueError(f"{name} must be in (0, 1]")
+        return normalized
+
+    @staticmethod
+    def _validate_zero_one_fraction(name: str, value: float) -> float:
+        normalized = float(value)
+        if not np.isfinite(normalized) or not 0 <= normalized <= 1:
+            raise ValueError(f"{name} must be in [0, 1]")
         return normalized
 
     @staticmethod

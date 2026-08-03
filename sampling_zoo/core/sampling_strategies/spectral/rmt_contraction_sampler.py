@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, replace
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from dataclasses import dataclass, field, replace
+from time import perf_counter
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -12,6 +13,7 @@ from .backend.matrix_backend import MatrixRMTBackend
 from .backend.tensor_backend import TensorRMTBackend
 from .base_sampler import SpectralSamplerBase
 from .cluster_selection import ClusterSelectionResult, SpectralClusterSelector
+from .partition_sampling import select_partition_indices
 from .null_diagnostics import (
     SpectralNullDiagnostic,
     SpectralNullDiagnosticConfig,
@@ -24,6 +26,7 @@ from .subspace_diagnostics import (
 )
 from ...utils.progress import progress_bar
 from ...utils.utils import safe_index
+from ...experiment.budgeting import PartitionBudgetPlan, build_partition_budget_plan
 
 
 ArrayLike = Union[np.ndarray, pd.DataFrame]
@@ -63,6 +66,19 @@ class RMTContractionConfig:
     validation_proxy_fraction: float = 0.2
     validation_proxy_min_partition_rows: int = 8
     validation_proxy_smoothing: float = 1.0
+    sampling_budget_ratio: float = 1.0
+    budget_feasibility_mode: str = "off"
+    min_sampled_rows_per_partition: int = 1
+    budget_max_imbalance_ratio: Optional[float] = None
+    budget_min_partition_fraction: float = 0.0
+    include_single_partition_candidate: bool = False
+    downstream_proxy_model_factory: Optional[Callable[[], Any]] = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    downstream_proxy_shortlist_size: int = 3
+    downstream_complexity_penalty_weight: float = 0.01
     cluster_vote_temperature: float = 0.05
     n_views: Union[int, str] = "auto"
     n_views_policy: str = "auto"
@@ -234,7 +250,13 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self.cluster_selection_metric = self._validate_choice(
             "cluster_selection_metric",
             cfg.cluster_selection_metric,
-            ("silhouette", "balanced_silhouette", "validation_proxy"),
+            (
+                "silhouette",
+                "balanced_silhouette",
+                "validation_proxy",
+                "budget_aware_validation_proxy",
+                "downstream_proxy",
+            ),
         )
         self.cluster_ensemble_method = self._validate_choice(
             "cluster_ensemble_method",
@@ -298,6 +320,45 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self.validation_proxy_smoothing = self._validate_positive_float(
             "validation_proxy_smoothing",
             cfg.validation_proxy_smoothing,
+        )
+        self.sampling_budget_ratio = self._validate_fraction(
+            "sampling_budget_ratio",
+            cfg.sampling_budget_ratio,
+        )
+        self.budget_feasibility_mode = self._validate_choice(
+            "budget_feasibility_mode",
+            cfg.budget_feasibility_mode,
+            ("off", "hard"),
+        )
+        self.min_sampled_rows_per_partition = self._validate_positive_int(
+            "min_sampled_rows_per_partition",
+            cfg.min_sampled_rows_per_partition,
+        )
+        self.budget_max_imbalance_ratio = (
+            None
+            if cfg.budget_max_imbalance_ratio is None
+            else self._validate_positive_float(
+                "budget_max_imbalance_ratio",
+                cfg.budget_max_imbalance_ratio,
+            )
+        )
+        self.budget_min_partition_fraction = self._validate_nonnegative_fraction(
+            "budget_min_partition_fraction",
+            cfg.budget_min_partition_fraction,
+        )
+        self.include_single_partition_candidate = bool(
+            cfg.include_single_partition_candidate
+        )
+        self.downstream_proxy_model_factory = cfg.downstream_proxy_model_factory
+        self.downstream_proxy_shortlist_size = self._validate_positive_int(
+            "downstream_proxy_shortlist_size",
+            cfg.downstream_proxy_shortlist_size,
+        )
+        self.downstream_complexity_penalty_weight = (
+            self._validate_nonnegative_float(
+                "downstream_complexity_penalty_weight",
+                cfg.downstream_complexity_penalty_weight,
+            )
         )
         self.cluster_vote_temperature = self._validate_positive_float(
             "cluster_vote_temperature",
@@ -386,6 +447,7 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self.rank_selection_info_: Optional[RankSelectionInfo] = None
         self.n_views_selection_info_: Optional[NViewsSelectionInfo] = None
         self.partition_selection_info_: Optional[PartitionSelectionInfo] = None
+        self.partition_budget_plan_: Optional[PartitionBudgetPlan] = None
 
     @staticmethod
     def _normalize_config_inputs(
@@ -476,6 +538,13 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             raise ValueError(f"{name} must be a non-negative finite value")
         return value
 
+    @staticmethod
+    def _validate_nonnegative_fraction(name: str, value: float) -> float:
+        normalized = float(value)
+        if not np.isfinite(normalized) or not 0 <= normalized <= 1:
+            raise ValueError(f"{name} must be in [0, 1]")
+        return normalized
+
     def _make_cluster_selector(self) -> SpectralClusterSelector:
         return SpectralClusterSelector(
             algorithms=self.cluster_algorithms,
@@ -501,6 +570,30 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
                 self.validation_proxy_min_partition_rows
             ),
             validation_proxy_smoothing=self.validation_proxy_smoothing,
+            sampling_budget_ratio=self.sampling_budget_ratio,
+            budget_feasibility_mode=self.budget_feasibility_mode,
+            min_sampled_rows_per_partition=(
+                self.min_sampled_rows_per_partition
+            ),
+            budget_max_imbalance_ratio=self.budget_max_imbalance_ratio,
+            budget_min_partition_fraction=(
+                self.budget_min_partition_fraction
+            ),
+            include_single_partition_candidate=(
+                self.include_single_partition_candidate
+            ),
+            downstream_proxy_model_factory=(
+                self.downstream_proxy_model_factory
+            ),
+            downstream_proxy_shortlist_size=(
+                self.downstream_proxy_shortlist_size
+            ),
+            downstream_complexity_penalty_weight=(
+                self.downstream_complexity_penalty_weight
+            ),
+            selection_method=self.selection_method,
+            routing_temperature=self.routing_temperature,
+            routing_shrinkage=self.routing_shrinkage,
             vote_temperature=self.cluster_vote_temperature,
             random_state=self.random_state,
             show_progress=self.show_progress,
@@ -512,27 +605,53 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         target: Optional[Union[np.ndarray, pd.Series]] = None,
         **kwargs: Any,
     ) -> "RMTContractionTensorSampler":
+        fit_started = perf_counter()
+        stage_seconds: Dict[str, float] = {}
         with progress_bar(
             enabled=self.show_progress,
             desc="RMT sampler fit",
             total=7,
         ) as stage:
+            started = perf_counter()
             rng = self._start_fit()
+            stage_seconds["initialize"] = perf_counter() - started
+            started = perf_counter()
             X_num = self._fit_transform_features(data)
+            stage_seconds["preprocessing"] = perf_counter() - started
             stage.update(1)
+            started = perf_counter()
             M = self._build_fit_unfolding(X_num, rng)
+            stage_seconds["unfolding_and_view_selection"] = perf_counter() - started
             stage.update(1)
+            started = perf_counter()
             U, S, Vt, scores, rank = self._fit_spectral_basis(M)
+            stage_seconds["spectral_basis"] = perf_counter() - started
             stage.update(1)
             self._store_spectral_basis(U, S, Vt, scores)
+            started = perf_counter()
             self._fit_spectral_null_diagnostic(X_num)
+            stage_seconds["null_diagnostics"] = perf_counter() - started
             stage.update(1)
+            started = perf_counter()
             self._fit_spectral_subspace_diagnostic(X_num)
+            stage_seconds["subspace_diagnostics"] = perf_counter() - started
             stage.update(1)
-            self._fit_clusters_and_partitions(scores, target)
+            started = perf_counter()
+            self._fit_clusters_and_partitions(X_num, scores, target)
+            stage_seconds["partition_selection_and_sampling"] = perf_counter() - started
             stage.update(1)
+            started = perf_counter()
             self._build_diagnostics(M, rank)
+            stage_seconds["diagnostics"] = perf_counter() - started
             stage.update(1)
+        self.runtime_diagnostics_ = {
+            "stage_seconds": {
+                name: float(value) for name, value in stage_seconds.items()
+            },
+            "total_seconds": float(perf_counter() - fit_started),
+            "cold_start": True,
+        }
+        self.diagnostics_["runtime"] = dict(self.runtime_diagnostics_)
         return self
 
     def _start_fit(self) -> np.random.Generator:
@@ -550,6 +669,7 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self.rank_selection_info_ = None
         self.n_views_selection_info_ = None
         self.partition_selection_info_ = None
+        self.partition_budget_plan_ = None
         self.cluster_centers_ = None
         if self.n_views_requested == "auto":
             self.n_views = self.min_views
@@ -738,12 +858,18 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
 
     def _fit_clusters_and_partitions(
         self,
+        features: np.ndarray,
         scores: np.ndarray,
         target: Optional[Union[np.ndarray, pd.Series]],
     ) -> None:
         if self.sample_embedding_ is None:
             raise RuntimeError("Sample embedding is not available")
-        labels = self._fit_cluster_labels(self.sample_embedding_, target)
+        labels = self._fit_cluster_labels(
+            self.sample_embedding_,
+            target,
+            downstream_features=features,
+            sample_scores=scores,
+        )
         self.cluster_labels_ = labels
         self._build_partitions_from_labels(labels, scores, target)
 
@@ -751,9 +877,17 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self,
         embedding: np.ndarray,
         target: Optional[Union[np.ndarray, pd.Series]],
+        *,
+        downstream_features: np.ndarray,
+        sample_scores: np.ndarray,
     ) -> np.ndarray:
         if self.partition_selection_method == "auto":
-            return self._fit_auto_partition_clusters(embedding, target)
+            return self._fit_auto_partition_clusters(
+                embedding,
+                target,
+                downstream_features=downstream_features,
+                sample_scores=sample_scores,
+            )
         n_clusters = min(self.n_partitions, embedding.shape[0])
         self.clusterer_ = self._make_kmeans(n_clusters=n_clusters)
         labels = self.clusterer_.fit_predict(embedding)
@@ -785,8 +919,16 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self,
         embedding: np.ndarray,
         target: Optional[Union[np.ndarray, pd.Series]],
+        *,
+        downstream_features: np.ndarray,
+        sample_scores: np.ndarray,
     ) -> np.ndarray:
-        result = self.cluster_selector_.select(embedding, target=target)
+        result = self.cluster_selector_.select(
+            embedding,
+            target=target,
+            downstream_features=downstream_features,
+            sample_scores=sample_scores,
+        )
         self.clusterer_ = result.estimator
         self.cluster_centers_ = result.centers
         self.partition_selection_info_ = self._partition_info_from_selection(result)
@@ -1116,12 +1258,45 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         partitions: Dict[str, np.ndarray] = {}
         cluster_quality: List[Tuple[str, float]] = []
 
-        for cluster_id in sorted(np.unique(labels).tolist()):
-            cluster_idx = np.where(labels == cluster_id)[0]
-            selected = self._select_from_cluster(cluster_idx, scores)
+        cluster_indices = {
+            int(cluster_id): np.where(labels == cluster_id)[0]
+            for cluster_id in sorted(np.unique(labels).tolist())
+        }
+        capacities = {
+            f"chunk_{cluster_id}": self._cluster_selection_capacity(indices.size)
+            for cluster_id, indices in cluster_indices.items()
+        }
+        hard_budget = self.budget_feasibility_mode == "hard"
+        self.partition_budget_plan_ = build_partition_budget_plan(
+            capacities,
+            total_rows=int(labels.size),
+            budget_ratio=self.sampling_budget_ratio,
+            min_rows_per_partition=(
+                self.min_sampled_rows_per_partition if hard_budget else 1
+            ),
+            max_imbalance_ratio=(
+                self.budget_max_imbalance_ratio if hard_budget else None
+            ),
+            min_partition_fraction=(
+                self.budget_min_partition_fraction if hard_budget else 0.0
+            ),
+        )
+        if hard_budget and not self.partition_budget_plan_.feasible:
+            raise ValueError(
+                "Selected partition candidate is infeasible for the sampling budget: "
+                f"{self.partition_budget_plan_.to_dict()['violations']}"
+            )
+        allocation = self.partition_budget_plan_.allocation_map
+
+        for cluster_id, cluster_idx in cluster_indices.items():
+            name = f"chunk_{cluster_id}"
+            selected = self._select_from_cluster(
+                cluster_idx,
+                scores,
+                target_size=allocation[name],
+            )
             if selected.size == 0:
                 continue
-            name = f"chunk_{int(cluster_id)}"
             partitions[name] = selected
             cluster_quality.append((name, float(np.mean(scores[selected]))))
 
@@ -1136,70 +1311,36 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self.partition_names_ = list(partitions.keys())
         self.partition_to_cluster_ = {name: int(name.split("_")[-1]) for name in self.partition_names_}
 
-    def _select_from_cluster(self, cluster_idx: np.ndarray, scores: np.ndarray) -> np.ndarray:
-        if cluster_idx.size == 0:
-            return cluster_idx
-        if self.selection_method == "all" and self.chunk_fraction >= 1.0 and self.max_chunk_size is None:
-            return np.asarray(cluster_idx, dtype=int)
-
-        target_size = int(math.ceil(cluster_idx.size * self.chunk_fraction))
+    def _cluster_selection_capacity(self, cluster_size: int) -> int:
+        target_size = int(math.ceil(cluster_size * self.chunk_fraction))
         target_size = max(self.min_chunk_size, target_size)
         if self.max_chunk_size is not None:
             target_size = min(target_size, int(self.max_chunk_size))
-        target_size = min(target_size, cluster_idx.size)
+        return min(target_size, int(cluster_size))
 
-        if self.selection_method == "all":
-            return np.asarray(cluster_idx[:target_size], dtype=int)
-
-        if self.selection_method == "leverage":
-            order = np.argsort(-scores[cluster_idx], kind="mergesort")
-            return np.asarray(cluster_idx[order[:target_size]], dtype=int)
-
+    def _select_from_cluster(
+        self,
+        cluster_idx: np.ndarray,
+        scores: np.ndarray,
+        *,
+        target_size: Optional[int] = None,
+    ) -> np.ndarray:
+        if cluster_idx.size == 0:
+            return cluster_idx
         if self.sample_embedding_ is None:
             raise RuntimeError("Sample embedding is not available")
-
-        if self.selection_method == "maxvol":
-            return self._greedy_maxvol_indices(cluster_idx, target_size)
-
-        # hybrid: half leverage, half diversity via greedy MaxVol/farthest-span proxy
-        first = max(1, target_size // 2)
-        order = np.argsort(-scores[cluster_idx], kind="mergesort")
-        picked = list(cluster_idx[order[:first]])
-        remaining = np.setdiff1d(cluster_idx, np.asarray(picked, dtype=int), assume_unique=False)
-        if len(picked) < target_size and remaining.size > 0:
-            extra = self._greedy_maxvol_indices(remaining, target_size - len(picked))
-            picked.extend(extra.tolist())
-        return np.asarray(picked[:target_size], dtype=int)
-
-    def _greedy_maxvol_indices(self, candidate_idx: np.ndarray, target_size: int) -> np.ndarray:
-        """Small, dependency-light proxy for MaxVol: greedily maximize residual norm."""
-        E = self.sample_embedding_[candidate_idx]
-        if candidate_idx.size <= target_size:
-            return np.asarray(candidate_idx, dtype=int)
-        norms = np.sum(E * E, axis=1)
-        first = int(np.argmax(norms))
-        picked_local = [first]
-        Q = self._orthonormal_basis(E[[first]])
-
-        while len(picked_local) < target_size:
-            proj = E @ Q.T if Q.size else 0.0
-            residual = E - proj @ Q if Q.size else E
-            res_norms = np.sum(residual * residual, axis=1)
-            res_norms[picked_local] = -np.inf
-            nxt = int(np.argmax(res_norms))
-            if not np.isfinite(res_norms[nxt]):
-                break
-            picked_local.append(nxt)
-            Q = self._orthonormal_basis(E[picked_local])
-        return np.asarray(candidate_idx[picked_local], dtype=int)
-
-    @staticmethod
-    def _orthonormal_basis(rows: np.ndarray) -> np.ndarray:
-        if rows.size == 0:
-            return np.empty((0, 0))
-        # QR on transpose gives an orthonormal row-span basis after transpose.
-        Q, _ = np.linalg.qr(rows.T, mode="reduced")
-        return Q.T
+        resolved_target_size = (
+            self._cluster_selection_capacity(cluster_idx.size)
+            if target_size is None
+            else int(target_size)
+        )
+        return select_partition_indices(
+            cluster_idx,
+            target_size=resolved_target_size,
+            selection_method=self.selection_method,
+            scores=scores,
+            embedding=self.sample_embedding_,
+        )
 
     def _project_new_unfolding(self, M_new: np.ndarray) -> np.ndarray:
         if self.right_basis_ is None or self.singular_values_ is None:
@@ -1335,6 +1476,30 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             ),
             "validation_proxy_smoothing": float(
                 self.validation_proxy_smoothing
+            ),
+            "sampling_budget_ratio": float(self.sampling_budget_ratio),
+            "budget_feasibility_mode": self.budget_feasibility_mode,
+            "min_sampled_rows_per_partition": int(
+                self.min_sampled_rows_per_partition
+            ),
+            "budget_max_imbalance_ratio": self.budget_max_imbalance_ratio,
+            "budget_min_partition_fraction": float(
+                self.budget_min_partition_fraction
+            ),
+            "partition_budget_plan": (
+                self.partition_budget_plan_.to_dict()
+                if self.partition_budget_plan_ is not None
+                else {}
+            ),
+            "pre_budget_chunk_sizes": (
+                self.partition_budget_plan_.source_size_map
+                if self.partition_budget_plan_ is not None
+                else {}
+            ),
+            "post_budget_chunk_sizes": (
+                self.partition_budget_plan_.allocation_map
+                if self.partition_budget_plan_ is not None
+                else {}
             ),
             "partition_selection_candidates": list(partition_info.candidates) if partition_info else [],
             "partition_selection_scores": {

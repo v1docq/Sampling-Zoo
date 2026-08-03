@@ -1,6 +1,7 @@
 # model_integration.py
 import pickle
 import os
+from time import perf_counter
 from scipy.stats import mode
 import pandas as pd
 import numpy as np
@@ -9,7 +10,12 @@ from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 
 from sampling_zoo.core.api.api_main import SamplingStrategyFactory
 from sampling_zoo.core.metrics.eval_metrics import calculate_metrics, get_metric_comparator
-from sampling_zoo.core.experiment.contracts import PartitionTrainingRequest, PartitionTrainingResult
+from sampling_zoo.core.experiment.contracts import (
+    PartitionSizeDiagnosticsContract,
+    PartitionTrainingRequest,
+    PartitionTrainingResult,
+    RuntimeDiagnosticsContract,
+)
 from sampling_zoo.core.experiment.morphisms import (
     chunk_models_to_contracts,
     partitions_to_contract,
@@ -77,6 +83,9 @@ class SamplingEnsemble:
         self.validation_diagnostics_ = {}
         self.test_routing_diagnostics_ = {}
         self.partition_training_contract_ = None
+        self.runtime_diagnostics_ = {}
+        self.runtime_contract_ = None
+        self.partition_size_diagnostics_contract_ = None
 
     def _log(self, message: str) -> None:
         progress_write(message, enabled=self.show_progress)
@@ -90,28 +99,45 @@ class SamplingEnsemble:
         """
         try:
             strategy_name = self._strategy_name()
+            partition_started = perf_counter()
+            timings: Dict[str, float] = {}
             with progress_bar(
                 enabled=self.show_progress,
                 desc=f"Prepare chunks ({strategy_name})",
                 total=4,
             ) as stage:
+                started = perf_counter()
                 strategy_kwargs = self._build_partitioner_kwargs(strategy_name, random_state)
+                timings['config_resolution'] = perf_counter() - started
                 stage.update(1)
 
+                started = perf_counter()
                 self.partitioner = self._create_partitioner(strategy_name, strategy_kwargs)
+                timings['partitioner_initialization'] = perf_counter() - started
                 stage.update(1)
 
+                started = perf_counter()
                 self.partitions = self._fit_and_collect_partitions(self.partitioner, strategy_name, features, target)
+                timings['partitioner_fit_and_collect'] = perf_counter() - started
                 stage.update(1)
 
+                started = perf_counter()
                 self.partitions = self._apply_budget_policy_to_partitions(
                     partitions=self.partitions,
                     total_rows=len(features),
                     random_state=random_state,
                 )
+                timings['budget_application'] = perf_counter() - started
                 stage.update(1)
 
+            started = perf_counter()
             self.partition_diagnostics_ = self._build_partition_target_diagnostics(self.partitions, target)
+            self.partition_size_diagnostics_contract_ = (
+                self._build_partition_size_diagnostics_contract(self.partitions)
+            )
+            timings['partition_diagnostics'] = perf_counter() - started
+            timings['total'] = perf_counter() - partition_started
+            self.runtime_diagnostics_['partitioning'] = timings
             self._log_partition_summary(self.partitions)
             return self.partitions
 
@@ -155,6 +181,7 @@ class SamplingEnsemble:
             'em_min_partition_size',
             'em_refit_router',
             'em_keep_best',
+            'downstream_proxy_n_estimators',
         }
 
     @staticmethod
@@ -185,7 +212,57 @@ class SamplingEnsemble:
             return {key: value for key, value in strategy_kwargs.items() if key in allowed_keys}
         if strategy_name == 'rmt_contraction':
             strategy_kwargs.setdefault('show_progress', self.show_progress)
+            budget_ratio = self.partitioner_config.get('budget_ratio')
+            if budget_ratio is not None:
+                strategy_kwargs.setdefault('sampling_budget_ratio', float(budget_ratio))
+            selection_metric = str(
+                strategy_kwargs.get('cluster_selection_metric', '')
+            ).strip().lower()
+            if selection_metric in {
+                'budget_aware_validation_proxy',
+                'downstream_proxy',
+            }:
+                strategy_kwargs.setdefault('budget_feasibility_mode', 'hard')
+                strategy_kwargs.setdefault('include_single_partition_candidate', True)
+                strategy_kwargs.setdefault('min_sampled_rows_per_partition', 32)
+                strategy_kwargs.setdefault('budget_max_imbalance_ratio', 5.0)
+                strategy_kwargs.setdefault('budget_min_partition_fraction', 0.05)
+            if selection_metric == 'downstream_proxy':
+                strategy_kwargs['downstream_proxy_model_factory'] = (
+                    self._build_downstream_proxy_model_factory()
+                )
         return strategy_kwargs
+
+    def _build_downstream_proxy_model_factory(self) -> Callable[[], Any]:
+        max_estimators = int(
+            self.partitioner_config.get('downstream_proxy_n_estimators', 32)
+        )
+        if max_estimators < 1:
+            raise ValueError("downstream_proxy_n_estimators must be positive")
+
+        def _factory() -> Any:
+            model = self._create_model_instance()
+            if not hasattr(model, 'get_params') or not hasattr(model, 'set_params'):
+                raise ValueError(
+                    "downstream_proxy requires a sklearn-compatible model with get_params/set_params"
+                )
+            params = model.get_params(deep=False)
+            updates: Dict[str, Any] = {}
+            if 'n_estimators' in params:
+                current = params.get('n_estimators')
+                current = max_estimators if current is None else int(current)
+                updates['n_estimators'] = min(current, max_estimators)
+            if 'max_iter' in params:
+                current = params.get('max_iter')
+                current = max_estimators if current is None else int(current)
+                updates['max_iter'] = min(current, max_estimators)
+            if 'n_jobs' in params:
+                updates['n_jobs'] = 1
+            if updates:
+                model.set_params(**updates)
+            return model
+
+        return _factory
 
     def _with_supervised_partitioner_kwargs(
         self,
@@ -310,6 +387,19 @@ class SamplingEnsemble:
         if not (0 < budget_ratio <= 1):
             raise ValueError("budget_ratio must be in (0, 1]")
 
+        sampler_budget_plan = getattr(
+            self.partitioner,
+            'partition_budget_plan_',
+            None,
+        )
+        if sampler_budget_plan is not None:
+            self.budget_policy_ = {
+                **sampler_budget_plan.to_dict(),
+                'applied': True,
+                'applied_by': 'partitioner',
+            }
+            return partitions
+
         sizes = {name: self._partition_size(chunk) for name, chunk in partitions.items()}
         sizes = {name: size for name, size in sizes.items() if size > 0}
         if not sizes:
@@ -364,6 +454,39 @@ class SamplingEnsemble:
             'partition_sizes': {name: int(count) for name, count in counts.items()},
         }
         return budgeted
+
+    def _build_partition_size_diagnostics_contract(
+        self,
+        partitions: Dict[str, Any],
+    ) -> PartitionSizeDiagnosticsContract:
+        post_sizes = {
+            str(name): int(self._partition_size(partition))
+            for name, partition in partitions.items()
+        }
+        sampler_plan = getattr(self.partitioner, 'partition_budget_plan_', None)
+        if sampler_plan is not None:
+            pre_sizes = sampler_plan.source_size_map
+            requested_budget_size = int(sampler_plan.requested_budget_size)
+        else:
+            policy = getattr(self, 'budget_policy_', {}) or {}
+            pre_sizes = {
+                str(name): int(size)
+                for name, size in policy.get('source_sizes', post_sizes).items()
+            }
+            requested_budget_size = policy.get('budget_size')
+        selected_rows = int(sum(post_sizes.values()))
+        return PartitionSizeDiagnosticsContract(
+            pre_budget_sizes=pre_sizes,
+            post_budget_sizes=post_sizes,
+            requested_budget_size=(
+                None
+                if requested_budget_size is None
+                else int(requested_budget_size)
+            ),
+            selected_rows=selected_rows,
+            unique_selected_rows=selected_rows,
+            duplicate_rows=0,
+        )
 
     def _build_partition_target_diagnostics(self, partitions: Dict[str, Any], target: pd.Series) -> Dict[str, Any]:
         global_values = self._numeric_target_values(target)
@@ -614,16 +737,20 @@ class SamplingEnsemble:
         """
         Train one model per prepared data partition.
         """
+        training_started = perf_counter()
+        started = perf_counter()
         partitions = self._load_or_prepare_partitions(
             X_train=X_train,
             y_train=y_train,
             cv_fold=cv_fold,
             save_models_to_disk=save_models_to_disk,
         )
+        partition_preparation_time = perf_counter() - started
         validation_metric = self._normalize_validation_metric(validation_metric)
         metric_is_better = get_metric_comparator(validation_metric)
         training_request = self._build_partition_training_request(partitions, validation_metric)
 
+        started = perf_counter()
         self._train_partition_loop(
             partitions=partitions,
             X_val=X_val,
@@ -635,6 +762,8 @@ class SamplingEnsemble:
             train_all_chunks=train_all_chunks,
             save_models_to_disk=save_models_to_disk,
         )
+        model_training_time = perf_counter() - started
+        started = perf_counter()
         self._finalize_partition_training(
             partitions=partitions,
             X_val=X_val,
@@ -642,9 +771,48 @@ class SamplingEnsemble:
             metric_is_better=metric_is_better,
             validation_metric=validation_metric,
         )
+        routing_finalization_time = perf_counter() - started
         self.partition_training_contract_ = self._build_partition_training_result(
             request=training_request,
             partitions=partitions,
+        )
+        self.runtime_diagnostics_['training'] = {
+            'partition_preparation': float(partition_preparation_time),
+            'chunk_training_and_validation': float(model_training_time),
+            'routing_and_finalization': float(routing_finalization_time),
+            'chunk_model_fit_total': float(
+                sum(
+                    model_info.get('timings', {}).get('fit', 0.0)
+                    for model_info in self.models
+                )
+            ),
+            'chunk_validation_inference_total': float(
+                sum(
+                    model_info.get('timings', {}).get('validation_inference', 0.0)
+                    for model_info in self.models
+                )
+            ),
+            'total': float(perf_counter() - training_started),
+        }
+        stage_seconds = {
+            f"partitioning.{name}": float(value)
+            for name, value in self.runtime_diagnostics_.get('partitioning', {}).items()
+            if name != 'total'
+        }
+        if not stage_seconds:
+            stage_seconds['partitioning.total'] = float(partition_preparation_time)
+        stage_seconds.update({
+            'training.chunk_training_and_validation': float(model_training_time),
+            'training.routing_and_finalization': float(routing_finalization_time),
+        })
+        self.runtime_contract_ = RuntimeDiagnosticsContract(
+            stage_seconds=stage_seconds,
+            total_seconds=float(self.runtime_diagnostics_['training']['total']),
+            cold_start=True,
+            metadata={
+                'strategy': self._strategy_name(),
+                'n_partitions': len(partitions),
+            },
         )
 
     def _build_partition_training_request(
@@ -667,7 +835,17 @@ class SamplingEnsemble:
     ) -> PartitionTrainingResult:
         return PartitionTrainingResult(
             request=request,
-            partitions=partitions_to_contract(partitions, self.partition_diagnostics_),
+            partitions=partitions_to_contract(
+                partitions,
+                {
+                    **self.partition_diagnostics_,
+                    "size_contract": (
+                        self.partition_size_diagnostics_contract_.to_dict()
+                        if self.partition_size_diagnostics_contract_ is not None
+                        else {}
+                    ),
+                },
+            ),
             chunk_models=chunk_models_to_contracts(self.models),
             routing=routing_to_contract(self.router),
             validation_diagnostics=dict(self.validation_diagnostics_),
@@ -802,17 +980,31 @@ class SamplingEnsemble:
         self._log(f"Training model for chunk {partition_name}...")
         partition_data = self._ensure_partition_class_coverage(partition_data, class_samples)
         model = self._create_model_instance()
+        fit_started = perf_counter()
         model.fit(partition_data['feature'], partition_data['target'])
+        model_fit_time = perf_counter() - fit_started
         self._save_partition_model_if_requested(model, partition_name, cv_fold, save_models_to_disk)
 
+        inference_started = perf_counter()
         predict_labels, predict_proba = self._run_inference(model, X_val, calculation_mode='non-batch')
+        validation_inference_time = perf_counter() - inference_started
         metrics = calculate_metrics(
             y_true=y_val,
             problem_type=self.problem,
             y_labels=predict_labels,
             y_proba=predict_proba if self.problem == "classification" else None,
         )
-        model_info = self._build_partition_model_info(partition_name, model, partition_data, metrics, predict_labels)
+        model_info = self._build_partition_model_info(
+            partition_name,
+            model,
+            partition_data,
+            metrics,
+            predict_labels,
+            timings={
+                'fit': model_fit_time,
+                'validation_inference': validation_inference_time,
+            },
+        )
         self._register_partition_model(partition_name, model_info, metrics)
         self._log_partition_model_result(partition_name, model_info, metrics)
         return model_info
@@ -829,6 +1021,7 @@ class SamplingEnsemble:
         partition_data: Dict[str, Any],
         metrics: Dict[str, Any],
         predict_labels: np.ndarray,
+        timings: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
         return {
             'name': partition_name,
@@ -836,6 +1029,7 @@ class SamplingEnsemble:
             'data_size': len(partition_data['feature']),
             'metrics': metrics,
             'val_predictions': predict_labels,
+            'timings': dict(timings or {}),
         }
 
     def _register_partition_model(self, partition_name: str, model_info: Dict[str, Any], metrics: Dict[str, Any]) -> None:

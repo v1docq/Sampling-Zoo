@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import math
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -153,6 +154,88 @@ class PartitionContract:
             "sizes": dict(self.sizes),
             "n_partitions": self.n_partitions,
             "diagnostics": dict(self.diagnostics),
+        }
+
+
+@dataclass(frozen=True)
+class PartitionSizeDiagnosticsContract:
+    pre_budget_sizes: Mapping[str, int]
+    post_budget_sizes: Mapping[str, int]
+    requested_budget_size: int | None = None
+    selected_rows: int | None = None
+    unique_selected_rows: int | None = None
+    duplicate_rows: int | None = None
+
+    def __post_init__(self) -> None:
+        sizes = [
+            *map(int, self.pre_budget_sizes.values()),
+            *map(int, self.post_budget_sizes.values()),
+        ]
+        optional_counts = (
+            self.requested_budget_size,
+            self.selected_rows,
+            self.unique_selected_rows,
+            self.duplicate_rows,
+        )
+        sizes.extend(int(value) for value in optional_counts if value is not None)
+        if any(value < 0 for value in sizes):
+            raise ValueError("partition size diagnostics must be non-negative")
+        if (
+            self.selected_rows is not None
+            and self.unique_selected_rows is not None
+            and self.unique_selected_rows > self.selected_rows
+        ):
+            raise ValueError("unique_selected_rows cannot exceed selected_rows")
+        if (
+            self.selected_rows is not None
+            and self.duplicate_rows is not None
+            and self.unique_selected_rows is not None
+            and self.unique_selected_rows + self.duplicate_rows != self.selected_rows
+        ):
+            raise ValueError(
+                "unique_selected_rows and duplicate_rows must sum to selected_rows"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return _drop_none(
+            {
+                "pre_budget_sizes": {
+                    str(name): int(size)
+                    for name, size in self.pre_budget_sizes.items()
+                },
+                "post_budget_sizes": {
+                    str(name): int(size)
+                    for name, size in self.post_budget_sizes.items()
+                },
+                "requested_budget_size": self.requested_budget_size,
+                "selected_rows": self.selected_rows,
+                "unique_selected_rows": self.unique_selected_rows,
+                "duplicate_rows": self.duplicate_rows,
+            }
+        )
+
+
+@dataclass(frozen=True)
+class RuntimeDiagnosticsContract:
+    stage_seconds: Mapping[str, float]
+    total_seconds: float
+    cold_start: bool = True
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        values = [float(self.total_seconds), *map(float, self.stage_seconds.values())]
+        if any(not math.isfinite(value) or value < 0 for value in values):
+            raise ValueError("runtime diagnostics must be finite and non-negative")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "stage_seconds": {
+                str(name): float(value)
+                for name, value in self.stage_seconds.items()
+            },
+            "total_seconds": float(self.total_seconds),
+            "cold_start": bool(self.cold_start),
+            "metadata": dict(self.metadata),
         }
 
 
