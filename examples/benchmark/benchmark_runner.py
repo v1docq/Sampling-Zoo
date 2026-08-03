@@ -324,6 +324,86 @@ class FoldExecutionPlan:
     use_direct_model: bool
 
 
+@dataclass(frozen=True)
+class EnsembleSampleAccounting:
+    """Separate allocated sampling budget from the retained ensemble size."""
+
+    selected_rows: int
+    selected_partition_count: int
+    active_model_rows: int
+    active_model_count: int
+    class_coverage_rows_added: int
+
+    @property
+    def model_fit_rows_total(self) -> int:
+        return self.selected_rows + self.class_coverage_rows_added
+
+
+def _partition_row_count(partition: Any) -> int:
+    if isinstance(partition, Mapping) and "feature" in partition:
+        return int(len(partition["feature"]))
+    return int(len(partition))
+
+
+def _build_ensemble_sample_accounting(
+    ensemble: SamplingEnsemble,
+) -> EnsembleSampleAccounting:
+    size_contract = getattr(
+        ensemble,
+        "partition_size_diagnostics_contract_",
+        None,
+    )
+    if size_contract is not None:
+        selected_rows = int(
+            size_contract.selected_rows
+            if size_contract.selected_rows is not None
+            else sum(size_contract.post_budget_sizes.values())
+        )
+        selected_partition_count = len(size_contract.post_budget_sizes)
+    else:
+        partitions = getattr(ensemble, "partitions", {}) or {}
+        selected_rows = sum(
+            _partition_row_count(partition)
+            for partition in partitions.values()
+        )
+        selected_partition_count = len(partitions)
+
+    active_models = getattr(ensemble, "models", ()) or ()
+    active_model_rows = sum(
+        int(model_info.get("data_size", 0))
+        for model_info in active_models
+    )
+    repairs = getattr(ensemble, "class_coverage_repairs_", {}) or {}
+    class_coverage_rows_added = sum(
+        int(repair.get("rows_added", 0))
+        for repair in repairs.values()
+        if isinstance(repair, Mapping)
+    )
+    return EnsembleSampleAccounting(
+        selected_rows=int(selected_rows),
+        selected_partition_count=int(selected_partition_count),
+        active_model_rows=int(active_model_rows),
+        active_model_count=len(active_models),
+        class_coverage_rows_added=int(class_coverage_rows_added),
+    )
+
+
+def _selected_class_distribution(
+    ensemble: SamplingEnsemble,
+) -> dict[str, int]:
+    diagnostics = getattr(ensemble, "partition_diagnostics_", {}) or {}
+    chunks = diagnostics.get("chunks", {})
+    distribution: dict[str, int] = {}
+    if isinstance(chunks, Mapping):
+        for chunk in chunks.values():
+            if not isinstance(chunk, Mapping):
+                continue
+            for label, count in chunk.get("class_counts", {}).items():
+                key = str(label)
+                distribution[key] = distribution.get(key, 0) + int(count)
+    return distribution
+
+
 class EnsembleFoldBenchmarkExecutor:
     """Owns fold splitting, fold-level model execution, and fold result logging."""
 
@@ -920,17 +1000,56 @@ class EnsembleFoldBenchmarkExecutor:
         y_train: Any,
         problem_type: str,
     ) -> tuple[dict[str, Any], list[int]]:
-        chunk_sizes = [int(model_info.get("data_size", 0)) for model_info in ensemble.models]
+        chunk_sizes = [
+            int(model_info.get("data_size", 0))
+            for model_info in ensemble.models
+        ]
         sample_stats = self._build_train_sample_stats(
             y_train=y_train,
             problem_type=problem_type,
             total_train_size=len(y_train),
         )
-        trained_rows = int(sum(chunk_sizes))
-        sample_stats["sample_size"] = trained_rows
-        sample_stats["coverage_ratio"] = float(trained_rows / max(len(y_train), 1))
-        sample_stats["chunk_count"] = int(len(chunk_sizes))
-        sample_stats["chunk_size_mean"] = float(np.mean(chunk_sizes)) if chunk_sizes else 0.0
+        accounting = _build_ensemble_sample_accounting(ensemble)
+        sample_stats.update(
+            {
+                "sample_size": accounting.selected_rows,
+                "coverage_ratio": float(
+                    accounting.selected_rows / max(len(y_train), 1)
+                ),
+                "selected_rows": accounting.selected_rows,
+                "selected_partition_count": (
+                    accounting.selected_partition_count
+                ),
+                "model_fit_rows_total": accounting.model_fit_rows_total,
+                "class_coverage_rows_added": (
+                    accounting.class_coverage_rows_added
+                ),
+                "active_model_rows": accounting.active_model_rows,
+                "active_model_count": accounting.active_model_count,
+                "active_model_coverage_ratio": float(
+                    accounting.active_model_rows / max(len(y_train), 1)
+                ),
+                "chunk_count": accounting.selected_partition_count,
+                "chunk_size_mean": float(
+                    accounting.selected_rows
+                    / max(accounting.selected_partition_count, 1)
+                ),
+            }
+        )
+        if problem_type == "classification":
+            source_distribution = dict(
+                sample_stats.get("class_distribution", {})
+            )
+            selected_distribution = _selected_class_distribution(ensemble)
+            sample_stats["source_class_distribution"] = source_distribution
+            sample_stats["source_class_coverage_count"] = len(
+                source_distribution
+            )
+            if selected_distribution:
+                sample_stats["class_distribution"] = selected_distribution
+                sample_stats["class_coverage_count"] = len(
+                    selected_distribution
+                )
         return sample_stats, chunk_sizes
 
     def _log_direct_model_fold(

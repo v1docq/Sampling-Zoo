@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import numpy as np
@@ -14,6 +15,9 @@ if str(BENCHMARK_DIR) not in sys.path:
 from benchmark_datasets import RawDatasetBundle, RawDatasetMetadata  # noqa: E402
 from benchmark_logging import BenchmarkLogger  # noqa: E402
 from benchmark_runner import EnsembleChunkBenchmarkRunner  # noqa: E402
+from sampling_zoo.core.experiment.contracts import (  # noqa: E402
+    PartitionSizeDiagnosticsContract,
+)
 from sampling_zoo.core.experiment.resume import (  # noqa: E402
     build_resume_plan,
     leaf_run_key_from_components,
@@ -152,6 +156,60 @@ def test_ensemble_chunk_runner_skips_fully_completed_dataset(
     assert result == []
     assert loader_called is False
     assert runner.resume_diagnostics()["skipped_leaf_runs"] == 2
+
+
+def test_ensemble_sample_stats_separate_budget_from_pruned_models(
+    tmp_path,
+) -> None:
+    runner = EnsembleChunkBenchmarkRunner(
+        logger=BenchmarkLogger(
+            run_id="sample_accounting_test",
+            artifacts_root=tmp_path,
+        ),
+        cv_folds=2,
+        show_progress=False,
+    )
+    ensemble = SimpleNamespace(
+        models=[{"data_size": 3}],
+        partition_size_diagnostics_contract_=(
+            PartitionSizeDiagnosticsContract(
+                pre_budget_sizes={"chunk_0": 5, "chunk_1": 5},
+                post_budget_sizes={"chunk_0": 3, "chunk_1": 3},
+                requested_budget_size=6,
+                selected_rows=6,
+                unique_selected_rows=6,
+                duplicate_rows=0,
+            )
+        ),
+        partition_diagnostics_={
+            "chunks": {
+                "chunk_0": {"class_counts": {"0": 2, "1": 1}},
+                "chunk_1": {"class_counts": {"0": 2, "1": 1}},
+            }
+        },
+        class_coverage_repairs_={
+            "chunk_0": {"rows_added": 1},
+            "chunk_1": {"rows_added": 0},
+        },
+    )
+
+    sample_stats, active_chunk_sizes = (
+        runner.fold_executor._build_ensemble_sample_stats(
+            ensemble=ensemble,
+            y_train=pd.Series([0, 0, 0, 0, 0, 0, 1, 1, 1, 1]),
+            problem_type="classification",
+        )
+    )
+
+    assert sample_stats["sample_size"] == 6
+    assert sample_stats["selected_rows"] == 6
+    assert sample_stats["model_fit_rows_total"] == 7
+    assert sample_stats["active_model_rows"] == 3
+    assert sample_stats["selected_partition_count"] == 2
+    assert sample_stats["active_model_count"] == 1
+    assert sample_stats["class_distribution"] == {"0": 4, "1": 2}
+    assert sample_stats["source_class_distribution"] == {"0": 6, "1": 4}
+    assert active_chunk_sizes == [3]
 
 
 def test_rmt_downstream_proxy_fold_emits_budget_and_runtime_contracts(
