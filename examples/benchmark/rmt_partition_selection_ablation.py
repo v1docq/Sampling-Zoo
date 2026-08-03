@@ -502,6 +502,29 @@ def run_rmt_partition_selection_mechanism_smoke(
     return RMTPartitionSelectionAblationOrchestrator(config).run()
 
 
+def run_rmt_partition_downstream_proxy_smoke(
+    *,
+    regression_tasks: Sequence[str] = DEFAULT_MECHANISM_SMOKE_TASKS,
+    models: Sequence[str] = ("lightgbm",),
+    max_train_rows: int | None = 300_000,
+    seed: int = 42,
+    show_progress: bool = True,
+) -> Path:
+    """Recompute only downstream-proxy leaves after proxy changes."""
+
+    config = RMTPartitionSelectionAblationConfig(
+        regression_tasks=regression_tasks,
+        models=models,
+        budget_ratios=DEFAULT_MECHANISM_SMOKE_BUDGET_RATIOS,
+        cluster_selection_metrics=("downstream_proxy",),
+        max_train_rows=max_train_rows,
+        model_n_jobs=1,
+        seed=seed,
+        show_progress=show_progress,
+    )
+    return RMTPartitionSelectionAblationOrchestrator(config).run()
+
+
 def _run_cli() -> Path:
     parser = argparse.ArgumentParser(
         description="Compare RMT partition-selection objectives."
@@ -510,6 +533,11 @@ def _run_cli() -> Path:
         "--mechanism-smoke",
         action="store_true",
         help="Run the three-dataset, three-budget preflight grid.",
+    )
+    parser.add_argument(
+        "--downstream-proxy-smoke",
+        action="store_true",
+        help="Run only the nine downstream-proxy preflight leaves.",
     )
     parser.add_argument("--max-train-rows", type=int, default=300_000)
     parser.add_argument("--seed", type=int, default=42)
@@ -522,6 +550,8 @@ def _run_cli() -> Path:
     }
     if args.mechanism_smoke:
         return run_rmt_partition_selection_mechanism_smoke(**common)
+    if args.downstream_proxy_smoke:
+        return run_rmt_partition_downstream_proxy_smoke(**common)
     return run_rmt_partition_selection_ablation(**common)
 
 

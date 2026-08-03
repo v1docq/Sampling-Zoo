@@ -263,7 +263,10 @@ class PartitionDownstreamProxyEvaluator:
                 f"chunk_{partition_id}": int(indices.size)
                 for partition_id, indices in zip(partition_ids, source_indices)
             },
-            total_rows=int(train_indices.size),
+            # Preserve the sampler's absolute budget. The holdout reduces the
+            # available training pool, not the number of rows the candidate
+            # is expected to use at final fit time.
+            total_rows=int(self.embedding.shape[0]),
             budget_ratio=self.budget_ratio,
             min_rows_per_partition=self.min_partition_rows,
             max_imbalance_ratio=self.max_imbalance_ratio,
@@ -286,6 +289,13 @@ class PartitionDownstreamProxyEvaluator:
                     for partition_id in partition_ids
                 ),
                 unique_sampled_rows=0,
+                budget_reference_rows=int(self.embedding.shape[0]),
+                proxy_train_rows=int(train_indices.size),
+                requested_budget_size=int(budget_plan.requested_budget_size),
+                selected_budget_size=int(budget_plan.selected_size),
+                budget_violations=tuple(
+                    violation.value for violation in budget_plan.violations
+                ),
             )
 
         sampled_indices = tuple(
@@ -363,6 +373,13 @@ class PartitionDownstreamProxyEvaluator:
             routed_validation_counts=tuple(int(value) for value in routed_counts),
             sampled_partition_sizes=tuple(int(indices.size) for indices in sampled_indices),
             unique_sampled_rows=int(concatenated_indices.size),
+            budget_reference_rows=int(self.embedding.shape[0]),
+            proxy_train_rows=int(train_indices.size),
+            requested_budget_size=int(budget_plan.requested_budget_size),
+            selected_budget_size=int(budget_plan.selected_size),
+            budget_violations=tuple(
+                violation.value for violation in budget_plan.violations
+            ),
         )
 
     def _global_baseline_loss(
