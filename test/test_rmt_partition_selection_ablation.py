@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pandas as pd
 import pytest
 
@@ -224,6 +226,35 @@ def test_mechanism_smoke_scope_matches_first_experiment_gate() -> None:
         "pol",
     )
     assert DEFAULT_MECHANISM_SMOKE_BUDGET_RATIOS == (0.01, 0.05, 0.20)
+
+
+def test_downstream_proxy_smoke_scope_contains_only_targeted_objective(
+    monkeypatch,
+) -> None:
+    import examples.benchmark.rmt_partition_selection_ablation as module
+
+    captured = {}
+
+    def _run(orchestrator):
+        captured["config"] = orchestrator.ablation_config
+        return Path("targeted-output")
+
+    monkeypatch.setattr(
+        module.RMTPartitionSelectionAblationOrchestrator,
+        "run",
+        _run,
+    )
+
+    output = module.run_rmt_partition_downstream_proxy_smoke(
+        regression_tasks=("diamonds",),
+        show_progress=False,
+    )
+
+    assert output == Path("targeted-output")
+    assert captured["config"].cluster_selection_metrics == (
+        "downstream_proxy",
+    )
+    assert captured["config"].budget_ratios == (0.01, 0.05, 0.20)
 
 
 def test_new_partition_selectors_materialize_budget_and_proxy_policies() -> None:

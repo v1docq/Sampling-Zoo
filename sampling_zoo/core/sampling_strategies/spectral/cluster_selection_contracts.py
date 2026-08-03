@@ -285,6 +285,11 @@ class PartitionDownstreamComponents:
     routed_validation_counts: Tuple[int, ...]
     sampled_partition_sizes: Tuple[int, ...]
     unique_sampled_rows: int
+    budget_reference_rows: int
+    proxy_train_rows: int
+    requested_budget_size: int
+    selected_budget_size: int
+    budget_violations: Tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -300,6 +305,11 @@ class PartitionDownstreamComponents:
             "routed_validation_counts": list(self.routed_validation_counts),
             "sampled_partition_sizes": list(self.sampled_partition_sizes),
             "unique_sampled_rows": int(self.unique_sampled_rows),
+            "budget_reference_rows": int(self.budget_reference_rows),
+            "proxy_train_rows": int(self.proxy_train_rows),
+            "requested_budget_size": int(self.requested_budget_size),
+            "selected_budget_size": int(self.selected_budget_size),
+            "budget_violations": list(self.budget_violations),
         }
 
 

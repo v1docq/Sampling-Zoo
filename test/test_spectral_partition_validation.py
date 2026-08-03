@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
+from sklearn.dummy import DummyRegressor
 
 from sampling_zoo.core.sampling_strategies.spectral.cluster_selection import (
     SpectralClusterSelector,
@@ -12,6 +13,7 @@ from sampling_zoo.core.sampling_strategies.spectral.cluster_selection_contracts 
     score_cluster_components,
 )
 from sampling_zoo.core.sampling_strategies.spectral.partition_validation import (
+    PartitionDownstreamProxyEvaluator,
     PartitionValidationProxyEvaluator,
     build_partition_validation_plan,
 )
@@ -189,6 +191,46 @@ def test_validation_proxy_reports_fallback_for_undersized_partition() -> None:
     assert sum(result.routed_validation_counts) == len(
         evaluator.plan.validation_indices
     )
+
+
+def test_downstream_proxy_preserves_full_train_absolute_budget() -> None:
+    rng = np.random.default_rng(101)
+    embedding = np.vstack(
+        (
+            rng.normal(-1.0, 0.2, size=(50, 3)),
+            rng.normal(1.0, 0.2, size=(50, 3)),
+        )
+    )
+    target = embedding[:, 0] + rng.normal(0.0, 0.05, size=100)
+    labels = np.repeat(np.asarray([0, 1]), 50)
+    evaluator = PartitionDownstreamProxyEvaluator(
+        embedding=embedding,
+        features=embedding,
+        target=target,
+        sample_scores=np.ones(100),
+        target_type="regression",
+        model_factory=lambda: DummyRegressor(strategy="mean"),
+        budget_ratio=0.2,
+        min_partition_rows=9,
+        max_imbalance_ratio=5.0,
+        min_partition_fraction=0.05,
+        selection_method="all",
+        routing_temperature=1.0,
+        routing_shrinkage=0.0,
+        validation_fraction=0.2,
+        random_state=103,
+    )
+
+    result = evaluator.evaluate(labels)
+
+    assert result.status == "ok"
+    assert result.budget_reference_rows == 100
+    assert result.proxy_train_rows == 80
+    assert result.requested_budget_size == 20
+    assert result.selected_budget_size == 20
+    assert sum(result.sampled_partition_sizes) == 20
+    assert min(result.sampled_partition_sizes) >= 9
+    assert result.budget_violations == ()
 
 
 def test_validation_only_partition_does_not_define_proxy_centroid() -> None:

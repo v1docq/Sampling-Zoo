@@ -187,6 +187,47 @@ class RMTReportTableBuilder:
                         "downstream_proxy.relative_gain_vs_concatenated"
                     ),
                 ),
+                "downstream_proxy_budget_reference_rows": self._numeric_series(
+                    df,
+                    (
+                        "extra.sampler_diagnostics."
+                        "partition_selection_selected_candidate.components."
+                        "downstream_proxy.budget_reference_rows"
+                    ),
+                ),
+                "downstream_proxy_train_rows": self._numeric_series(
+                    df,
+                    (
+                        "extra.sampler_diagnostics."
+                        "partition_selection_selected_candidate.components."
+                        "downstream_proxy.proxy_train_rows"
+                    ),
+                ),
+                "downstream_proxy_requested_budget_size": self._numeric_series(
+                    df,
+                    (
+                        "extra.sampler_diagnostics."
+                        "partition_selection_selected_candidate.components."
+                        "downstream_proxy.requested_budget_size"
+                    ),
+                ),
+                "downstream_proxy_selected_budget_size": self._numeric_series(
+                    df,
+                    (
+                        "extra.sampler_diagnostics."
+                        "partition_selection_selected_candidate.components."
+                        "downstream_proxy.selected_budget_size"
+                    ),
+                ),
+                "downstream_proxy_budget_violations": value_series(
+                    df,
+                    (
+                        "extra.sampler_diagnostics."
+                        "partition_selection_selected_candidate.components."
+                        "downstream_proxy.budget_violations"
+                    ),
+                    default=None,
+                ),
                 "null_model_status": value_series(
                     df,
                     "extra.sampler_diagnostics.null_model_status",
