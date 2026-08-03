@@ -6,6 +6,9 @@ import pytest
 from examples.benchmark import rmt_regression_medium_datasets
 from examples.benchmark.benchmark_logging import BenchmarkLogger
 from examples.benchmark.rmt_partition_selection_ablation import (
+    DEFAULT_MECHANISM_SMOKE_BUDGET_RATIOS,
+    DEFAULT_MECHANISM_SMOKE_TASKS,
+    DEFAULT_PARTITION_SELECTION_METRICS,
     RMTPartitionSelectionAblationConfig,
     RMTPartitionSelectionAblationOrchestrator,
     make_rmt_partition_selection_grid,
@@ -180,7 +183,7 @@ def test_ablation_strategy_names_keep_resume_leaf_runs_distinct() -> None:
         if name != "full_dataset"
     }
 
-    assert len(leaf_keys) == 2
+    assert len(leaf_keys) == 4
 
 
 def test_ablation_plan_and_metadata_capture_scientific_axes(
@@ -204,16 +207,56 @@ def test_ablation_plan_and_metadata_capture_scientific_axes(
         "rmt_partition_selection_ablation"
     )
     assert plan.effective_config["cluster_selection_metrics"] == (
-        "balanced_silhouette",
-        "validation_proxy",
+        DEFAULT_PARTITION_SELECTION_METRICS
     )
     assert plan.effective_config["model_n_jobs"] == 1
     assert metadata["experiment_kind"] == "rmt_partition_selection_ablation"
-    assert metadata["cluster_selection_metrics"] == [
-        "balanced_silhouette",
-        "validation_proxy",
-    ]
+    assert metadata["cluster_selection_metrics"] == list(
+        DEFAULT_PARTITION_SELECTION_METRICS
+    )
     assert metadata["model_n_jobs"] == 1
+
+
+def test_mechanism_smoke_scope_matches_first_experiment_gate() -> None:
+    assert DEFAULT_MECHANISM_SMOKE_TASKS == (
+        "Brazilian_houses",
+        "diamonds",
+        "pol",
+    )
+    assert DEFAULT_MECHANISM_SMOKE_BUDGET_RATIOS == (0.01, 0.05, 0.20)
+
+
+def test_new_partition_selectors_materialize_budget_and_proxy_policies() -> None:
+    config = RMTPartitionSelectionAblationConfig(
+        regression_tasks=("diamonds",),
+        models=("ridge",),
+        budget_ratios=(0.05,),
+        cluster_selection_metrics=(
+            "budget_aware_validation_proxy",
+            "downstream_proxy",
+        ),
+        show_progress=False,
+    )
+
+    configs = make_rmt_partition_selection_strategy_configs(config)
+    budget_aware = next(
+        value
+        for key, value in configs.items()
+        if "selection_budget_aware_validation_proxy" in key
+    )
+    downstream = next(
+        value
+        for key, value in configs.items()
+        if "selection_downstream_proxy" in key
+    )
+
+    assert budget_aware["budget_feasibility_mode"] == "hard"
+    assert budget_aware["include_single_partition_candidate"] is True
+    assert budget_aware["min_sampled_rows_per_partition"] == 32
+    assert downstream["budget_feasibility_mode"] == "hard"
+    assert downstream["cluster_ensemble_method"] == "best_score"
+    assert downstream["downstream_proxy_shortlist_size"] == 3
+    assert downstream["downstream_proxy_n_estimators"] == 32
 
 
 def test_ablation_orchestrator_applies_model_worker_limit(monkeypatch) -> None:

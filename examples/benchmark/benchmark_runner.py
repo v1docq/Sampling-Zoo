@@ -960,6 +960,21 @@ class EnsembleFoldBenchmarkExecutor:
                 "test_routing_diagnostics": dict(test_routing_diagnostics),
                 "sampler_diagnostics": getattr(ensemble.partitioner, "diagnostics_", {}),
                 "budget_policy": getattr(ensemble, "budget_policy_", {}),
+                "runtime_diagnostics": getattr(ensemble, "runtime_diagnostics_", {}),
+                "runtime_contract": (
+                    ensemble.runtime_contract_.to_dict()
+                    if getattr(ensemble, "runtime_contract_", None) is not None
+                    else {}
+                ),
+                "partition_size_contract": (
+                    ensemble.partition_size_diagnostics_contract_.to_dict()
+                    if getattr(
+                        ensemble,
+                        "partition_size_diagnostics_contract_",
+                        None,
+                    ) is not None
+                    else {}
+                ),
             },
         )
 

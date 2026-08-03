@@ -147,6 +147,46 @@ class RMTReportTableBuilder:
                         "validation_proxy.fallback_validation_fraction"
                     ),
                 ),
+                "downstream_proxy_global_baseline_loss": self._numeric_series(
+                    df,
+                    (
+                        "extra.sampler_diagnostics."
+                        "partition_selection_selected_candidate.components."
+                        "downstream_proxy.global_baseline_loss"
+                    ),
+                ),
+                "downstream_proxy_concatenated_loss": self._numeric_series(
+                    df,
+                    (
+                        "extra.sampler_diagnostics."
+                        "partition_selection_selected_candidate.components."
+                        "downstream_proxy.concatenated_loss"
+                    ),
+                ),
+                "downstream_proxy_candidate_loss": self._numeric_series(
+                    df,
+                    (
+                        "extra.sampler_diagnostics."
+                        "partition_selection_selected_candidate.components."
+                        "downstream_proxy.candidate_loss"
+                    ),
+                ),
+                "downstream_proxy_gain_vs_global": self._numeric_series(
+                    df,
+                    (
+                        "extra.sampler_diagnostics."
+                        "partition_selection_selected_candidate.components."
+                        "downstream_proxy.relative_gain_vs_global"
+                    ),
+                ),
+                "downstream_proxy_gain_vs_concatenated": self._numeric_series(
+                    df,
+                    (
+                        "extra.sampler_diagnostics."
+                        "partition_selection_selected_candidate.components."
+                        "downstream_proxy.relative_gain_vs_concatenated"
+                    ),
+                ),
                 "null_model_status": value_series(
                     df,
                     "extra.sampler_diagnostics.null_model_status",
@@ -221,6 +261,38 @@ class RMTReportTableBuilder:
                 "rmse": self._numeric_series(df, "model_metrics.rmse"),
                 "fit_time": self._numeric_series(df, "timings_sec.fit"),
                 "inference_time": self._numeric_series(df, "timings_sec.inference"),
+                "sampler_fit_time": self._numeric_series(
+                    df,
+                    "extra.sampler_diagnostics.runtime.total_seconds",
+                ),
+                "preprocessing_time": self._numeric_series(
+                    df,
+                    (
+                        "extra.sampler_diagnostics.runtime."
+                        "stage_seconds.preprocessing"
+                    ),
+                ),
+                "partition_selection_time": self._numeric_series(
+                    df,
+                    (
+                        "extra.sampler_diagnostics.runtime."
+                        "stage_seconds.partition_selection_and_sampling"
+                    ),
+                ),
+                "chunk_training_time": self._numeric_series(
+                    df,
+                    (
+                        "extra.runtime_contract.stage_seconds."
+                        "training.chunk_training_and_validation"
+                    ),
+                ),
+                "routing_finalization_time": self._numeric_series(
+                    df,
+                    (
+                        "extra.runtime_contract.stage_seconds."
+                        "training.routing_and_finalization"
+                    ),
+                ),
                 "leverage_entropy": self._numeric_series(df, "extra.sampler_diagnostics.leverage_entropy"),
                 "effective_sample_count": self._numeric_series(df, "extra.sampler_diagnostics.effective_sample_count"),
                 "chunk_size_imbalance_ratio": self._numeric_series(
@@ -314,6 +386,26 @@ class RMTReportTableBuilder:
                 ),
                 "singular_values": value_series(df, "extra.sampler_diagnostics.singular_values", default=None),
                 "chunk_sizes": value_series(df, "extra.sampler_diagnostics.chunk_sizes", default=None),
+                "pre_budget_chunk_sizes": value_series(
+                    df,
+                    "extra.sampler_diagnostics.pre_budget_chunk_sizes",
+                    default=None,
+                ),
+                "post_budget_chunk_sizes": value_series(
+                    df,
+                    "extra.sampler_diagnostics.post_budget_chunk_sizes",
+                    default=None,
+                ),
+                "budget_feasible": value_series(
+                    df,
+                    "extra.sampler_diagnostics.partition_budget_plan.feasible",
+                    default=None,
+                ),
+                "budget_violations": value_series(
+                    df,
+                    "extra.sampler_diagnostics.partition_budget_plan.violations",
+                    default=None,
+                ),
             }
         )
 
@@ -463,34 +555,38 @@ class RMTReportTableBuilder:
             "router",
             "view_strategy",
             "partition_selection_method",
-            "cluster_ensemble_method",
             "budget_ratio",
         ]
         metric_column = "cluster_selection_metric"
-        measure_columns = [
+        requested_measures = [
             "rmse",
             "rmse_drop",
             "fit_time",
             "inference_time",
+            "sampler_fit_time",
+            "partition_selection_time",
+            "chunk_training_time",
             "total_train_rows",
             "selected_n_partitions",
             "chunk_size_imbalance_ratio",
             "validation_mean_max_routing_proba",
             "validation_mean_routing_entropy",
             "validation_proxy_relative_gain",
+            "downstream_proxy_candidate_loss",
+            "downstream_proxy_gain_vs_global",
+            "downstream_proxy_gain_vs_concatenated",
         ]
-        required_columns = {*key_columns, metric_column, *measure_columns}
+        required_columns = {*key_columns, metric_column, "rmse"}
         if raw.empty or not required_columns.issubset(raw.columns):
             return pd.DataFrame(columns=key_columns)
 
-        selected = raw[
-            raw[metric_column].isin(
-                ("balanced_silhouette", "validation_proxy")
-            )
-        ]
+        selected = raw[raw[metric_column].notna()].copy()
         if selected.empty:
             return pd.DataFrame(columns=key_columns)
 
+        measure_columns = [
+            column for column in requested_measures if column in selected.columns
+        ]
         group_columns = [*key_columns, metric_column]
         grouped = selected.groupby(
             group_columns,
@@ -503,52 +599,99 @@ class RMTReportTableBuilder:
             how="left",
             validate="one_to_one",
         )
-        balanced = aggregated[
-            aggregated[metric_column] == "balanced_silhouette"
-        ].drop(columns=[metric_column])
-        validation = aggregated[
-            aggregated[metric_column] == "validation_proxy"
-        ].drop(columns=[metric_column])
+        method_names = (
+            selected.groupby(group_columns, as_index=False, dropna=False)[
+                "cluster_ensemble_method"
+            ].first()
+            if "cluster_ensemble_method" in selected.columns
+            else None
+        )
+        metric_values = sorted(
+            aggregated[metric_column].astype(str).unique().tolist(),
+            key=lambda value: (value != "balanced_silhouette", value),
+        )
+        comparison = None
         result_columns = [*measure_columns, "run_count"]
-        balanced = balanced.rename(
-            columns={
-                column: f"{column}_balanced_silhouette"
-                for column in result_columns
-            }
-        )
-        validation = validation.rename(
-            columns={
-                column: f"{column}_validation_proxy"
-                for column in result_columns
-            }
-        )
-        comparison = balanced.merge(
-            validation,
-            on=key_columns,
-            how="outer",
-            validate="one_to_one",
-        )
-        for measure in measure_columns:
-            comparison[
-                f"{measure}_delta_validation_proxy_minus_balanced_silhouette"
-            ] = (
-                comparison[f"{measure}_validation_proxy"]
-                - comparison[f"{measure}_balanced_silhouette"]
+        for metric in metric_values:
+            metric_frame = aggregated[
+                aggregated[metric_column].astype(str) == metric
+            ].drop(columns=[metric_column])
+            metric_frame = metric_frame.rename(
+                columns={column: f"{column}_{metric}" for column in result_columns}
             )
-        comparison["paired_run_count"] = comparison[
-            [
-                "run_count_balanced_silhouette",
-                "run_count_validation_proxy",
+            if method_names is not None:
+                method_frame = method_names[
+                    method_names[metric_column].astype(str) == metric
+                ].drop(columns=[metric_column]).rename(
+                    columns={
+                        "cluster_ensemble_method": (
+                            f"cluster_ensemble_method_{metric}"
+                        )
+                    }
+                )
+                metric_frame = metric_frame.merge(
+                    method_frame,
+                    on=key_columns,
+                    how="left",
+                    validate="one_to_one",
+                )
+            comparison = (
+                metric_frame
+                if comparison is None
+                else comparison.merge(
+                    metric_frame,
+                    on=key_columns,
+                    how="outer",
+                    validate="one_to_one",
+                )
+            )
+        if comparison is None:
+            return pd.DataFrame(columns=key_columns)
+
+        baseline_metric = "balanced_silhouette"
+        if baseline_metric in metric_values:
+            for metric in metric_values:
+                if metric == baseline_metric:
+                    continue
+                for measure in measure_columns:
+                    comparison[
+                        f"{measure}_delta_{metric}_minus_{baseline_metric}"
+                    ] = (
+                        comparison[f"{measure}_{metric}"]
+                        - comparison[f"{measure}_{baseline_metric}"]
+                    )
+                left_count = f"run_count_{baseline_metric}"
+                right_count = f"run_count_{metric}"
+                comparison[f"paired_run_count_{metric}"] = comparison[
+                    [left_count, right_count]
+                ].fillna(0).min(axis=1).astype(int)
+                comparison[f"pair_complete_{metric}"] = (
+                    comparison[left_count].notna()
+                    & comparison[right_count].notna()
+                    & (comparison[left_count] == comparison[right_count])
+                )
+
+        if "validation_proxy" in metric_values:
+            baseline_count = f"run_count_{baseline_metric}"
+            if baseline_count not in comparison.columns:
+                comparison[baseline_count] = np.nan
+                for measure in measure_columns:
+                    comparison[f"{measure}_{baseline_metric}"] = np.nan
+                    comparison[
+                        f"{measure}_delta_validation_proxy_minus_{baseline_metric}"
+                    ] = np.nan
+            if "paired_run_count_validation_proxy" not in comparison.columns:
+                validation_count = "run_count_validation_proxy"
+                comparison["paired_run_count_validation_proxy"] = comparison[
+                    [baseline_count, validation_count]
+                ].fillna(0).min(axis=1).astype(int)
+                comparison["pair_complete_validation_proxy"] = False
+            comparison["paired_run_count"] = comparison[
+                "paired_run_count_validation_proxy"
             ]
-        ].fillna(0).min(axis=1).astype(int)
-        comparison["pair_complete"] = (
-            comparison["run_count_balanced_silhouette"].notna()
-            & comparison["run_count_validation_proxy"].notna()
-            & (
-                comparison["run_count_balanced_silhouette"]
-                == comparison["run_count_validation_proxy"]
-            )
-        )
+            comparison["pair_complete"] = comparison[
+                "pair_complete_validation_proxy"
+            ]
         return comparison.sort_values(
             ["dataset", "model", "budget_ratio"],
             ignore_index=True,

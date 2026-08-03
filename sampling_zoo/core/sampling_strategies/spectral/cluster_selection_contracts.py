@@ -7,6 +7,8 @@ from enum import Enum
 import math
 from typing import Any, Optional, Sequence, Tuple
 
+from ...experiment.budgeting import PartitionBudgetPlan
+
 
 class ClusterCandidateKind(str, Enum):
     COUNT_BASED = "count_based"
@@ -126,6 +128,7 @@ class ClusterCandidatePlan:
     size_guard_rejections: Tuple[ClusterCandidateRejection, ...]
     size_guard_fallback_applied: bool
     requests: Tuple[ClusterCandidateRequest, ...]
+    include_single_partition_candidate: bool = False
 
     @property
     def total_fit_count(self) -> int:
@@ -145,6 +148,9 @@ class ClusterCandidatePlan:
             "size_guard_fallback_applied": bool(self.size_guard_fallback_applied),
             "requests": [request.to_dict() for request in self.requests],
             "total_fit_count": int(self.total_fit_count),
+            "include_single_partition_candidate": bool(
+                self.include_single_partition_candidate
+            ),
         }
 
 
@@ -266,6 +272,38 @@ class PartitionValidationComponents:
 
 
 @dataclass(frozen=True)
+class PartitionDownstreamComponents:
+    """Validation evidence from budgeted local experts and real routing."""
+
+    status: str
+    loss_name: str
+    global_baseline_loss: float
+    concatenated_loss: float
+    candidate_loss: float
+    relative_gain_vs_global: float
+    relative_gain_vs_concatenated: float
+    routed_validation_counts: Tuple[int, ...]
+    sampled_partition_sizes: Tuple[int, ...]
+    unique_sampled_rows: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "loss_name": self.loss_name,
+            "global_baseline_loss": float(self.global_baseline_loss),
+            "concatenated_loss": float(self.concatenated_loss),
+            "candidate_loss": float(self.candidate_loss),
+            "relative_gain_vs_global": float(self.relative_gain_vs_global),
+            "relative_gain_vs_concatenated": float(
+                self.relative_gain_vs_concatenated
+            ),
+            "routed_validation_counts": list(self.routed_validation_counts),
+            "sampled_partition_sizes": list(self.sampled_partition_sizes),
+            "unique_sampled_rows": int(self.unique_sampled_rows),
+        }
+
+
+@dataclass(frozen=True)
 class ClusterScoreComponents:
     """Balanced-objective inputs and explicit hard-constraint violations."""
 
@@ -278,10 +316,19 @@ class ClusterScoreComponents:
     violations: Tuple[ClusterConstraintViolation, ...]
     classification: Optional[ClassificationPartitionComponents] = None
     validation_proxy: Optional[PartitionValidationComponents] = None
+    budget_plan: Optional[PartitionBudgetPlan] = None
+    downstream_proxy: Optional[PartitionDownstreamComponents] = None
 
     @property
     def valid(self) -> bool:
-        return not self.violations
+        return (
+            not self.violations
+            and (self.budget_plan is None or self.budget_plan.feasible)
+            and (
+                self.downstream_proxy is None
+                or self.downstream_proxy.status == "ok"
+            )
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -301,6 +348,16 @@ class ClusterScoreComponents:
             "validation_proxy": (
                 self.validation_proxy.to_dict()
                 if self.validation_proxy is not None
+                else None
+            ),
+            "budget_plan": (
+                self.budget_plan.to_dict()
+                if self.budget_plan is not None
+                else None
+            ),
+            "downstream_proxy": (
+                self.downstream_proxy.to_dict()
+                if self.downstream_proxy is not None
                 else None
             ),
         }
@@ -344,6 +401,7 @@ def build_cluster_candidate_plan(
     min_partitions: int,
     max_partitions: Optional[int],
     min_auto_partition_size: int,
+    include_single_partition_candidate: bool = False,
 ) -> ClusterCandidatePlan:
     """Build the exact current candidate grid while retaining guard provenance."""
 
@@ -364,6 +422,7 @@ def build_cluster_candidate_plan(
         n_samples=n_samples,
         min_partitions=min_partitions,
         max_partitions=requested_max,
+        include_single_partition_candidate=include_single_partition_candidate,
     )
     rejections = tuple(
         ClusterCandidateRejection(
@@ -396,6 +455,9 @@ def build_cluster_candidate_plan(
         size_guard_rejections=rejections,
         size_guard_fallback_applied=fallback_applied,
         requests=requests,
+        include_single_partition_candidate=bool(
+            include_single_partition_candidate
+        ),
     )
 
 
@@ -408,6 +470,8 @@ def evaluate_cluster_score_components(
     min_cluster_fraction: float,
     classification: Optional[ClassificationPartitionComponents] = None,
     validation_proxy: Optional[PartitionValidationComponents] = None,
+    budget_plan: Optional[PartitionBudgetPlan] = None,
+    downstream_proxy: Optional[PartitionDownstreamComponents] = None,
 ) -> ClusterScoreComponents:
     normalized_counts = tuple(int(count) for count in counts)
     if not normalized_counts or any(count < 0 for count in normalized_counts):
@@ -444,6 +508,8 @@ def evaluate_cluster_score_components(
         violations=tuple(violations),
         classification=classification,
         validation_proxy=validation_proxy,
+        budget_plan=budget_plan,
+        downstream_proxy=downstream_proxy,
     )
 
 
@@ -536,22 +602,39 @@ def score_cluster_components(
     missing_class_penalty_weight: float = 0.0,
     single_class_penalty_weight: float = 0.0,
     class_distribution_drift_weight: float = 0.0,
+    downstream_complexity_penalty_weight: float = 0.0,
     hard_constraint_penalty: float = 1.0,
 ) -> float:
     silhouette = -1.0 if components.silhouette is None else components.silhouette
     if selection_metric == "silhouette":
         return float(silhouette)
-    if selection_metric == "validation_proxy":
+    if selection_metric in {"validation_proxy", "budget_aware_validation_proxy"}:
         if components.validation_proxy is None:
             raise ValueError(
                 "validation_proxy components are required for validation_proxy scoring"
             )
         constraint_penalty = 0.0 if components.valid else hard_constraint_penalty
         return float(components.validation_proxy.relative_gain - constraint_penalty)
+    if selection_metric == "downstream_proxy":
+        if components.downstream_proxy is None:
+            raise ValueError(
+                "downstream_proxy components are required for downstream_proxy scoring"
+            )
+        downstream = components.downstream_proxy
+        complexity_penalty = float(downstream_complexity_penalty_weight) * max(
+            len(components.counts) - 1,
+            0,
+        )
+        constraint_penalty = 0.0 if components.valid else hard_constraint_penalty
+        return float(
+            downstream.relative_gain_vs_global
+            - complexity_penalty
+            - constraint_penalty
+        )
     if selection_metric != "balanced_silhouette":
         raise ValueError(
             "selection_metric must be silhouette, balanced_silhouette, "
-            "or validation_proxy"
+            "validation_proxy, budget_aware_validation_proxy, or downstream_proxy"
         )
     imbalance_penalty = float(imbalance_penalty_weight) * math.log(
         max(components.imbalance_ratio, 1.0)
@@ -691,6 +774,7 @@ def _requested_candidate_counts(
     n_samples: int,
     min_partitions: int,
     max_partitions: int,
+    include_single_partition_candidate: bool = False,
 ) -> Tuple[int, ...]:
     if n_samples <= 1:
         return (1,)
@@ -699,7 +783,10 @@ def _requested_candidate_counts(
         n_samples - 1 if n_samples > 2 else n_samples,
     )
     lower = min(max(2, min_partitions), upper)
-    return tuple(range(lower, upper + 1))
+    counts = tuple(range(lower, upper + 1))
+    if include_single_partition_candidate and 1 not in counts:
+        return (1, *counts)
+    return counts
 
 
 def _requests_for_algorithm(

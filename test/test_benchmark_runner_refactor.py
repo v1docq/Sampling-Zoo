@@ -4,6 +4,8 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
+from sklearn.linear_model import Ridge
 
 BENCHMARK_DIR = Path(__file__).resolve().parents[1] / "examples" / "benchmark"
 if str(BENCHMARK_DIR) not in sys.path:
@@ -150,3 +152,84 @@ def test_ensemble_chunk_runner_skips_fully_completed_dataset(
     assert result == []
     assert loader_called is False
     assert runner.resume_diagnostics()["skipped_leaf_runs"] == 2
+
+
+def test_rmt_downstream_proxy_fold_emits_budget_and_runtime_contracts(
+    tmp_path,
+) -> None:
+    rng = np.random.default_rng(17)
+    X = pd.DataFrame(
+        rng.normal(size=(120, 5)),
+        columns=[f"x{index}" for index in range(5)],
+    )
+    y = pd.Series(2 * X["x0"] - X["x1"] + rng.normal(scale=0.2, size=120))
+    dataset = RawDatasetBundle(
+        name="rmt_contract_smoke",
+        problem_type="regression",
+        target_name="target",
+        source_path="memory://rmt_contract_smoke",
+        X=X,
+        y=y,
+        metadata=RawDatasetMetadata(
+            n_objects=len(X),
+            n_features=X.shape[1],
+            n_train_candidates=len(X),
+            n_categorical=0,
+            n_numeric=X.shape[1],
+        ),
+        feature_columns=list(X.columns),
+        categorical_columns=[],
+        numeric_columns=list(X.columns),
+    )
+    runner = EnsembleChunkBenchmarkRunner(
+        logger=BenchmarkLogger(
+            run_id="rmt_contract_smoke",
+            artifacts_root=tmp_path,
+        ),
+        cv_folds=2,
+        seed=42,
+        show_progress=False,
+    )
+
+    records = runner.run_dataset(
+        dataset=dataset,
+        strategy_configs={
+            "rmt_downstream": {
+                "strategy": "rmt_contraction",
+                "force_chunking": True,
+                "ensemble_method": "routed_weighted",
+                "router": "spectral",
+                "budget_ratio": 0.4,
+                "n_partitions": 2,
+                "partition_selection_method": "auto",
+                "cluster_algorithms": ("kmeans",),
+                "cluster_selection_metric": "downstream_proxy",
+                "cluster_ensemble_method": "best_score",
+                "min_partitions": 2,
+                "max_partitions": 3,
+                "min_auto_partition_size": 1,
+                "budget_feasibility_mode": "hard",
+                "min_sampled_rows_per_partition": 5,
+                "budget_max_imbalance_ratio": 5.0,
+                "budget_min_partition_fraction": 0.05,
+                "include_single_partition_candidate": True,
+                "downstream_proxy_shortlist_size": 2,
+                "downstream_proxy_n_estimators": 8,
+                "n_views": 2,
+                "projection_dim": 2,
+                "backend": "numpy",
+            }
+        },
+        model_pool={"ridge": lambda: Ridge()},
+    )
+
+    assert len(records) == 2
+    for record in records:
+        assert record["model_metrics"]["rmse"] >= 0
+        assert record["extra"]["budget_policy"]["applied_by"] == "partitioner"
+        assert record["extra"]["budget_policy"]["feasible"] is True
+        assert record["extra"]["runtime_contract"]["total_seconds"] > 0
+        assert record["extra"]["partition_size_contract"]["selected_rows"] > 0
+        assert record["extra"]["sampler_diagnostics"][
+            "partition_selection_selected_candidate"
+        ]["components"]["downstream_proxy"]["status"] == "ok"

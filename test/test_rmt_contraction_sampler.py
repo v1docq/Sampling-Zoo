@@ -5,6 +5,7 @@ import importlib.util
 import numpy as np
 import pandas as pd
 import pytest
+from sklearn.linear_model import Ridge
 
 from sampling_zoo.core.sampling_strategies.spectral.backend.matrix_backend import MatrixRMTBackend
 from sampling_zoo.core.sampling_strategies.spectral.backend.tensor_backend import TensorRMTBackend
@@ -151,6 +152,85 @@ def test_auto_partition_selection_records_diagnostics() -> None:
     assert sampler.diagnostics_["partition_selection_candidate_plan"]["eligible_count_candidates"] == [2, 3, 4]
     assert sampler.diagnostics_["partition_selection_candidate_failures"] == []
     assert len(sampler.partitions) == sampler.diagnostics_["selected_n_partitions"]
+
+
+def test_budget_aware_selection_uses_exact_budget_and_minimum_chunk_rows() -> None:
+    rng = np.random.default_rng(337)
+    X = pd.DataFrame(
+        rng.normal(size=(400, 6)),
+        columns=[f"x_{idx}" for idx in range(6)],
+    )
+    y = pd.Series(2.0 * X["x_0"] - X["x_1"] + rng.normal(scale=0.2, size=400))
+    sampler = RMTContractionTensorSampler(
+        partition_selection_method="auto",
+        cluster_algorithms=("kmeans",),
+        cluster_selection_metric="budget_aware_validation_proxy",
+        cluster_ensemble_method="best_score",
+        min_partitions=2,
+        max_partitions=5,
+        min_auto_partition_size=1,
+        sampling_budget_ratio=0.10,
+        budget_feasibility_mode="hard",
+        min_sampled_rows_per_partition=10,
+        budget_max_imbalance_ratio=5.0,
+        budget_min_partition_fraction=0.05,
+        include_single_partition_candidate=True,
+        n_views=2,
+        projection_dim=2,
+        backend="numpy",
+        random_state=37,
+        show_progress=False,
+    ).fit(X, y)
+
+    budget = sampler.diagnostics_["partition_budget_plan"]
+    assert budget["feasible"] is True
+    assert budget["selected_size"] == 40
+    assert sum(sampler.diagnostics_["post_budget_chunk_sizes"].values()) == 40
+    assert min(sampler.diagnostics_["post_budget_chunk_sizes"].values()) >= 10
+    assert sampler.diagnostics_["selected_n_partitions"] <= 4
+
+
+def test_downstream_proxy_records_routed_and_concatenated_validation_losses() -> None:
+    rng = np.random.default_rng(341)
+    X = pd.DataFrame(
+        rng.normal(size=(240, 6)),
+        columns=[f"x_{idx}" for idx in range(6)],
+    )
+    y = pd.Series(1.5 * X["x_0"] - 0.7 * X["x_1"] + rng.normal(scale=0.2, size=240))
+    sampler = RMTContractionTensorSampler(
+        partition_selection_method="auto",
+        cluster_algorithms=("kmeans",),
+        cluster_selection_metric="downstream_proxy",
+        cluster_ensemble_method="best_score",
+        min_partitions=2,
+        max_partitions=4,
+        min_auto_partition_size=1,
+        sampling_budget_ratio=0.20,
+        budget_feasibility_mode="hard",
+        min_sampled_rows_per_partition=8,
+        budget_max_imbalance_ratio=5.0,
+        budget_min_partition_fraction=0.05,
+        include_single_partition_candidate=True,
+        downstream_proxy_model_factory=lambda: Ridge(),
+        downstream_proxy_shortlist_size=2,
+        n_views=2,
+        projection_dim=2,
+        backend="numpy",
+        random_state=41,
+        show_progress=False,
+    ).fit(X, y)
+
+    selected = sampler.diagnostics_[
+        "partition_selection_selected_candidate"
+    ]["components"]["downstream_proxy"]
+    assert selected["status"] == "ok"
+    assert selected["candidate_loss"] >= 0
+    assert selected["concatenated_loss"] >= 0
+    assert sum(selected["routed_validation_counts"]) > 0
+    assert selected["unique_sampled_rows"] == sum(
+        selected["sampled_partition_sizes"]
+    )
+    assert "runtime" in sampler.diagnostics_
 
 
 def test_auto_partition_selection_skips_unavailable_optional_algorithms() -> None:
