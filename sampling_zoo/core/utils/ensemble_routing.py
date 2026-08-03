@@ -25,6 +25,21 @@ class GatingTrainingData:
     target: np.ndarray
 
 
+def _normalize_routing_rows(
+    weights: np.ndarray,
+    fallback: float | np.ndarray,
+) -> np.ndarray:
+    row_sums = weights.sum(axis=1, keepdims=True)
+    normalized = np.zeros_like(weights, dtype=float)
+    np.divide(
+        weights,
+        row_sums,
+        out=normalized,
+        where=row_sums > 0,
+    )
+    return np.where(row_sums > 0, normalized, fallback)
+
+
 def _load_torch_backend() -> tuple[Any, Any]:
     global torch, nn, _TORCH_IMPORT_ATTEMPTED
     if torch is not None and nn is not None:
@@ -196,8 +211,10 @@ class RoutedWeightedRouter:
                         if name in name_to_col:
                             aligned[:, model_idx] = proba[:, name_to_col[name]]
                     if aligned.sum() > 0:
-                        row_sums = aligned.sum(axis=1, keepdims=True)
-                        return np.where(row_sums > 0, aligned / row_sums, 1.0 / n_models)
+                        return _normalize_routing_rows(
+                            aligned,
+                            1.0 / n_models,
+                        )
 
             if hasattr(partitioner, "predict_partitions"):
                 labels = np.asarray(partitioner.predict_partitions(features))
@@ -208,8 +225,10 @@ class RoutedWeightedRouter:
                     except Exception:
                         label_id = model_idx
                     aligned[:, model_idx] = (labels == label_id).astype(float)
-                row_sums = aligned.sum(axis=1, keepdims=True)
-                return np.where(row_sums > 0, aligned / row_sums, 1.0 / n_models)
+                return _normalize_routing_rows(
+                    aligned,
+                    1.0 / n_models,
+                )
         except Exception:
             pass
 
@@ -590,5 +609,4 @@ class RoutedWeightedRouter:
         for class_col, model_idx in enumerate(classes):
             if 0 <= int(model_idx) < aligned.shape[1]:
                 aligned[:, int(model_idx)] = proba[:, class_col]
-        row_sums = aligned.sum(axis=1, keepdims=True)
-        return np.where(row_sums > 0, aligned / row_sums, base_weights)
+        return _normalize_routing_rows(aligned, base_weights)

@@ -322,7 +322,7 @@ def test_ablation_orchestrator_applies_model_worker_limit(monkeypatch) -> None:
     ]
 
 
-def test_base_orchestrator_keeps_legacy_model_pool_defaults(monkeypatch) -> None:
+def test_base_orchestrator_forwards_typed_model_pool_config(monkeypatch) -> None:
     calls = []
 
     def fake_make_model_pool(**kwargs):
@@ -343,13 +343,13 @@ def test_base_orchestrator_keeps_legacy_model_pool_defaults(monkeypatch) -> None
     )
 
     assert orchestrator._make_model_pool() == {}
-    assert calls == [
-        {
-            "seed": 42,
-            "model_names": ("ridge",),
-            "problem_type": "regression",
-        }
-    ]
+    assert len(calls) == 1
+    assert calls[0]["seed"] == 42
+    assert calls[0]["model_names"] == ("ridge",)
+    assert calls[0]["problem_type"] == "regression"
+    assert calls[0]["tabpfn_finetune_config"] is (
+        orchestrator.config.tabpfn_finetune_config
+    )
 
 
 def test_partition_selection_comparison_reports_paired_deltas() -> None:

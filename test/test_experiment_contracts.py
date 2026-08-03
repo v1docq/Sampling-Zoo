@@ -4,8 +4,11 @@ import pytest
 
 from sampling_zoo.core.experiment.errors import EmptyExperimentInputError, InvalidExperimentConfigError
 from sampling_zoo.core.experiment.contracts import (
+    ModelStrategyScenarioGridContract,
+    ModelStrategyScenarioSpec,
     PartitionSizeDiagnosticsContract,
     RuntimeDiagnosticsContract,
+    StrategySpec,
 )
 from sampling_zoo.core.experiment.morphisms import (
     build_standard_rmt_experiment_plan,
@@ -47,6 +50,45 @@ def test_strategy_grid_rejects_invalid_payloads() -> None:
 
     with pytest.raises(InvalidExperimentConfigError):
         normalize_strategy_grid({"broken": {"ensemble_method": "voting"}})
+
+
+def test_model_strategy_scenario_grid_binds_models_without_cartesian_product() -> None:
+    grid = ModelStrategyScenarioGridContract(
+        scenarios=(
+            ModelStrategyScenarioSpec(
+                name="ridge__random",
+                model_name="ridge",
+                group="controls",
+                strategy=StrategySpec(
+                    name="random",
+                    config={"strategy": "random", "budget_ratio": 0.1},
+                ),
+            ),
+            ModelStrategyScenarioSpec(
+                name="lightgbm__rmt",
+                model_name="lightgbm",
+                group="rmt",
+                strategy=StrategySpec(
+                    name="rmt",
+                    config={
+                        "strategy": "rmt_contraction",
+                        "budget_ratio": 0.1,
+                    },
+                ),
+            ),
+        )
+    )
+
+    assert grid.model_names == ("ridge", "lightgbm")
+    assert [item["name"] for item in grid.to_dict()["scenarios"]] == [
+        "ridge__random",
+        "lightgbm__rmt",
+    ]
+
+    with pytest.raises(ValueError, match="Duplicate scenario"):
+        ModelStrategyScenarioGridContract(
+            scenarios=(grid.scenarios[0], grid.scenarios[0])
+        )
 
 
 def test_standard_rmt_experiment_stage_plan_order_is_stable() -> None:

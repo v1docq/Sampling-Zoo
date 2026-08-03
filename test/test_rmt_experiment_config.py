@@ -12,6 +12,7 @@ from examples.benchmark.rmt_regression_medium_datasets import (
     make_rmt_experiment_strategy_configs as make_medium_rmt_experiment_strategy_configs,
     make_rmt_strategy_grid as make_medium_rmt_strategy_grid,
 )
+from examples.benchmark.rmt_report_tables import RMTReportTableBuilder
 from examples.benchmark.run_rmt_contraction_regression_experiment import (
     RMTRegressionExperimentConfig,
     RMTRegressionExperimentOrchestrator,
@@ -576,6 +577,18 @@ def test_sample_efficiency_summary_selects_minimal_budget(tmp_path) -> None:
             "timings_sec": {"fit": 0.5, "inference": 0.1},
             "sample_stats": {"sample_size": 5},
             "extra": {
+                "n_test": 20,
+                "model_complexity_diagnostics": {
+                    "status": "ok",
+                    "tree_count_total": 12,
+                    "leaf_count_total": 24,
+                    "split_count_total": 12,
+                    "max_tree_depth": 4,
+                    "mean_tree_depth": 3.0,
+                    "gain_importance_entropy": 0.8,
+                    "shap_mean_abs_entropy": 0.7,
+                    "shap_top_5_share": 0.6,
+                },
                 "sampler_diagnostics": {
                     "leverage_entropy": 1.2,
                     "effective_sample_count": 3.3,
@@ -631,6 +644,46 @@ def test_sample_efficiency_summary_selects_minimal_budget(tmp_path) -> None:
     assert proxy_row["validation_proxy_candidate_loss"] == 0.8
     assert proxy_row["validation_proxy_relative_gain"] == 0.2
     assert proxy_row["validation_proxy_fallback_fraction"] == 0.0
+    assert proxy_row["tree_count_total"] == 12
+    assert proxy_row["inference_rows_per_second"] == 200.0
     assert (tmp_path / "rmt_raw_runs.csv").exists()
     assert (tmp_path / "sample_efficiency_curve.csv").exists()
     assert (tmp_path / "minimal_effective_budget.csv").exists()
+
+
+def test_rmse_baseline_is_aligned_to_the_same_fold() -> None:
+    raw = pd.DataFrame(
+        {
+            "dataset": ["demo"] * 4,
+            "model": ["lightgbm"] * 4,
+            "split_label": ["fold_1", "fold_2", "fold_1", "fold_2"],
+            "sampler": [
+                "full_dataset",
+                "full_dataset",
+                "rmt_contraction",
+                "rmt_contraction",
+            ],
+            "rmse": [10.0, 20.0, 11.0, 22.0],
+        }
+    )
+
+    enriched = RMTReportTableBuilder()._attach_rmse_baseline(raw)
+
+    assert enriched["rmse_ref"].tolist() == [10.0, 20.0, 10.0, 20.0]
+
+
+def test_tabpfn_prefers_foundational_reference_without_full_run() -> None:
+    raw = pd.DataFrame(
+        {
+            "model": ["tabpfn_in_context", "lightgbm"],
+            "rmse_ref": [12.0, 8.0],
+            "rmse_ref_source": ["best_observed", "best_observed"],
+            "foundational_rmse_ref": [10.0, 7.0],
+        }
+    )
+
+    enriched = RMTReportTableBuilder._prefer_foundational_tabpfn_baseline(raw)
+
+    assert enriched.loc[0, "rmse_ref"] == 10.0
+    assert enriched.loc[0, "rmse_ref_source"] == "amlb_foundational"
+    assert enriched.loc[1, "rmse_ref"] == 8.0

@@ -123,6 +123,55 @@ class StrategyGridContract:
 
 
 @dataclass(frozen=True)
+class ModelStrategyScenarioSpec:
+    """One explicitly bound model and strategy configuration."""
+
+    name: str
+    model_name: str
+    strategy: StrategySpec
+    group: str = "default"
+
+    def __post_init__(self) -> None:
+        for field_name in ("name", "model_name", "group"):
+            if not str(getattr(self, field_name)).strip():
+                raise ValueError(f"{field_name} must be non-empty")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "model_name": self.model_name,
+            "group": self.group,
+            "strategy": self.strategy.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class ModelStrategyScenarioGridContract:
+    """A non-Cartesian experiment matrix of bound model-strategy runs."""
+
+    scenarios: tuple[ModelStrategyScenarioSpec, ...]
+
+    def __post_init__(self) -> None:
+        if not self.scenarios:
+            raise ValueError("Scenario grid must not be empty")
+        names = [scenario.name for scenario in self.scenarios]
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        if duplicates:
+            raise ValueError(f"Duplicate scenario names: {duplicates}")
+
+    @property
+    def model_names(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(
+            scenario.model_name for scenario in self.scenarios
+        ))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "scenarios": [scenario.to_dict() for scenario in self.scenarios]
+        }
+
+
+@dataclass(frozen=True)
 class ModelSpec:
     name: str
     params: Mapping[str, Any] = field(default_factory=dict)

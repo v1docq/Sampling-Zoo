@@ -25,8 +25,12 @@ from sampling_zoo.core.metrics.eval_metrics import (
 )
 from sampling_zoo.core.experiment.errors import (
     ClassificationProbabilitiesRequiredError,
+    InvalidExperimentConfigError,
 )
-from sampling_zoo.core.experiment.contracts import StrategyGridContract
+from sampling_zoo.core.experiment.contracts import (
+    ModelStrategyScenarioGridContract,
+    StrategyGridContract,
+)
 from sampling_zoo.core.experiment.morphisms import (
     dataset_to_contract,
     evaluation_to_contract,
@@ -49,6 +53,7 @@ from benchmark_adapters import _normalize_scores,_select_top_k_by_importance,_st
 from benchmark_repo import AMLB_CATEGORY_PROFILES
 from benchmark_sampling_strategies import make_strategies
 from benchmark_models import _to_dense
+from benchmark_model_diagnostics import summarize_ensemble_complexity
 
 
 @dataclass
@@ -780,6 +785,12 @@ class EnsembleFoldBenchmarkExecutor:
         )
         sample_stats["chunk_count"] = 1
         sample_stats["chunk_size_mean"] = float(len(fold.y_train))
+        sample_stats["model_fit_rows_total"] = int(len(fold.y_train))
+        sample_stats["active_model_count"] = 1
+        model_complexity_diagnostics = summarize_ensemble_complexity(
+            ({"name": "full_dataset", "model": model},),
+            X_test_df,
+        )
 
         payload = self._log_direct_model_fold(
             dataset=dataset,
@@ -791,6 +802,7 @@ class EnsembleFoldBenchmarkExecutor:
             fit_time=fit_time,
             infer_time=infer_time,
             sample_stats=sample_stats,
+            model_complexity_diagnostics=model_complexity_diagnostics,
         )
         fold_stage.update(1)
         return payload
@@ -923,6 +935,10 @@ class EnsembleFoldBenchmarkExecutor:
             y_train=fold.y_train,
             problem_type=dataset.problem_type,
         )
+        model_complexity_diagnostics = summarize_ensemble_complexity(
+            ensemble.models,
+            X_test_df,
+        )
         payload = self._log_ensemble_fold(
             dataset=dataset,
             strategy_name=strategy_name,
@@ -937,6 +953,7 @@ class EnsembleFoldBenchmarkExecutor:
             sample_stats=sample_stats,
             chunk_sizes=chunk_sizes,
             test_routing_diagnostics=test_routing_diagnostics,
+            model_complexity_diagnostics=model_complexity_diagnostics,
         )
         fold_stage.update(1)
         return payload
@@ -1063,6 +1080,7 @@ class EnsembleFoldBenchmarkExecutor:
         fit_time: float,
         infer_time: float,
         sample_stats: Mapping[str, Any],
+        model_complexity_diagnostics: Mapping[str, Any],
     ) -> dict[str, Any]:
         fold_value = self._fold_value(fold)
         return self.logger.log_strategy_run(
@@ -1100,6 +1118,9 @@ class EnsembleFoldBenchmarkExecutor:
                 "partition_metrics": [],
                 "chunking_skipped": True,
                 "chunking_skip_reason": "train_size_below_20000",
+                "model_complexity_diagnostics": dict(
+                    model_complexity_diagnostics
+                ),
             },
         )
 
@@ -1118,6 +1139,7 @@ class EnsembleFoldBenchmarkExecutor:
         sample_stats: Mapping[str, Any],
         chunk_sizes: Sequence[int],
         test_routing_diagnostics: Mapping[str, Any],
+        model_complexity_diagnostics: Mapping[str, Any],
     ) -> dict[str, Any]:
         fold_value = self._fold_value(fold)
         return self.logger.log_strategy_run(
@@ -1158,6 +1180,9 @@ class EnsembleFoldBenchmarkExecutor:
                 "sampler_diagnostics": getattr(ensemble.partitioner, "diagnostics_", {}),
                 "budget_policy": getattr(ensemble, "budget_policy_", {}),
                 "runtime_diagnostics": getattr(ensemble, "runtime_diagnostics_", {}),
+                "model_complexity_diagnostics": dict(
+                    model_complexity_diagnostics
+                ),
                 "runtime_contract": (
                     ensemble.runtime_contract_.to_dict()
                     if getattr(ensemble, "runtime_contract_", None) is not None
@@ -1360,6 +1385,94 @@ class EnsembleChunkBenchmarkRunner:
             )
         finally:
             self._release_openml_split(openml_split_data)
+
+    def run_scenario_grid(
+        self,
+        dataset: RawDatasetBundle,
+        scenario_grid: ModelStrategyScenarioGridContract,
+        model_pool: Mapping[str, Callable[[], Any]],
+    ) -> List[Dict[str, Any]]:
+        """Run explicitly bound model-strategy scenarios for one dataset."""
+        self._validate_scenario_models(scenario_grid, model_pool)
+        if not self._scenario_grid_has_pending_leaf_runs(
+            dataset,
+            scenario_grid,
+        ):
+            return []
+
+        openml_split_data = self._load_openml_split(dataset)
+        records: list[dict[str, Any]] = []
+        try:
+            scenarios = tqdm(
+                scenario_grid.scenarios,
+                total=len(scenario_grid.scenarios),
+                disable=not self.show_progress,
+                desc=f"Scenarios ({dataset.name})",
+                leave=False,
+            )
+            for scenario in scenarios:
+                fold_records = self.fold_executor.run_strategy_folds(
+                    dataset=dataset,
+                    strategy_name=scenario.name,
+                    partitioner_config=scenario.strategy.materialize(),
+                    model_name=scenario.model_name,
+                    model_factory=model_pool[scenario.model_name],
+                    openml_split_data=openml_split_data,
+                )
+                for record in fold_records:
+                    self._record_run(records, record)
+            return records
+        finally:
+            self._release_openml_split(openml_split_data)
+
+    @staticmethod
+    def _validate_scenario_models(
+        scenario_grid: ModelStrategyScenarioGridContract,
+        model_pool: Mapping[str, Callable[[], Any]],
+    ) -> None:
+        missing = sorted(set(scenario_grid.model_names) - set(model_pool))
+        if missing:
+            raise InvalidExperimentConfigError(
+                scope="benchmark.scenario_grid",
+                code="missing_scenario_models",
+                message=(
+                    "Scenario grid references models absent from model_pool."
+                ),
+                details={"missing_models": missing},
+            )
+
+    def _scenario_grid_has_pending_leaf_runs(
+        self,
+        dataset: RawDatasetBundle,
+        scenario_grid: ModelStrategyScenarioGridContract,
+    ) -> bool:
+        if self.resume_plan is None:
+            return True
+        pending = False
+        split_labels = (
+            ("split_1",)
+            if isinstance(dataset, OpenMLRawDatasetBundle)
+            else tuple(
+                f"fold_{fold_idx}"
+                for fold_idx in range(1, self.cv_folds + 1)
+            )
+        )
+        for scenario in scenario_grid.scenarios:
+            config = scenario.strategy.materialize()
+            for split_label in split_labels:
+                leaf_run = leaf_run_key_from_components(
+                    dataset=dataset.name,
+                    split=split_label,
+                    model=scenario.model_name,
+                    strategy=scenario.name,
+                    strategy_config=config,
+                    seed=self.seed,
+                )
+                if self.resume_plan.should_execute(leaf_run):
+                    pending = True
+                else:
+                    self.fold_executor.skipped_leaf_keys.add(leaf_run.key)
+        return pending
 
     def _has_pending_leaf_runs(
         self,
