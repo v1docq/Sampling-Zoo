@@ -411,7 +411,8 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 | `null_diagnostic_enabled`, `null_*` | Opt-in empirical null references и bulk-edge diagnostics; подробно в `08_null_calibrated_spectral_diagnostics.md`. |
 | `subspace_diagnostic_enabled`, `subspace_*` | Opt-in principal-angle и projection-distance diagnostics; подробно в `09_spectral_subspace_stability.md`. |
 | `view_strategy` | `subsample` или `gaussian`. |
-| `selection_method` | Как выбирать точки внутри cluster: `all`, `leverage`, `maxvol`, `hybrid`. |
+| `selection_method` | Как выбирать точки внутри cluster: `all`, `leverage`, `capped_leverage`, `maxvol`, `hybrid`. |
+| `leverage_cap_quantile` | Верхний квантиль локальных leverage scores для `capped_leverage`; default `0.95`. |
 | `routing_temperature` | Температура softmax routing-а. Больше значение делает weights более равномерными. |
 | `routing_shrinkage` | Смешивание routing probabilities с uniform prior. |
 | `backend` | `auto`, `torch`, `numpy`. |
@@ -515,12 +516,12 @@ Leverage score строки:
 l_i = ||U_r[i, :]||_2^2 / sum_j ||U_r[j, :]||_2^2
 ```
 
-Он показывает, насколько объект представлен в ведущем spectral subspace. Внутри cluster-а sampler может выбирать строки по leverage, maxvol или hybrid.
+Он показывает, насколько объект представлен в ведущем spectral subspace. Внутри cluster-а sampler может выбирать строки по leverage, capped leverage, maxvol или hybrid.
 
 | Метод | Назначение |
 |---|---|
 | `_build_partitions_from_labels(labels, rng)` | Преобразует cluster labels в partitions. |
-| `_select_from_cluster(cluster_idx, scores)` | Выбирает rows внутри cluster по `selection_method`. |
+| `_select_from_cluster(cluster_idx, scores)` | Выбирает rows внутри cluster по `selection_method`; stochastic policies получают воспроизводимый generator. |
 | `_greedy_maxvol_indices(candidate_idx, target_size)` | Greedy approximation max-volume selection. |
 | `_orthonormal_basis(rows)` | Вспомогательный basis для maxvol-like residual updates. |
 
@@ -555,7 +556,7 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 ### Text2Image Prompt: Leverage Chunk Selection
 
 ```text
-ICML-style scientific figure, clean academic vector infographic, white background, muted blue-gray palette with one accent color, minimal typography, precise arrows, thin lines, labeled panels, no photorealism, no 3D glossy rendering, no decorative background, conference-paper figure aesthetics, mathematically clean, visually balanced. Leverage score chunk selection diagram: spectral embedding points grouped into clusters, row leverage intensity indicated by subtle accent color, selected points inside each cluster, comparison of all, leverage, maxvol, hybrid selection methods.
+ICML-style scientific figure, clean academic vector infographic, white background, muted blue-gray palette with one accent color, minimal typography, precise arrows, thin lines, labeled panels, no photorealism, no 3D glossy rendering, no decorative background, conference-paper figure aesthetics, mathematically clean, visually balanced. Leverage score chunk selection diagram: spectral embedding points grouped into clusters, row leverage intensity indicated by subtle accent color, selected points inside each cluster, comparison of all, leverage, capped leverage PPS, maxvol, and hybrid selection methods; show clipping of extreme leverage scores at a quantile threshold.
 ```
 
 ## SpectralClusterSelector

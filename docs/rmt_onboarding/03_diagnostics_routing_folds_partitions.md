@@ -95,6 +95,9 @@ ICML-style scientific figure, clean academic vector infographic, white backgroun
 | `singular_values` | Сингулярные значения до/после truncation, полезны для анализа spectral decay. |
 | `leverage_entropy` | Энтропия распределения leverage scores. Низкая энтропия означает концентрацию leverage на малом числе точек. |
 | `effective_sample_count` | Эффективное число точек по leverage distribution. |
+| `row_selection_method` | Метод выбора строк внутри уже построенных partitions. |
+| `leverage_cap_quantile` | Квантиль clipping для `capped_leverage`. |
+| `partition_membership_fingerprint` | Label-invariant SHA-256 состава исходных partitions; используется для проверки чистоты абляций. |
 | `n_partitions_requested` | Запрошенное число partitions. |
 | `selected_n_partitions` | Выбранное число partitions при `partition_selection_method="auto"`. |
 | `partition_selection_method` | `fixed` или `auto`. |
@@ -206,6 +209,7 @@ flowchart LR
 |---|---|
 | `all` | Берет все объекты cluster-а. |
 | `leverage` | Отбирает точки с большими leverage scores. |
+| `capped_leverage` | Ограничивает верхний хвост leverage локальным квантилем и выполняет воспроизводимую PPS-выборку без возвращения. |
 | `maxvol` | Greedy-выбор точек, которые расширяют объем/разнообразие подпространства. |
 | `hybrid` | Сочетает leverage и maxvol-like selection. |
 

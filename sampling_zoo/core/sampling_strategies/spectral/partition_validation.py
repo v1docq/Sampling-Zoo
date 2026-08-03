@@ -216,6 +216,7 @@ class PartitionDownstreamProxyEvaluator:
         selection_method: str,
         routing_temperature: float,
         routing_shrinkage: float,
+        leverage_cap_quantile: float = 0.95,
         validation_fraction: float = 0.2,
         random_state: Optional[int] = 42,
     ) -> None:
@@ -236,6 +237,10 @@ class PartitionDownstreamProxyEvaluator:
         self.max_imbalance_ratio = max_imbalance_ratio
         self.min_partition_fraction = float(min_partition_fraction)
         self.selection_method = str(selection_method)
+        if not 0 < float(leverage_cap_quantile) <= 1:
+            raise ValueError("leverage_cap_quantile must be in (0, 1]")
+        self.leverage_cap_quantile = float(leverage_cap_quantile)
+        self.random_state = random_state
         self.routing_temperature = max(float(routing_temperature), 1e-12)
         self.routing_shrinkage = min(max(float(routing_shrinkage), 0.0), 1.0)
         self.plan = build_partition_validation_plan(
@@ -305,6 +310,8 @@ class PartitionDownstreamProxyEvaluator:
                 selection_method=self.selection_method,
                 scores=self.sample_scores,
                 embedding=self.embedding,
+                random_state=self.random_state,
+                leverage_cap_quantile=self.leverage_cap_quantile,
             )
             for partition_id, indices in zip(partition_ids, source_indices)
         )
