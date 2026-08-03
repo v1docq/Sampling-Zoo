@@ -245,6 +245,9 @@ class RMTRegressionExperimentOrchestrator:
             os.environ.setdefault("LOKY_MAX_CPU_COUNT", "1")
             os.environ.setdefault("OMP_NUM_THREADS", "1")
 
+    def _run_id_prefix(self) -> str:
+        return "run_rmt_contraction_regression"
+
     def _create_logger(self) -> BenchmarkLogger:
         base_dir = Path(__file__).resolve().parent
         if self.config.resume_from is not None:
@@ -272,7 +275,7 @@ class RMTRegressionExperimentOrchestrator:
                 run_id=self.run_identity.run_id,
                 artifacts_root=self.resume_session.run_dir.parent,
             )
-        run_id = f"run_rmt_contraction_regression_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        run_id = f"{self._run_id_prefix()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         return BenchmarkLogger(run_id=run_id, artifacts_root=base_dir / "results")
 
     def _create_incremental_recorder(
