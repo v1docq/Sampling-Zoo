@@ -7,6 +7,7 @@ build/
 .vscode
 .idea/
 mlruns/
+/examples/benchmark/results/
 /examples/tmp/ywiki_publish_scripts_v2/wiki_out/assets/source/01.09.25.pptx
 /examples/tmp/ywiki_publish_scripts_v2/wiki_out/assets/source/01.12.25 .pptx
 /examples/tmp/ywiki_publish_scripts_v2/wiki_out/assets/source/03.11.25.pptx

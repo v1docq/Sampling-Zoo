@@ -188,8 +188,8 @@ class BenchmarkLogger:
                     "",
                     "## Classification",
                     "",
-                    "| Dataset | Strategy | ROC-AUC | Log loss | F1 macro | F1 weighted | fit(s) | sample(s) | inference(s) |",
-                    "|---|---|---:|---:|---:|---:|---:|---:|---:|",
+                    "| Dataset | Strategy | ROC-AUC | Log loss | Brier | ECE | F1 macro | F1 weighted | fit(s) | sample(s) | inference(s) |",
+                    "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
                 ]
             )
             for record in classification_records:
@@ -198,11 +198,13 @@ class BenchmarkLogger:
                 metrics = record.get("model_metrics", {})
                 timings = record.get("timings_sec", {})
                 lines.append(
-                    "| {dataset} | {strategy} | {roc_auc:.4f} | {log_loss:.4f} | {f1_macro:.4f} | {f1_weighted:.4f} | {fit:.4f} | {sample:.4f} | {inference:.4f} |".format(
+                    "| {dataset} | {strategy} | {roc_auc:.4f} | {log_loss:.4f} | {brier:.4f} | {ece:.4f} | {f1_macro:.4f} | {f1_weighted:.4f} | {fit:.4f} | {sample:.4f} | {inference:.4f} |".format(
                         dataset=dataset_name,
                         strategy=record.get("strategy", "-"),
                         roc_auc=float(metrics.get("roc_auc", float("nan"))),
                         log_loss=float(metrics.get("log_loss", float("nan"))),
+                        brier=float(metrics.get("brier_score", float("nan"))),
+                        ece=float(metrics.get("expected_calibration_error", float("nan"))),
                         f1_macro=float(metrics.get("f1_macro", float("nan"))),
                         f1_weighted=float(metrics.get("f1_weighted", float("nan"))),
                         fit=float(timings.get("fit", 0.0)),

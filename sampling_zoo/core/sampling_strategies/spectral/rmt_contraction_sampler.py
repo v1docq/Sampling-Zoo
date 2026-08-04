@@ -73,6 +73,7 @@ class RMTContractionConfig:
     class_distribution_drift_weight: float = 0.25
     class_coverage_policy: str = "auto"
     min_samples_per_class: int = 1
+    class_allocation_policy: str = "minimum_then_global"
     validation_proxy_fraction: float = 0.2
     validation_proxy_min_partition_rows: int = 8
     validation_proxy_smoothing: float = 1.0
@@ -327,6 +328,11 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self.min_samples_per_class = self._validate_positive_int(
             "min_samples_per_class",
             cfg.min_samples_per_class,
+        )
+        self.class_allocation_policy = self._validate_choice(
+            "class_allocation_policy",
+            cfg.class_allocation_policy,
+            ("minimum_then_global", "proportional"),
         )
         self.validation_proxy_fraction = self._validate_fraction(
             "validation_proxy_fraction",
@@ -1448,6 +1454,7 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             target=target,
             target_size=target_size,
             min_samples_per_class=self.min_samples_per_class,
+            class_allocation_policy=self.class_allocation_policy,
             selection_method=self.selection_method,
             scores=scores,
             embedding=self.sample_embedding_,
@@ -1593,6 +1600,7 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
                 self.resolved_class_coverage_policy_
             ),
             "min_samples_per_class": int(self.min_samples_per_class),
+            "class_allocation_policy": self.class_allocation_policy,
             "class_coverage_guaranteed": bool(
                 self.class_coverage_guaranteed_
             ),
