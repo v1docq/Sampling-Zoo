@@ -18,7 +18,9 @@ class ClassCoverageSelectionPlan:
     selected_indices: np.ndarray
     target_size: int
     min_samples_per_class: int
+    allocation_policy: str
     source_class_counts: tuple[tuple[str, int], ...]
+    allocated_class_counts: tuple[tuple[str, int], ...]
     selected_class_counts: tuple[tuple[str, int], ...]
     missing_classes: tuple[str, ...]
     feasible: bool
@@ -30,7 +32,9 @@ class ClassCoverageSelectionPlan:
             "target_size": int(self.target_size),
             "selected_size": int(self.selected_indices.size),
             "min_samples_per_class": int(self.min_samples_per_class),
+            "allocation_policy": self.allocation_policy,
             "source_class_counts": dict(self.source_class_counts),
+            "allocated_class_counts": dict(self.allocated_class_counts),
             "selected_class_counts": dict(self.selected_class_counts),
             "missing_classes": list(self.missing_classes),
             "n_source_classes": len(self.source_class_counts),
@@ -67,6 +71,7 @@ def select_class_aware_partition_indices(
     target: Sequence[Any] | np.ndarray,
     target_size: int,
     min_samples_per_class: int,
+    class_allocation_policy: str = "minimum_then_global",
     selection_method: str,
     scores: np.ndarray,
     embedding: np.ndarray,
@@ -81,6 +86,12 @@ def select_class_aware_partition_indices(
     minimum = int(min_samples_per_class)
     if minimum < 1:
         raise ValueError("min_samples_per_class must be positive")
+    allocation_policy = str(class_allocation_policy).strip().lower()
+    if allocation_policy not in {"minimum_then_global", "proportional"}:
+        raise ValueError(
+            "class_allocation_policy must be one of: "
+            "minimum_then_global, proportional"
+        )
     if indices.size and target_values.size <= int(np.max(indices)):
         raise ValueError("target must align with candidate indices")
 
@@ -103,7 +114,9 @@ def select_class_aware_partition_indices(
             selected_indices=np.asarray([], dtype=int),
             target_size=resolved_size,
             min_samples_per_class=minimum,
+            allocation_policy=allocation_policy,
             source_class_counts=source_pairs,
+            allocated_class_counts=(),
             selected_class_counts=(),
             missing_classes=labels,
             feasible=False,
@@ -116,12 +129,30 @@ def select_class_aware_partition_indices(
         if isinstance(random_state, np.random.Generator)
         else np.random.default_rng(random_state)
     )
-    reserved: list[np.ndarray] = []
-    for class_index in range(classes.size):
-        class_candidates = indices[encoded == class_index]
-        reserved.append(
+    if allocation_policy == "proportional":
+        allocation = _proportional_class_allocation(
+            source_counts,
+            target_size=resolved_size,
+            minimum=minimum,
+        )
+        selected_by_class = [
             select_partition_indices(
-                class_candidates,
+                indices[encoded == class_index],
+                target_size=int(class_size),
+                selection_method=selection_method,
+                scores=scores,
+                embedding=embedding,
+                random_state=rng,
+                leverage_cap_quantile=leverage_cap_quantile,
+            )
+            for class_index, class_size in enumerate(allocation)
+        ]
+        selected = np.concatenate(selected_by_class).astype(int, copy=False)
+    else:
+        allocation = np.full(classes.size, minimum, dtype=int)
+        reserved = [
+            select_partition_indices(
+                indices[encoded == class_index],
                 target_size=minimum,
                 selection_method=selection_method,
                 scores=scores,
@@ -129,25 +160,33 @@ def select_class_aware_partition_indices(
                 random_state=rng,
                 leverage_cap_quantile=leverage_cap_quantile,
             )
-        )
-
-    selected = np.concatenate(reserved).astype(int, copy=False)
-    remaining_size = resolved_size - selected.size
-    if remaining_size > 0:
-        remaining = indices[~np.isin(indices, selected)]
-        selected = np.concatenate(
+            for class_index in range(classes.size)
+        ]
+        selected = np.concatenate(reserved).astype(int, copy=False)
+        remaining_size = resolved_size - selected.size
+        if remaining_size > 0:
+            remaining = indices[~np.isin(indices, selected)]
+            selected = np.concatenate(
+                [
+                    selected,
+                    select_partition_indices(
+                        remaining,
+                        target_size=remaining_size,
+                        selection_method=selection_method,
+                        scores=scores,
+                        embedding=embedding,
+                        random_state=rng,
+                        leverage_cap_quantile=leverage_cap_quantile,
+                    ),
+                ]
+            )
+        selected_target_for_allocation = target_values[selected]
+        allocation = np.asarray(
             [
-                selected,
-                select_partition_indices(
-                    remaining,
-                    target_size=remaining_size,
-                    selection_method=selection_method,
-                    scores=scores,
-                    embedding=embedding,
-                    random_state=rng,
-                    leverage_cap_quantile=leverage_cap_quantile,
-                ),
-            ]
+                np.sum(selected_target_for_allocation == value)
+                for value in classes
+            ],
+            dtype=int,
         )
 
     selected_target = target_values[selected]
@@ -156,6 +195,7 @@ def select_class_aware_partition_indices(
         dtype=int,
     )
     selected_pairs = tuple(zip(labels, selected_counts.tolist()))
+    allocated_pairs = tuple(zip(labels, allocation.astype(int).tolist()))
     missing = tuple(
         label for label, count in selected_pairs if int(count) < minimum
     )
@@ -164,13 +204,55 @@ def select_class_aware_partition_indices(
         selected_indices=selected,
         target_size=resolved_size,
         min_samples_per_class=minimum,
+        allocation_policy=allocation_policy,
         source_class_counts=source_pairs,
+        allocated_class_counts=allocated_pairs,
         selected_class_counts=selected_pairs,
         missing_classes=missing,
         feasible=selected.size == resolved_size and not missing,
         violations=(() if selected.size == resolved_size and not missing else ("selection_invariant_failed",)),
         distribution_total_variation=drift,
     )
+
+
+def _proportional_class_allocation(
+    source_counts: np.ndarray,
+    *,
+    target_size: int,
+    minimum: int,
+) -> np.ndarray:
+    """Allocate an exact class budget with lower bounds and finite capacities."""
+
+    counts = np.asarray(source_counts, dtype=int).reshape(-1)
+    if counts.size == 0:
+        return np.asarray([], dtype=int)
+    allocation = np.full(counts.size, int(minimum), dtype=int)
+    if np.any(allocation > counts) or int(allocation.sum()) > int(target_size):
+        raise ValueError("class allocation is infeasible")
+
+    remaining = int(target_size) - int(allocation.sum())
+    while remaining > 0:
+        capacity = counts - allocation
+        active = np.flatnonzero(capacity > 0)
+        if active.size == 0:
+            raise ValueError("class allocation cannot fill the requested budget")
+
+        ideal = remaining * capacity[active] / float(capacity[active].sum())
+        additions = np.minimum(
+            np.floor(ideal).astype(int),
+            capacity[active],
+        )
+        allocated_now = int(additions.sum())
+        if allocated_now > 0:
+            allocation[active] += additions
+            remaining -= allocated_now
+            continue
+
+        fractional = ideal - np.floor(ideal)
+        best_local = int(np.argmax(fractional))
+        allocation[int(active[best_local])] += 1
+        remaining -= 1
+    return allocation
 
 
 def _class_label(value: Any) -> str:

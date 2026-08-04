@@ -1314,7 +1314,12 @@ class SamplingEnsemble:
         *,
         status: str,
     ) -> None:
-        all_classes = set(before) | set(after)
+        global_classes = (
+            {str(label) for label in self._classification_classes()}
+            if self.problem == 'classification'
+            else set()
+        )
+        all_classes = global_classes | set(before) | set(after)
         rows_before = int(sum(before.values()))
         rows_after = int(sum(after.values()))
         self.class_coverage_repairs_[str(partition_name)] = {

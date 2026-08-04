@@ -14,6 +14,7 @@
 `RMTContractionTensorSampler` поддерживает параметры:
 
 - `class_coverage_policy="auto" | "off" | "preserve_local_classes"`;
+- `class_allocation_policy="minimum_then_global" | "proportional"`;
 - `min_samples_per_class=1`.
 
 В режиме `preserve_local_classes` отбор внутри каждого спектрального кластера выполняется в два шага:
@@ -22,6 +23,8 @@
 2. Оставшийся точный бюджет заполняется той же стратегией из еще не выбранных строк.
 
 План считается infeasible, если бюджет меньше числа обязательных class representatives или исходный кластер является single-class. Строки не добавляются постфактум, поэтому размер chunk остается равен budget allocation.
+
+`minimum_then_global` сначала резервирует обязательный минимум каждого локального класса, а затем заполняет остаток бюджета глобальным capped-leverage отбором. `proportional` сначала вычисляет точную квоту каждого класса с учетом локальной частоты и lower bound, а затем независимо применяет capped leverage внутри каждого класса. Вторая политика лучше сохраняет class distribution, первая оставляет spectral leverage больше свободы.
 
 Диагностика `class_coverage_by_partition` хранит class counts до и после отбора, missing classes, total-variation drift, feasibility и violations.
 
@@ -38,6 +41,8 @@
 
 - binary: `roc_auc`, вероятность positive class;
 - multiclass: `log_loss`, полная probability matrix.
+
+В качестве вторичных calibration diagnostics сохраняются `brier_score` и `expected_calibration_error`. Они не заменяют primary metric и не смешиваются с ней при выборе минимального эффективного бюджета.
 
 ## Runner
 
@@ -59,3 +64,6 @@ python -c "from examples.benchmark.rmt_classification_sampling_gate import run_r
 - Multiclass runs содержат конечный log loss.
 - Все classification модели предоставляют `predict_proba`.
 - Incremental JSONL, CSV, metadata и Markdown report формируются без ошибок.
+
+После прохождения этого короткого gate используется полный протокол из
+`docs/rmt_onboarding/17_classification_full_grid.md`.

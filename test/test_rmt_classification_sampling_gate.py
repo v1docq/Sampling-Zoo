@@ -65,6 +65,44 @@ def test_class_aware_selection_preserves_classes_and_exact_budget() -> None:
     assert np.array_equal(first.selected_indices, second.selected_indices)
 
 
+def test_proportional_class_allocation_preserves_distribution_and_budget() -> None:
+    indices, target, scores, embedding = _selection_inputs()
+    plan = select_class_aware_partition_indices(
+        indices,
+        target=target,
+        target_size=15,
+        min_samples_per_class=1,
+        class_allocation_policy="proportional",
+        selection_method="capped_leverage",
+        scores=scores,
+        embedding=embedding,
+        random_state=17,
+    )
+
+    assert plan.feasible
+    assert plan.selected_indices.size == 15
+    assert dict(plan.allocated_class_counts) == {"0": 9, "1": 4, "2": 2}
+    assert plan.allocated_class_counts == plan.selected_class_counts
+    assert plan.distribution_total_variation == pytest.approx(0.0)
+    assert plan.to_dict()["allocation_policy"] == "proportional"
+
+
+def test_class_allocation_policy_rejects_unknown_value() -> None:
+    indices, target, scores, embedding = _selection_inputs()
+    with pytest.raises(ValueError, match="class_allocation_policy"):
+        select_class_aware_partition_indices(
+            indices,
+            target=target,
+            target_size=9,
+            min_samples_per_class=1,
+            class_allocation_policy="unknown",
+            selection_method="capped_leverage",
+            scores=scores,
+            embedding=embedding,
+            random_state=17,
+        )
+
+
 def test_class_aware_selection_reports_infeasible_budget() -> None:
     indices, target, scores, embedding = _selection_inputs()
     plan = select_class_aware_partition_indices(
@@ -106,6 +144,8 @@ def test_binary_and_multiclass_metrics_follow_amlb_policy() -> None:
         classes=[0, 1],
     )
     assert binary["roc_auc"] == pytest.approx(1.0)
+    assert binary["brier_score"] == pytest.approx(0.045)
+    assert binary["expected_calibration_error"] == pytest.approx(0.2)
     assert primary_classification_metric([0, 1]) == "roc_auc"
 
     multiclass_true = np.asarray([0, 1, 2, 1])
@@ -126,6 +166,8 @@ def test_binary_and_multiclass_metrics_follow_amlb_policy() -> None:
     )
     assert np.isnan(multiclass["roc_auc"])
     assert multiclass["log_loss"] < 0.5
+    assert 0.0 <= multiclass["brier_score"] < 1.0
+    assert 0.0 <= multiclass["expected_calibration_error"] <= 1.0
     assert primary_classification_metric([0, 1, 2]) == "log_loss"
     assert metric_drop("roc_auc", 0.9, 0.95) == pytest.approx(0.05)
     assert metric_drop("log_loss", 0.45, 0.4) == pytest.approx(0.05)
@@ -202,6 +244,25 @@ def test_probability_required_error_is_structured() -> None:
     assert error.value.code == "classification_probabilities_required"
 
 
+def test_class_coverage_repair_uses_global_classes_as_source_of_truth() -> None:
+    ensemble = SamplingEnsemble(
+        problem="classification",
+        ensemble_method="voting",
+        show_progress=False,
+    )
+    ensemble.classes_ = np.asarray([0, 1, 2])
+    ensemble._record_class_coverage_repair(
+        "chunk_0",
+        {"0": 5, "1": 2},
+        {"0": 5, "1": 2},
+        status="sampler_guaranteed",
+    )
+
+    diagnostics = ensemble.class_coverage_repairs_["chunk_0"]
+    assert diagnostics["missing_classes_before"] == ["2"]
+    assert diagnostics["missing_classes_after"] == ["2"]
+
+
 def test_rmt_sampler_preserves_classes_after_budget_selection() -> None:
     rng = np.random.default_rng(23)
     features = pd.DataFrame(rng.normal(size=(180, 8)))
@@ -211,6 +272,7 @@ def test_rmt_sampler_preserves_classes_after_budget_selection() -> None:
         partition_selection_method="fixed",
         cluster_target_type="classification",
         class_coverage_policy="preserve_local_classes",
+        class_allocation_policy="proportional",
         sampling_budget_ratio=0.25,
         selection_method="capped_leverage",
         n_views=4,
@@ -224,6 +286,7 @@ def test_rmt_sampler_preserves_classes_after_budget_selection() -> None:
 
     assert sampler.class_coverage_guaranteed_
     assert sampler.diagnostics_["class_coverage_guaranteed"]
+    assert sampler.diagnostics_["class_allocation_policy"] == "proportional"
     for indices in sampler.partitions.values():
         assert np.unique(target.iloc[indices]).size >= 2
 
