@@ -263,6 +263,33 @@ routing_refinement="em_retraining"
 
 Этот механизм не включен по умолчанию, потому что он дороже и меняет смысл эксперимента: это уже не только sampling + static ensemble, а совместная донастройка experts по маршрутизации.
 
+## 5.2. Routing geometry и bulk/spike-гипотеза
+
+Текущий spectral router использует arithmetic centroid каждого чанка, squared Euclidean distance и softmax. Это воспроизводимый baseline, но он не учитывает различный масштаб и анизотропию partitions. Поэтому дальнейшая проверка включает три содержательных альтернативы:
+
+1. Euclidean distance, нормированное на медианное расстояние внутри каждого partition;
+2. shrinkage Mahalanobis distance с diagonal или full covariance estimate;
+3. regularized GMM posterior, который одновременно учитывает центр, форму, объем и prior partition.
+
+Важно различать два вида спектрального отбора. `capped_leverage` ограничивает чрезмерное влияние отдельных **строк** по квантилю их leverage scores. Этот квантиль не является границей RMT bulk. Bulk/spike split, напротив, классифицирует **спектральные компоненты** относительно empirical null edge и их устойчивости при resampling.
+
+Для исследования вводится opt-in topology:
+
+```text
+stable spectral component split
+  -> bulk rows / spike signatures
+  -> bulk expert + one or more spike experts
+  -> calibrated spectral geometry
+  -> row-wise mixture of expert predictions
+```
+
+![Различие row leverage, spectral spikes и иерархического ансамбля](../img/4.RMT_bulk_spike_moe_v2.png)
+
+Эта topology пока является исследовательской гипотезой, а не частью default sampler. Архитектурный план и точный двухфазный протокол вынесены в:
+
+- [RMT routing geometry и bulk/spike experts](../rmt_onboarding/18_routing_geometry_and_bulk_spike_plan.md);
+- [Эксперимент: routing geometry и bulk/spike experts](RMT%20routing%20geometry%20и%20bulk-spike%20experiment.md).
+
 # 6. Вывод 
 
 Суть метода:

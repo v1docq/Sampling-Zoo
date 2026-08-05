@@ -1,0 +1,470 @@
+from __future__ import annotations
+
+import importlib.util
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from sampling_zoo.core.experiment.routing_replay import (
+    RoutingReplayEvaluator,
+    RoutingReplayRequest,
+)
+from sampling_zoo.core.sampling_strategies.spectral.backend.matrix_backend import MatrixRMTBackend
+from sampling_zoo.core.sampling_strategies.spectral.backend.tensor_backend import TensorRMTBackend
+from sampling_zoo.core.sampling_strategies.spectral.rmt_contraction_sampler import (
+    RMTContractionTensorSampler,
+)
+from sampling_zoo.core.sampling_strategies.spectral.routing_contracts import (
+    PartitionGeometryContract,
+    PartitionGeometrySpec,
+    RoutingDistanceContract,
+)
+from sampling_zoo.core.metrics.eval_metrics import classification_brier_score
+from sampling_zoo.core.sampling_strategies.spectral.routing_geometry import (
+    PartitionGeometryBuilder,
+    route_partition_geometry,
+)
+from examples.benchmark.routing_geometry_replay import (
+    FittedEnsembleRoutingReplay,
+    default_routing_geometry_arms,
+)
+from examples.benchmark.rmt_routing_geometry_experiment import (
+    RoutingGeometryExperimentConfig,
+    RoutingGeometryExperimentOrchestrator,
+)
+from examples.benchmark.benchmark_dataset_interfaces import make_synthetic_regression_smoke_dataset
+
+
+def _geometry_inputs() -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray], dict[str, int]]:
+    embedding = np.asarray(
+        [
+            [-2.0, -0.2],
+            [-1.8, 0.1],
+            [-2.2, 0.0],
+            [2.0, -0.1],
+            [1.8, 0.2],
+            [2.2, 0.0],
+        ],
+        dtype=float,
+    )
+    labels = np.asarray([0, 0, 0, 1, 1, 1])
+    partitions = {
+        "chunk_0": np.asarray([0, 1]),
+        "chunk_1": np.asarray([3, 4]),
+    }
+    mapping = {"chunk_0": 0, "chunk_1": 1}
+    return embedding, labels, partitions, mapping
+
+
+@pytest.mark.parametrize(
+    ("metric", "kernel"),
+    [
+        ("squared_euclidean", "softmax"),
+        ("median_scaled_euclidean", "softmax"),
+        ("diag_shrinkage_mahalanobis", "softmax"),
+        ("full_shrinkage_mahalanobis", "softmax"),
+        ("full_shrinkage_mahalanobis", "gmm_posterior"),
+        ("cosine", "softmax"),
+    ],
+)
+def test_routing_geometry_produces_aligned_normalized_weights(metric: str, kernel: str) -> None:
+    embedding, labels, partitions, mapping = _geometry_inputs()
+    spec = PartitionGeometrySpec(
+        metric=metric,
+        kernel=kernel,
+        uniform_shrinkage=0.0,
+        covariance_shrinkage=0.2,
+    )
+    geometry = PartitionGeometryBuilder().build(
+        embedding=embedding,
+        cluster_labels=labels,
+        partitions=partitions,
+        partition_to_cluster=mapping,
+        spec=spec,
+    )
+
+    distances, routing = route_partition_geometry(
+        backend=MatrixRMTBackend(),
+        embedding=np.asarray([[-2.0, 0.0], [2.0, 0.0], [0.0, 0.0]]),
+        geometry=geometry,
+    )
+
+    assert geometry.partition_names == ("chunk_0", "chunk_1")
+    assert distances.values.shape == (3, 2)
+    assert routing.weights.shape == (3, 2)
+    assert np.allclose(routing.weights.sum(axis=1), 1.0)
+    assert np.argmax(routing.weights[0]) == 0
+    assert np.argmax(routing.weights[1]) == 1
+
+
+def test_sampled_centroid_uses_only_selected_partition_rows() -> None:
+    embedding, labels, partitions, mapping = _geometry_inputs()
+    source = PartitionGeometryBuilder().build(
+        embedding=embedding,
+        cluster_labels=labels,
+        partitions=partitions,
+        partition_to_cluster=mapping,
+        spec=PartitionGeometrySpec(representation="source_centroid"),
+    )
+    sampled = PartitionGeometryBuilder().build(
+        embedding=embedding,
+        cluster_labels=labels,
+        partitions=partitions,
+        partition_to_cluster=mapping,
+        spec=PartitionGeometrySpec(representation="sampled_centroid"),
+    )
+
+    assert source.representation_counts == (3, 3)
+    assert sampled.representation_counts == (2, 2)
+    assert not np.allclose(source.centers, sampled.centers)
+
+
+def test_geometry_contract_arrays_are_read_only() -> None:
+    embedding, labels, partitions, mapping = _geometry_inputs()
+    geometry = PartitionGeometryBuilder().build(
+        embedding=embedding,
+        cluster_labels=labels,
+        partitions=partitions,
+        partition_to_cluster=mapping,
+        spec=PartitionGeometrySpec(),
+    )
+
+    with pytest.raises(ValueError):
+        geometry.centers[0, 0] = 999.0
+
+
+def test_invalid_gmm_metric_combination_fails_at_config_boundary() -> None:
+    with pytest.raises(ValueError, match="gmm_posterior requires"):
+        PartitionGeometrySpec(metric="squared_euclidean", kernel="gmm_posterior")
+
+
+def test_identity_mahalanobis_matches_squared_euclidean() -> None:
+    embedding = np.asarray([[-1.0, 0.5], [2.0, -0.25]])
+    centers = np.asarray([[0.0, 0.0], [1.0, 1.0]])
+    backend = MatrixRMTBackend()
+
+    euclidean = backend.compute_routing_values(
+        embedding,
+        centers,
+        metric="squared_euclidean",
+        kernel="softmax",
+    )
+    mahalanobis = backend.compute_routing_values(
+        embedding,
+        centers,
+        metric="full_shrinkage_mahalanobis",
+        kernel="softmax",
+        precisions=np.repeat(np.eye(2)[None, :, :], 2, axis=0),
+    )
+
+    assert np.allclose(euclidean, mahalanobis)
+
+
+def test_median_scaled_distance_is_invariant_to_global_embedding_scale() -> None:
+    embedding, labels, partitions, mapping = _geometry_inputs()
+    spec = PartitionGeometrySpec(
+        metric="median_scaled_euclidean",
+        uniform_shrinkage=0.0,
+    )
+    builder = PartitionGeometryBuilder()
+    geometry = builder.build(
+        embedding=embedding,
+        cluster_labels=labels,
+        partitions=partitions,
+        partition_to_cluster=mapping,
+        spec=spec,
+    )
+    scaled_geometry = builder.build(
+        embedding=embedding * 7.0,
+        cluster_labels=labels,
+        partitions=partitions,
+        partition_to_cluster=mapping,
+        spec=spec,
+    )
+    evaluation = np.asarray([[-1.5, 0.0], [1.5, 0.0], [0.0, 0.2]])
+    backend = MatrixRMTBackend()
+
+    original = backend.compute_routing_values(
+        evaluation,
+        geometry.centers,
+        metric=str(spec.metric),
+        kernel=str(spec.kernel),
+        scales=geometry.scales,
+    )
+    scaled = backend.compute_routing_values(
+        evaluation * 7.0,
+        scaled_geometry.centers,
+        metric=str(spec.metric),
+        kernel=str(spec.kernel),
+        scales=scaled_geometry.scales,
+    )
+
+    assert np.allclose(original, scaled)
+
+
+def test_gmm_posterior_respects_partition_priors() -> None:
+    spec = PartitionGeometrySpec(
+        metric="full_shrinkage_mahalanobis",
+        kernel="gmm_posterior",
+        uniform_shrinkage=0.0,
+    )
+    geometry = PartitionGeometryContract(
+        spec=spec,
+        partition_names=("chunk_0", "chunk_1"),
+        cluster_ids=(0, 1),
+        centers=np.zeros((2, 2)),
+        scales=np.ones(2),
+        priors=np.asarray([0.9, 0.1]),
+        precisions=np.repeat(np.eye(2)[None, :, :], 2, axis=0),
+        log_determinants=np.zeros(2),
+        source_counts=(9, 1),
+        representation_counts=(9, 1),
+    )
+
+    _distances, routing = route_partition_geometry(
+        backend=MatrixRMTBackend(),
+        embedding=np.zeros((1, 2)),
+        geometry=geometry,
+    )
+
+    assert routing.weights[0, 0] == pytest.approx(0.9)
+    assert routing.weights[0, 1] == pytest.approx(0.1)
+
+
+def test_sampler_can_replay_alternative_geometry_without_refit() -> None:
+    rng = np.random.default_rng(51)
+    frame = pd.DataFrame(rng.normal(size=(60, 5)), columns=[f"x_{idx}" for idx in range(5)])
+    sampler = RMTContractionTensorSampler(
+        n_partitions=3,
+        n_views=3,
+        projection_dim=2,
+        backend="numpy",
+        random_state=51,
+        show_progress=False,
+    ).fit(frame)
+    original_basis = np.array(sampler.right_basis_, copy=True)
+
+    distances, routing = sampler.predict_partition_routing_contracts(
+        frame.iloc[:8],
+        geometry_spec=PartitionGeometrySpec(
+            metric="diag_shrinkage_mahalanobis",
+            covariance_shrinkage=0.2,
+        ),
+    )
+
+    assert distances.partition_names == tuple(sampler.partition_names_)
+    assert routing.partition_names == tuple(sampler.partition_names_)
+    assert np.allclose(routing.weights.sum(axis=1), 1.0)
+    assert np.array_equal(original_basis, sampler.right_basis_)
+
+
+def test_temperature_replay_selects_better_regression_routing() -> None:
+    spec = PartitionGeometrySpec(temperature=1.0, uniform_shrinkage=0.0)
+    distances = RoutingDistanceContract(
+        partition_names=("chunk_0", "chunk_1"),
+        values=np.asarray([[0.0, 1.0], [0.0, 1.0], [1.0, 0.0], [1.0, 0.0]]),
+        kind="distance",
+    )
+    request = RoutingReplayRequest(
+        arm_name="euclidean",
+        geometry_spec=spec,
+        distances=distances,
+        target=np.asarray([0.0, 0.0, 10.0, 10.0]),
+        expert_outputs=np.asarray(
+            [
+                [0.0, 10.0],
+                [0.0, 10.0],
+                [0.0, 10.0],
+                [0.0, 10.0],
+            ]
+        ),
+        problem_type="regression",
+    )
+
+    selection = RoutingReplayEvaluator().calibrate_temperature(request, (0.1, 1.0, 10.0))
+
+    assert selection.best.temperature == 0.1
+    assert selection.best.primary_metric == "rmse"
+    assert selection.best.diagnostics["oracle_expert_regret"] >= 0.0
+
+
+def test_classification_replay_uses_probability_metrics() -> None:
+    distances = RoutingDistanceContract(
+        partition_names=("chunk_0", "chunk_1"),
+        values=np.asarray([[0.0, 2.0], [2.0, 0.0], [0.0, 2.0], [2.0, 0.0]]),
+        kind="distance",
+    )
+    expert_proba = np.asarray(
+        [
+            [[0.95, 0.05], [0.10, 0.90]],
+            [[0.90, 0.10], [0.05, 0.95]],
+            [[0.90, 0.10], [0.15, 0.85]],
+            [[0.85, 0.15], [0.10, 0.90]],
+        ]
+    )
+    request = RoutingReplayRequest(
+        arm_name="binary",
+        geometry_spec=PartitionGeometrySpec(uniform_shrinkage=0.0),
+        distances=distances,
+        target=np.asarray([0, 1, 0, 1]),
+        expert_outputs=expert_proba,
+        problem_type="classification",
+        classes=(0, 1),
+    )
+
+    result = RoutingReplayEvaluator().evaluate(request, temperature=0.2)
+
+    assert result.primary_metric == "roc_auc"
+    assert result.metrics["roc_auc"] == pytest.approx(1.0)
+    assert np.isfinite(result.metrics["log_loss"])
+    assert np.isfinite(result.metrics["brier_score"])
+    assert result.metrics["brier_score"] == pytest.approx(
+        classification_brier_score(
+            request.target,
+            result.blended_output,
+            request.classes,
+        )
+    )
+    assert "mean_top1_margin" in result.routing.diagnostics
+    assert np.allclose(result.blended_output.sum(axis=1), 1.0)
+
+
+def test_default_phase_a_arms_have_stable_order() -> None:
+    arms = default_routing_geometry_arms()
+
+    assert tuple(arm.name.split("_", 1)[0] for arm in arms) == (
+        "A0",
+        "A1",
+        "A2",
+        "A3",
+        "A4",
+        "A5",
+        "A6",
+    )
+    assert arms[0].use_validation_priors is False
+    assert arms[1].temperature_candidates == (1.0,)
+
+
+def test_fitted_ensemble_adapter_replays_without_model_fit() -> None:
+    rng = np.random.default_rng(81)
+    frame = pd.DataFrame(rng.normal(size=(50, 4)), columns=[f"x_{idx}" for idx in range(4)])
+    sampler = RMTContractionTensorSampler(
+        n_partitions=2,
+        n_views=2,
+        projection_dim=2,
+        backend="numpy",
+        random_state=81,
+        show_progress=False,
+    ).fit(frame)
+    target = frame.iloc[:12, 0].to_numpy()
+    names = tuple(sampler.partition_names_)
+    outputs = np.column_stack(
+        [target + 0.1 * (idx + 1) for idx in range(len(names))]
+    )
+
+    class _FittedEnsemble:
+        problem = "regression"
+        classes_ = None
+        partitioner = sampler
+
+        @staticmethod
+        def export_expert_outputs(features, *, stage="validation"):
+            assert stage == "validation"
+            return names, outputs
+
+        @staticmethod
+        def validation_prior_weights():
+            return np.full(len(names), 1.0 / len(names))
+
+    selected_arms = default_routing_geometry_arms()[:3]
+    results = FittedEnsembleRoutingReplay(show_progress=False).run_validation(
+        ensemble=_FittedEnsemble(),
+        X_val=frame.iloc[:12],
+        y_val=target,
+        arms=selected_arms,
+    )
+
+    assert [result.arm_name for result in results] == [arm.name for arm in selected_arms]
+    assert all(result.primary_metric == "rmse" for result in results)
+    assert all(np.isfinite(result.primary_value) for result in results)
+
+
+def test_targeted_runner_persists_incremental_synthetic_results(tmp_path) -> None:
+    config = RoutingGeometryExperimentConfig(
+        regression_suite=None,
+        classification_suite=None,
+        regression_tasks=(),
+        classification_tasks=(),
+        models=("ridge",),
+        budget_ratios=(0.20,),
+        seeds=(42,),
+        n_partitions=3,
+        output_dir=tmp_path,
+        show_progress=False,
+    )
+
+    class _SyntheticOrchestrator(RoutingGeometryExperimentOrchestrator):
+        def _load_datasets(self):
+            return [make_synthetic_regression_smoke_dataset(42)]
+
+    result = _SyntheticOrchestrator(
+        config,
+        arms=default_routing_geometry_arms()[:2],
+    ).run()
+
+    assert result.shape[0] == 2
+    assert set(result["status"]) == {"completed"}
+    assert (tmp_path / "routing_geometry_runs.jsonl").exists()
+    assert (tmp_path / "routing_geometry_replay.csv").exists()
+    assert '"status": "completed"' in (tmp_path / "run_meta.json").read_text(encoding="utf-8")
+
+    resumed = _SyntheticOrchestrator(
+        config,
+        arms=default_routing_geometry_arms()[:2],
+    ).run()
+
+    assert resumed.shape[0] == 2
+    lines = (tmp_path / "routing_geometry_runs.jsonl").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert len(lines) == 2
+
+
+@pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch is optional")
+@pytest.mark.parametrize(
+    ("metric", "kernel"),
+    [
+        ("median_scaled_euclidean", "softmax"),
+        ("full_shrinkage_mahalanobis", "softmax"),
+        ("full_shrinkage_mahalanobis", "gmm_posterior"),
+    ],
+)
+def test_matrix_and_tensor_routing_kernels_are_consistent(metric: str, kernel: str) -> None:
+    embedding, labels, partitions, mapping = _geometry_inputs()
+    geometry = PartitionGeometryBuilder().build(
+        embedding=embedding,
+        cluster_labels=labels,
+        partitions=partitions,
+        partition_to_cluster=mapping,
+        spec=PartitionGeometrySpec(
+            metric=metric,
+            kernel=kernel,
+            covariance_shrinkage=0.2,
+            uniform_shrinkage=0.0,
+        ),
+    )
+    evaluation = np.asarray([[-1.5, 0.0], [1.5, 0.0], [0.0, 0.2]])
+
+    _, matrix_weights = route_partition_geometry(
+        backend=MatrixRMTBackend(),
+        embedding=evaluation,
+        geometry=geometry,
+    )
+    _, tensor_weights = route_partition_geometry(
+        backend=TensorRMTBackend(device="cpu", dtype="float64"),
+        embedding=evaluation,
+        geometry=geometry,
+    )
+
+    assert np.allclose(matrix_weights.weights, tensor_weights.weights, atol=1e-6)

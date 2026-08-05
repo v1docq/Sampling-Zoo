@@ -70,6 +70,12 @@ from .resume import (
     scientific_experiment_config,
 )
 from .resume_runtime import ResumeSession, load_resume_session
+from .routing_replay import (
+    RoutingReplayEvaluator,
+    RoutingReplayRequest,
+    RoutingReplayResult,
+    RoutingTemperatureSelection,
+)
 from .stages import ExperimentPlan, ExperimentStageId, StageRegistry, StageRequest, StageResult
 
 __all__ = [
@@ -105,6 +111,10 @@ __all__ = [
     "PartitionTrainingResult",
     "PackageVersion",
     "RoutingContract",
+    "RoutingReplayEvaluator",
+    "RoutingReplayRequest",
+    "RoutingReplayResult",
+    "RoutingTemperatureSelection",
     "RuntimeDiagnosticsContract",
     "RunArtifactRef",
     "RunArtifactRegistry",

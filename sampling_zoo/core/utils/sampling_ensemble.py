@@ -1900,6 +1900,47 @@ class SamplingEnsemble:
                 raise ValueError("stage must be 'validation' or 'inference'")
         return probabilities
 
+    def export_expert_outputs(
+        self,
+        features: pd.DataFrame,
+        *,
+        stage: str = 'inference',
+        models: Optional[List[Dict[str, Any]]] = None,
+    ) -> tuple[tuple[str, ...], np.ndarray]:
+        """Return fixed expert outputs for offline routing-policy replay.
+
+        Regression output has shape ``(rows, experts)``. Classification output
+        has shape ``(rows, experts, classes)`` with the global class order used
+        by :meth:`ensemble_predict_proba`.
+        """
+
+        active_models = self._ensure_active_models(models)
+        names = tuple(str(model.get('name', f'model_{index}')) for index, model in enumerate(active_models))
+        if self.problem == 'classification':
+            outputs = np.stack(
+                self._model_proba_predictions(features, stage, active_models),
+                axis=1,
+            )
+        else:
+            predictions = [
+                (
+                    np.asarray(model_info['val_predictions'])
+                    if stage == 'validation'
+                    else np.asarray(model_info['model'].predict(features))
+                )
+                for model_info in active_models
+            ]
+            outputs = np.column_stack(predictions)
+        return names, np.asarray(outputs, dtype=float)
+
+    def validation_prior_weights(
+        self,
+        models: Optional[List[Dict[str, Any]]] = None,
+    ) -> np.ndarray:
+        """Expose validation-derived expert priors for deterministic replay."""
+
+        return self._validation_weights(self._ensure_active_models(models))
+
     def ensemble_predict_proba(
         self,
         features: pd.DataFrame,
