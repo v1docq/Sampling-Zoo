@@ -600,7 +600,12 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--max-train-rows", type=int, default=100_000)
-    parser.add_argument("--seeds", type=int, nargs="+", default=[42])
+    parser.add_argument(
+        "--seeds",
+        type=int,
+        nargs="+",
+        default=list(DEFAULT_ROUTING_SEEDS),
+    )
     parser.add_argument("--budgets", type=float, nargs="+", default=list(DEFAULT_ROUTING_BUDGETS))
     parser.add_argument("--models", nargs="+", default=["lightgbm"])
     parser.add_argument("--no-progress", action="store_true")
