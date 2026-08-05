@@ -33,6 +33,15 @@ from .null_diagnostics import (
     SpectralNullDiagnosticResult,
 )
 from .rmt_contraction_sampler import RMTContractionTensorSampler
+from .routing_contracts import (
+    PartitionGeometryContract,
+    PartitionGeometrySpec,
+    PartitionRepresentation,
+    RoutingDistanceContract,
+    RoutingKernel,
+    RoutingMetric,
+    RoutingWeightContract,
+)
 from .subspace_diagnostics import (
     SpectralSubspaceDiagnostic,
     SpectralSubspaceDiagnosticConfig,
@@ -57,9 +66,16 @@ __all__ = [
     "PartitionValidationComponents",
     "PartitionValidationPlan",
     "PartitionValidationProxyEvaluator",
+    "PartitionGeometryContract",
+    "PartitionGeometrySpec",
+    "PartitionRepresentation",
     "NullDiagnosticStatus",
     "NullModelPolicy",
     "RMTContractionTensorSampler",
+    "RoutingDistanceContract",
+    "RoutingKernel",
+    "RoutingMetric",
+    "RoutingWeightContract",
     "SpectralNullDiagnostic",
     "SpectralNullDiagnosticConfig",
     "SpectralNullDiagnosticResult",

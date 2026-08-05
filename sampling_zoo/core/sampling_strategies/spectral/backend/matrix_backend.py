@@ -171,12 +171,129 @@ class MatrixRMTBackend:
         active_centroids: np.ndarray,
         temperature: float,
     ) -> np.ndarray:
-        d2 = np.sum((embedding[:, None, :] - active_centroids[None, :, :]) ** 2, axis=2)
+        d2 = MatrixRMTBackend.pairwise_squared_euclidean(embedding, active_centroids)
+        return MatrixRMTBackend.normalize_routing_values(
+            d2,
+            kind="distance",
+            temperature=temperature,
+        )
+
+    @staticmethod
+    def pairwise_squared_euclidean(
+        embedding: np.ndarray,
+        centers: np.ndarray,
+    ) -> np.ndarray:
+        embedding = np.asarray(embedding, dtype=float)
+        centers = np.asarray(centers, dtype=float)
+        return np.sum((embedding[:, None, :] - centers[None, :, :]) ** 2, axis=2)
+
+    @staticmethod
+    def pairwise_mahalanobis(
+        embedding: np.ndarray,
+        centers: np.ndarray,
+        precisions: np.ndarray,
+    ) -> np.ndarray:
+        embedding = np.asarray(embedding, dtype=float)
+        centers = np.asarray(centers, dtype=float)
+        precisions = np.asarray(precisions, dtype=float)
+        diff = embedding[:, None, :] - centers[None, :, :]
+        return np.einsum("nkd,kde,nke->nk", diff, precisions, diff, optimize=True)
+
+    @staticmethod
+    def pairwise_cosine_distance(
+        embedding: np.ndarray,
+        centers: np.ndarray,
+    ) -> np.ndarray:
+        embedding = np.asarray(embedding, dtype=float)
+        centers = np.asarray(centers, dtype=float)
+        numerator = embedding @ centers.T
+        denominator = (
+            np.linalg.norm(embedding, axis=1, keepdims=True)
+            * np.linalg.norm(centers, axis=1, keepdims=True).T
+        )
+        similarity = np.divide(
+            numerator,
+            denominator,
+            out=np.zeros_like(numerator, dtype=float),
+            where=denominator > 1e-12,
+        )
+        return np.clip(1.0 - similarity, 0.0, 2.0)
+
+    @classmethod
+    def compute_routing_values(
+        cls,
+        embedding: np.ndarray,
+        centers: np.ndarray,
+        *,
+        metric: str,
+        kernel: str,
+        scales: Optional[np.ndarray] = None,
+        precisions: Optional[np.ndarray] = None,
+        log_determinants: Optional[np.ndarray] = None,
+        priors: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        if kernel == "gmm_posterior":
+            if precisions is None or log_determinants is None or priors is None:
+                raise ValueError("gmm_posterior requires precisions, log determinants, and priors")
+            d2 = cls.pairwise_mahalanobis(embedding, centers, precisions)
+            dimension = int(np.asarray(embedding).shape[1])
+            return (
+                -0.5
+                * (
+                    d2
+                    + np.asarray(log_determinants, dtype=float)[None, :]
+                    + dimension * np.log(2.0 * np.pi)
+                )
+                + np.log(np.maximum(np.asarray(priors, dtype=float), 1e-12))[None, :]
+            )
+        if metric == "squared_euclidean":
+            return cls.pairwise_squared_euclidean(embedding, centers)
+        if metric == "median_scaled_euclidean":
+            if scales is None:
+                raise ValueError("median_scaled_euclidean requires partition scales")
+            d2 = cls.pairwise_squared_euclidean(embedding, centers)
+            return d2 / np.maximum(np.asarray(scales, dtype=float)[None, :], 1e-12)
+        if metric in {"diag_shrinkage_mahalanobis", "full_shrinkage_mahalanobis"}:
+            if precisions is None:
+                raise ValueError(f"{metric} requires precision matrices")
+            return cls.pairwise_mahalanobis(embedding, centers, precisions)
+        if metric == "cosine":
+            return cls.pairwise_cosine_distance(embedding, centers)
+        raise ValueError(f"Unsupported routing metric: {metric}")
+
+    @staticmethod
+    def normalize_routing_values(
+        values: np.ndarray,
+        *,
+        kind: str,
+        temperature: float,
+    ) -> np.ndarray:
+        values = np.asarray(values, dtype=float)
+        if values.ndim != 2 or values.shape[1] < 1:
+            raise ValueError("Routing values must be a 2D matrix with at least one partition")
         temp = max(float(temperature), 1e-8)
-        logits = -d2 / temp
-        logits = logits - np.max(logits, axis=1, keepdims=True)
-        proba = np.exp(logits)
-        return proba / np.maximum(np.sum(proba, axis=1, keepdims=True), 1e-12)
+        if kind == "distance":
+            logits = -values / temp
+        elif kind == "log_density":
+            logits = values / temp
+        else:
+            raise ValueError(f"Unsupported routing value kind: {kind}")
+        finite = np.isfinite(logits)
+        safe_logits = np.where(finite, logits, -np.inf)
+        row_max = np.max(safe_logits, axis=1, keepdims=True)
+        all_invalid = ~np.isfinite(row_max[:, 0])
+        safe_logits = safe_logits - np.where(np.isfinite(row_max), row_max, 0.0)
+        probabilities = np.exp(safe_logits)
+        row_sums = np.sum(probabilities, axis=1, keepdims=True)
+        normalized = np.divide(
+            probabilities,
+            row_sums,
+            out=np.full_like(probabilities, 1.0 / probabilities.shape[1]),
+            where=row_sums > 0,
+        )
+        if np.any(all_invalid):
+            normalized[all_invalid] = 1.0 / probabilities.shape[1]
+        return normalized
 
 
 def _validate_subspace_inputs(

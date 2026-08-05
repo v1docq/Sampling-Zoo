@@ -80,7 +80,10 @@ class TensorRMTBackend:
     def _to_tensor(self, X: Any) -> Any:
         if torch.is_tensor(X):
             return X.to(device=self.device, dtype=self.dtype)
-        return torch.as_tensor(X, dtype=self.dtype, device=self.device)
+        array = np.asarray(X)
+        if not array.flags.writeable:
+            array = np.array(array, copy=True)
+        return torch.as_tensor(array, dtype=self.dtype, device=self.device)
 
     def build_mode0_unfolding(self, X: np.ndarray, view_specs: Iterable[Any]) -> Any:
         X_tensor = self._to_tensor(X)
@@ -228,10 +231,90 @@ class TensorRMTBackend:
         active_centroids: np.ndarray,
         temperature: float,
     ) -> np.ndarray:
+        values = self.compute_routing_values(
+            embedding,
+            active_centroids,
+            metric="squared_euclidean",
+            kernel="softmax",
+        )
+        return self.normalize_routing_values(
+            values,
+            kind="distance",
+            temperature=temperature,
+        )
+
+    def compute_routing_values(
+        self,
+        embedding: np.ndarray,
+        centers: np.ndarray,
+        *,
+        metric: str,
+        kernel: str,
+        scales: Optional[np.ndarray] = None,
+        precisions: Optional[np.ndarray] = None,
+        log_determinants: Optional[np.ndarray] = None,
+        priors: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
         emb = self._to_tensor(embedding)
-        centroids = torch.as_tensor(active_centroids, dtype=emb.dtype, device=emb.device)
-        d2 = torch.sum((emb[:, None, :] - centroids[None, :, :]) ** 2, dim=2)
-        logits = -d2 / max(float(temperature), 1e-8)
-        logits = logits - torch.max(logits, dim=1, keepdim=True).values
-        proba = torch.softmax(logits, dim=1)
-        return proba.detach().cpu().numpy()
+        center_tensor = self._to_tensor(centers)
+        diff = emb[:, None, :] - center_tensor[None, :, :]
+
+        if kernel == "gmm_posterior":
+            if precisions is None or log_determinants is None or priors is None:
+                raise ValueError("gmm_posterior requires precisions, log determinants, and priors")
+            precision_tensor = self._to_tensor(precisions)
+            d2 = torch.einsum("nkd,kde,nke->nk", diff, precision_tensor, diff)
+            logdet = self._to_tensor(log_determinants)
+            prior = self._to_tensor(priors)
+            values = (
+                -0.5 * (d2 + logdet[None, :] + int(emb.shape[1]) * math.log(2.0 * math.pi))
+                + torch.log(torch.clamp(prior, min=1e-12))[None, :]
+            )
+            return values.detach().cpu().numpy()
+
+        if metric in {"squared_euclidean", "median_scaled_euclidean"}:
+            values = torch.sum(diff * diff, dim=2)
+            if metric == "median_scaled_euclidean":
+                if scales is None:
+                    raise ValueError("median_scaled_euclidean requires partition scales")
+                scale_tensor = self._to_tensor(scales)
+                values = values / torch.clamp(scale_tensor[None, :], min=1e-12)
+        elif metric in {"diag_shrinkage_mahalanobis", "full_shrinkage_mahalanobis"}:
+            if precisions is None:
+                raise ValueError(f"{metric} requires precision matrices")
+            precision_tensor = self._to_tensor(precisions)
+            values = torch.einsum("nkd,kde,nke->nk", diff, precision_tensor, diff)
+        elif metric == "cosine":
+            numerator = emb @ center_tensor.T
+            denominator = (
+                torch.linalg.vector_norm(emb, dim=1, keepdim=True)
+                * torch.linalg.vector_norm(center_tensor, dim=1, keepdim=True).T
+            )
+            similarity = numerator / torch.clamp(denominator, min=1e-12)
+            values = torch.clamp(1.0 - similarity, min=0.0, max=2.0)
+        else:
+            raise ValueError(f"Unsupported routing metric: {metric}")
+        return values.detach().cpu().numpy()
+
+    def normalize_routing_values(
+        self,
+        values: np.ndarray,
+        *,
+        kind: str,
+        temperature: float,
+    ) -> np.ndarray:
+        tensor = self._to_tensor(values)
+        if tensor.ndim != 2 or int(tensor.shape[1]) < 1:
+            raise ValueError("Routing values must be a 2D matrix with at least one partition")
+        if kind == "distance":
+            logits = -tensor / max(float(temperature), 1e-8)
+        elif kind == "log_density":
+            logits = tensor / max(float(temperature), 1e-8)
+        else:
+            raise ValueError(f"Unsupported routing value kind: {kind}")
+        finite = torch.isfinite(logits)
+        safe_logits = torch.where(finite, logits, torch.full_like(logits, -torch.inf))
+        invalid_rows = ~torch.any(finite, dim=1)
+        safe_logits[invalid_rows] = 0.0
+        probabilities = torch.softmax(safe_logits, dim=1)
+        return probabilities.detach().cpu().numpy()

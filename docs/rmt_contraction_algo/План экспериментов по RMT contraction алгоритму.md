@@ -1,5 +1,7 @@
 #  Первичный план - 04.05.26
 
+> Это исторический общий план. Актуальная целевая проверка routing geometry и bulk/spike topology описана в [двухфазной постановке эксперимента](RMT%20routing%20geometry%20и%20bulk-spike%20experiment.md).
+
 1. Прогнать `rmt_contraction` против `random`, `difficulty`, `feature_clustering` на regression datasets из `AMBL_regression_suite.csv` / OpenML regression suite.
 2. Разделить результаты на:
     - маленькие датасеты -  `<20k` семплов;

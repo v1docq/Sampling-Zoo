@@ -32,6 +32,13 @@ from .subspace_diagnostics import (
     SpectralSubspaceDiagnosticConfig,
     SpectralSubspaceDiagnosticResult,
 )
+from .routing_contracts import (
+    PartitionGeometryContract,
+    PartitionGeometrySpec,
+    RoutingDistanceContract,
+    RoutingWeightContract,
+)
+from .routing_geometry import PartitionGeometryBuilder, route_partition_geometry
 from ...utils.progress import progress_bar
 from ...utils.utils import safe_index
 from ...experiment.budgeting import PartitionBudgetPlan, build_partition_budget_plan
@@ -127,8 +134,14 @@ class RMTContractionConfig:
     max_chunk_size: Optional[int] = None
     selection_method: str = "hybrid"
     leverage_cap_quantile: float = 0.95
+    routing_representation: str = "source_centroid"
+    routing_metric: str = "squared_euclidean"
+    routing_kernel: str = "softmax"
     routing_temperature: float = 1.0
     routing_shrinkage: float = 0.05
+    routing_covariance_shrinkage: float = 0.10
+    routing_min_scale: float = 1e-8
+    routing_min_prior: float = 1e-8
     include_categorical: bool = True
     max_one_hot_cardinality: int = 128
     max_encoded_features: Optional[int] = 4096
@@ -457,6 +470,17 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self.spectral_subspace_diagnostic = SpectralSubspaceDiagnostic(
             subspace_config
         )
+        self.routing_geometry_spec = PartitionGeometrySpec(
+            representation=cfg.routing_representation,
+            metric=cfg.routing_metric,
+            kernel=cfg.routing_kernel,
+            temperature=cfg.routing_temperature,
+            covariance_shrinkage=cfg.routing_covariance_shrinkage,
+            uniform_shrinkage=cfg.routing_shrinkage,
+            min_scale=cfg.routing_min_scale,
+            min_prior=cfg.routing_min_prior,
+        )
+        self.geometry_builder_ = PartitionGeometryBuilder()
         self.oversample_factor = int(cfg.oversample_factor)
         self.power_iterations = int(cfg.power_iterations)
         self.max_unfolding_elements = cfg.max_unfolding_elements
@@ -480,6 +504,9 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         ] = {}
         self.resolved_class_coverage_policy_ = "off"
         self.class_coverage_guaranteed_ = False
+        self.partition_geometry_: Optional[PartitionGeometryContract] = None
+        self.last_routing_distances_: Optional[RoutingDistanceContract] = None
+        self.last_routing_weights_: Optional[RoutingWeightContract] = None
 
     @staticmethod
     def _normalize_config_inputs(
@@ -643,7 +670,7 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         with progress_bar(
             enabled=self.show_progress,
             desc="RMT sampler fit",
-            total=7,
+            total=8,
         ) as stage:
             started = perf_counter()
             rng = self._start_fit()
@@ -672,6 +699,10 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             started = perf_counter()
             self._fit_clusters_and_partitions(X_num, scores, target)
             stage_seconds["partition_selection_and_sampling"] = perf_counter() - started
+            stage.update(1)
+            started = perf_counter()
+            self._fit_partition_geometry()
+            stage_seconds["partition_geometry"] = perf_counter() - started
             stage.update(1)
             started = perf_counter()
             self._build_diagnostics(M, rank)
@@ -707,6 +738,9 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self.resolved_class_coverage_policy_ = "off"
         self.class_coverage_guaranteed_ = False
         self.cluster_centers_ = None
+        self.partition_geometry_ = None
+        self.last_routing_distances_ = None
+        self.last_routing_weights_ = None
         if self.n_views_requested == "auto":
             self.n_views = self.min_views
         return np.random.default_rng(self.random_state)
@@ -1050,24 +1084,105 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         return np.asarray([cluster_ids[i] for i in best], dtype=int)
 
     def predict_partition_proba(self, X: ArrayLike) -> np.ndarray:
-        if self.clusterer_ is None or self.sample_embedding_ is None or self.cluster_centers_ is None:
+        """Return routing probabilities aligned with ``partition_names_``."""
+
+        return self.predict_partition_routing(X).weights
+
+    def predict_partition_routing(
+        self,
+        X: ArrayLike,
+        *,
+        geometry_spec: Optional[PartitionGeometrySpec] = None,
+        temperature: Optional[float] = None,
+    ) -> RoutingWeightContract:
+        """Route raw rows and retain the typed distance/weight diagnostics."""
+
+        _distances, weights = self.predict_partition_routing_contracts(
+            X,
+            geometry_spec=geometry_spec,
+            temperature=temperature,
+        )
+        return weights
+
+    def predict_partition_routing_contracts(
+        self,
+        X: ArrayLike,
+        *,
+        geometry_spec: Optional[PartitionGeometrySpec] = None,
+        temperature: Optional[float] = None,
+    ) -> Tuple[RoutingDistanceContract, RoutingWeightContract]:
+        """Return both pre-normalization proximity values and routing weights."""
+
+        if self.sample_embedding_ is None:
             raise RuntimeError("Sampler not fitted. Call fit() first.")
         if not self.partition_names_:
             raise RuntimeError("No partitions available. Call fit() first.")
+        geometry = (
+            self.partition_geometry_
+            if geometry_spec is None
+            else self.build_partition_geometry(geometry_spec)
+        )
+        if geometry is None:
+            raise RuntimeError("Partition geometry is not fitted")
+        return self.route_embedding(
+            self.transform_embedding(X),
+            geometry=geometry,
+            temperature=temperature,
+        )
 
-        X_num = self._transform_features(X)
-        M_new = self._build_mode0_unfolding(X_num, fit=False, rng=None)
-        embedding = self._project_new_unfolding(M_new)
+    def route_embedding(
+        self,
+        embedding: np.ndarray,
+        *,
+        geometry: Optional[PartitionGeometryContract] = None,
+        geometry_spec: Optional[PartitionGeometrySpec] = None,
+        temperature: Optional[float] = None,
+    ) -> Tuple[RoutingDistanceContract, RoutingWeightContract]:
+        """Route an already projected embedding without refitting the sampler."""
 
-        active_cluster_ids = np.asarray([self.partition_to_cluster_[name] for name in self.partition_names_], dtype=int)
-        active_centroids = self.cluster_centers_[active_cluster_ids]
-        proba = self._routing_probability(embedding, active_centroids)
+        if geometry is not None and geometry_spec is not None:
+            raise ValueError("Pass either geometry or geometry_spec, not both")
+        selected_geometry = geometry
+        if selected_geometry is None:
+            selected_geometry = (
+                self.partition_geometry_
+                if geometry_spec is None
+                else self.build_partition_geometry(geometry_spec)
+            )
+        if selected_geometry is None:
+            raise RuntimeError("Partition geometry is not fitted")
+        distances, weights = route_partition_geometry(
+            backend=self._get_rmt_backend(),
+            embedding=np.asarray(embedding, dtype=float),
+            geometry=selected_geometry,
+            temperature=temperature,
+        )
+        self.last_routing_distances_ = distances
+        self.last_routing_weights_ = weights
+        return distances, weights
 
-        if self.routing_shrinkage > 0:
-            m = proba.shape[1]
-            lam = min(max(self.routing_shrinkage, 0.0), 1.0)
-            proba = (1.0 - lam) * proba + lam / m
-        return proba
+    def build_partition_geometry(
+        self,
+        spec: Optional[PartitionGeometrySpec] = None,
+    ) -> PartitionGeometryContract:
+        """Build an alternative immutable geometry from the fitted partitions."""
+
+        if self.sample_embedding_ is None or self.cluster_labels_ is None:
+            raise RuntimeError("Sampler not fitted. Call fit() first.")
+        if not self.partitions:
+            raise RuntimeError("No partitions available. Call fit() first.")
+        return self.geometry_builder_.build(
+            embedding=self.sample_embedding_,
+            cluster_labels=self.cluster_labels_,
+            partitions=self.partitions,
+            partition_to_cluster=self.partition_to_cluster_,
+            spec=self.routing_geometry_spec if spec is None else spec,
+        )
+
+    def _fit_partition_geometry(self) -> None:
+        self.partition_geometry_ = self.build_partition_geometry(
+            self.routing_geometry_spec
+        )
 
     def transform_embedding(self, X: ArrayLike) -> np.ndarray:
         """Return the latent sample-mode embedding used by the router."""
@@ -1564,6 +1679,11 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             "effective_sample_count": eff_n,
             "row_selection_method": self.selection_method,
             "leverage_cap_quantile": float(self.leverage_cap_quantile),
+            "routing_geometry": (
+                self.partition_geometry_.to_dict()
+                if self.partition_geometry_ is not None
+                else None
+            ),
             "partition_membership_fingerprint": (
                 partition_membership_fingerprint(self.cluster_labels_)
                 if self.cluster_labels_ is not None
