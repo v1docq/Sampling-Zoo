@@ -1,6 +1,6 @@
 # RMT routing geometry и bulk/spike experts: актуальный план разработки
 
-Дата актуализации: 2026-08-05. Статус: `phase_a_implemented`.
+Дата актуализации: 2026-08-06. Статус: `phase_a_completed_selector_gate_implemented`.
 
 Формальная постановка проверки гипотез: [Эксперимент: routing geometry и bulk/spike experts](../rmt_contraction_algo/RMT%20routing%20geometry%20и%20bulk-spike%20experiment.md).
 
@@ -16,10 +16,23 @@
 | P1 | завершен | `routing_contracts.py`, `PartitionGeometryBuilder`, совместимый `predict_partition_proba(...)`. |
 | P2 | завершен для Phase A | Matrix/Torch kernels для scaled L2, shrinkage Mahalanobis, cosine и GMM posterior; row-wise routing diagnostics. |
 | P3 | завершен | Offline replay фиксированных expert outputs, validation-only temperature calibration, incremental artifacts и synthetic smoke. |
+| P3.1 | реализован, ожидает real-data gate | `ValidationRoutingGeometrySelector`, независимые calibration/selection holdouts и A7 selector arm с A2 fallback. |
 | P4 | не начат | Component split и row participation реализуются только после real-data gate Phase A. |
 | P5-P6 | заблокированы gate-ом | Bulk/spike experts и full grid не запускаются до выбора routing geometry. |
 
-Targeted runner: `examples/benchmark/rmt_routing_geometry_experiment.py`. Быстрая локальная проверка: `examples/benchmark/rmt_routing_geometry_smoke.py`.
+Targeted runners: `examples/benchmark/rmt_routing_geometry_experiment.py` для screening и `examples/benchmark/rmt_validation_geometry_selector_experiment.py` для честного selector gate. Быстрая локальная проверка: `examples/benchmark/rmt_routing_geometry_smoke.py`.
+
+### Результат Phase A и следующий gate
+
+Phase A завершен без ошибок: `1120/1120` leaf runs, восемь датасетов, пять seeds, четыре бюджета и семь routing arms. Основные выводы:
+
+- `median_scaled_euclidean` имеет лучший средний ранг `2.28` и является fallback;
+- cosine arm имеет средний ранг `2.53`, чаще становится абсолютным победителем и больше не считается negative control;
+- GMM posterior имеет средний ранг `3.21` и особенно полезен для classification;
+- squared Euclidean дает переуверенный routing и остается только воспроизводимым baseline;
+- diagonal/full Mahalanobis не проходят в основной selector до отдельной temperature/covariance ablation.
+
+Следующий gate выбирает один вариант из A2/A5/A6. Исходный validation split делится на calibration и geometry-selection части. Calibration используется для temperature и expert priors, selection выбирает arm, outer test оценивается один раз после выбора. Синтетический selector arm называется `A7_validation_selected_top3`; имя `B0` остается зарезервированным для bulk/spike topology.
 
 ## 1. Принятые решения
 
@@ -151,6 +164,15 @@ Default остается `spectral_component_policy="explained_variance"` и `ex
 - выбирать geometry только по inner validation и один раз оценивать test.
 
 После P3 можно запускать первую новую real-data ablation.
+
+### P3.1. Validation-selected routing geometry
+
+- калибровать температуры A2/A5/A6 на calibration holdout;
+- выбирать geometry на отдельном selection holdout через immutable policy/result contracts;
+- предпочитать A2 при ничьей или недостаточном улучшении;
+- сохранять candidate scores, причину выбора, fallback flag и выбранный arm;
+- не передавать outer-test данные в selector;
+- запускать A7 gate до начала bulk/spike topology.
 
 ### P4. Component-aware spectral diagnostics
 

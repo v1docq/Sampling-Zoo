@@ -10,7 +10,11 @@ import numpy as np
 from scipy.stats import rankdata
 from sklearn.metrics import mean_absolute_error
 
-from sampling_zoo.core.metrics.eval_metrics import calculate_metrics, get_metric_comparator
+from sampling_zoo.core.metrics.eval_metrics import (
+    calculate_metrics,
+    get_metric_comparator,
+    metric_drop,
+)
 from sampling_zoo.core.sampling_strategies.spectral.backend.matrix_backend import MatrixRMTBackend
 from sampling_zoo.core.sampling_strategies.spectral.routing_contracts import (
     PartitionGeometrySpec,
@@ -112,6 +116,142 @@ class RoutingReplayResult:
 class RoutingTemperatureSelection:
     best: RoutingReplayResult
     candidates: tuple[RoutingReplayResult, ...]
+
+
+@dataclass(frozen=True)
+class RoutingGeometrySelectionPolicy:
+    """Validated policy for selecting one calibrated geometry on validation rows."""
+
+    candidate_arm_names: tuple[str, ...]
+    fallback_arm_name: str
+    minimum_improvement: float = 0.0
+
+    def __post_init__(self) -> None:
+        names = tuple(str(name).strip() for name in self.candidate_arm_names)
+        fallback = str(self.fallback_arm_name).strip()
+        if not names or any(not name for name in names):
+            raise ValueError("candidate_arm_names must be non-empty")
+        if len(set(names)) != len(names):
+            raise ValueError("candidate_arm_names must be unique")
+        if fallback not in names:
+            raise ValueError("fallback_arm_name must be one of candidate_arm_names")
+        if float(self.minimum_improvement) < 0:
+            raise ValueError("minimum_improvement must be non-negative")
+        object.__setattr__(self, "candidate_arm_names", names)
+        object.__setattr__(self, "fallback_arm_name", fallback)
+        object.__setattr__(self, "minimum_improvement", float(self.minimum_improvement))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "candidate_arm_names": list(self.candidate_arm_names),
+            "fallback_arm_name": self.fallback_arm_name,
+            "minimum_improvement": self.minimum_improvement,
+        }
+
+
+@dataclass(frozen=True)
+class RoutingGeometrySelection:
+    """Immutable validation decision and the evidence used to make it."""
+
+    selected: RoutingReplayResult
+    candidates: tuple[RoutingReplayResult, ...]
+    policy: RoutingGeometrySelectionPolicy
+    fallback_used: bool
+    reason: str
+    improvement_vs_fallback: float
+    candidate_scores: Mapping[str, float]
+
+    def __post_init__(self) -> None:
+        scores = {str(name): float(value) for name, value in self.candidate_scores.items()}
+        object.__setattr__(self, "candidate_scores", MappingProxyType(scores))
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "selected_arm_name": self.selected.arm_name,
+            "primary_metric": self.selected.primary_metric,
+            "selected_score": float(self.selected.primary_value),
+            "fallback_arm_name": self.policy.fallback_arm_name,
+            "fallback_used": bool(self.fallback_used),
+            "reason": self.reason,
+            "improvement_vs_fallback": float(self.improvement_vs_fallback),
+            "candidate_scores": dict(self.candidate_scores),
+            "policy": self.policy.to_dict(),
+        }
+
+
+class ValidationRoutingGeometrySelector:
+    """Select a calibrated routing geometry using validation metrics only."""
+
+    def select(
+        self,
+        results: Sequence[RoutingReplayResult],
+        policy: RoutingGeometrySelectionPolicy,
+    ) -> RoutingGeometrySelection:
+        by_name = self._index_results(results)
+        missing = [name for name in policy.candidate_arm_names if name not in by_name]
+        if missing:
+            raise ValueError(f"Missing validation results for routing arms: {missing}")
+
+        candidates = tuple(by_name[name] for name in policy.candidate_arm_names)
+        metrics = {result.primary_metric for result in candidates}
+        if len(metrics) != 1:
+            raise ValueError("Routing geometry candidates must use the same primary metric")
+        primary_metric = candidates[0].primary_metric
+        finite = [result for result in candidates if np.isfinite(result.primary_value)]
+        if not finite:
+            raise ValueError("No finite validation metric is available for geometry selection")
+
+        fallback = by_name[policy.fallback_arm_name]
+        comparator = get_metric_comparator(primary_metric)
+        best = fallback if np.isfinite(fallback.primary_value) else finite[0]
+        for candidate in finite:
+            if comparator(candidate.primary_value, best.primary_value):
+                best = candidate
+
+        fallback_finite = np.isfinite(fallback.primary_value)
+        improvement = (
+            -metric_drop(primary_metric, best.primary_value, fallback.primary_value)
+            if fallback_finite
+            else float("inf")
+        )
+        if (
+            best.arm_name != fallback.arm_name
+            and fallback_finite
+            and improvement <= policy.minimum_improvement
+        ):
+            best = fallback
+            improvement = 0.0
+            reason = "fallback_minimum_improvement"
+        elif best.arm_name == fallback.arm_name:
+            improvement = 0.0
+            reason = "fallback_best_or_tied"
+        elif not fallback_finite:
+            reason = "fallback_non_finite"
+        else:
+            reason = "validation_metric_improvement"
+
+        return RoutingGeometrySelection(
+            selected=best,
+            candidates=candidates,
+            policy=policy,
+            fallback_used=best.arm_name == fallback.arm_name,
+            reason=reason,
+            improvement_vs_fallback=float(improvement),
+            candidate_scores={
+                result.arm_name: float(result.primary_value) for result in candidates
+            },
+        )
+
+    @staticmethod
+    def _index_results(
+        results: Sequence[RoutingReplayResult],
+    ) -> dict[str, RoutingReplayResult]:
+        indexed: dict[str, RoutingReplayResult] = {}
+        for result in results:
+            if result.arm_name in indexed:
+                raise ValueError(f"Duplicate validation result for arm {result.arm_name!r}")
+            indexed[result.arm_name] = result
+        return indexed
 
 
 class RoutingReplayEvaluator:

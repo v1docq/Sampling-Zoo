@@ -1,6 +1,6 @@
 # Эксперимент: routing geometry и bulk/spike experts
 
-Дата постановки: 2026-08-05. Статус: `phase_a_ready_for_targeted_run`.
+Дата постановки: 2026-08-05. Актуализация: 2026-08-06. Статус: `phase_a_completed_selector_gate_ready`.
 
 Связанный архитектурный план: [RMT routing geometry и bulk/spike experts](../rmt_onboarding/18_routing_geometry_and_bulk_spike_plan.md).
 
@@ -28,6 +28,8 @@ results = run_rmt_routing_geometry_experiment(
     seeds=(42, 43, 44, 45, 46),
 )
 ```
+
+Phase A завершен: `1120/1120` records, `0 failed`. В основной selector прошли A2 median-scaled Euclidean, A5 GMM posterior и A6 cosine. A2 и A6 статистически не различаются в попарном сравнении, а A5 дополняет их на classification datasets, поэтому один глобальный arm не фиксируется без дополнительного holdout gate.
 
 Каждый набор expert-моделей обучается один раз для `dataset x seed x budget x model`. Arms A0-A6 используют одинаковые expert outputs. Температура выбирается по validation, после чего test оценивается один раз с зафиксированным значением. Результаты инкрементально сохраняются в `routing_geometry_runs.jsonl`, `routing_geometry_replay.csv` и `run_meta.json`.
 
@@ -124,6 +126,40 @@ Routing diagnostics:
 3. его 95% paired bootstrap CI не показывает систематического вреда;
 4. worst-case degradation не превышает `0.005` AUC, `1%` log loss или `1%` RMSE относительно A1;
 5. не вызывает collapse на одного expert или рост dead expert rate.
+
+### 4.5. Phase A.1: validation-selected geometry
+
+Цель этапа — проверить, переносится ли observed validation ranking A2/A5/A6 на outer test без повторного fit sampler и expert models.
+
+```python
+from examples.benchmark.rmt_validation_geometry_selector_experiment import (
+    run_rmt_validation_geometry_selector_experiment,
+)
+
+results = run_rmt_validation_geometry_selector_experiment(
+    models=("lightgbm",),
+    budget_ratios=(0.01, 0.05, 0.10, 0.20),
+    seeds=(42, 43, 44, 45, 46),
+    selector_fraction=0.5,
+)
+```
+
+Разбиение выполняется последовательно:
+
+1. outer train/test остается фиксированным;
+2. из outer train выделяется `20%` validation pool;
+3. половина pool используется для temperature calibration и expert priors;
+4. вторая половина выбирает geometry;
+5. outer test используется один раз для A2, A5, A6 и A7 selected policy.
+
+| ID | Политика | Назначение |
+|---|---|---|
+| A2 | fixed median-scaled Euclidean | безопасный fallback; |
+| A5 | fixed GMM posterior | classification-oriented кандидат; |
+| A6 | fixed cosine | directional geometry кандидат; |
+| A7 | validation-selected A2/A5/A6 | проверка адаптивного выбора без test leakage. |
+
+A7 проходит gate, если улучшает средний paired rank относительно fixed A2, не увеличивает worst-case degradation и выбирает test-победителя чаще любой фиксированной geometry. `B0` не используется на этом этапе: идентификатор зарезервирован для bulk/spike baseline.
 
 ## 5. Phase B: Bulk/Spike Hierarchical Experts
 
@@ -229,12 +265,13 @@ Phase B:
 
 1. [x] Реализовать contracts, matrix/Torch backend и invariant tests для Phase A.
 2. [x] Выполнить synthetic routing smoke для regression и multiclass classification.
-3. [ ] Запустить real-data Phase A с LightGBM.
-4. Зафиксировать лучшую geometry до просмотра outer test результатов.
-5. Реализовать component split и row participation contracts.
-6. Выполнить synthetic bulk/spike gate.
-7. Запустить B0-B4 screening с LightGBM.
-8. Перепроверить только прошедшие gate варианты с TabPFN.
-9. После этого расширять эксперимент на полную AMLB grid.
+3. [x] Запустить real-data Phase A с LightGBM: `1120/1120`, `0 failed`.
+4. [x] Реализовать независимый calibration/selection split и A7 selector contracts.
+5. [ ] Запустить real-data A7 selector gate и зафиксировать routing policy.
+6. Реализовать component split и row participation contracts.
+7. Выполнить synthetic bulk/spike gate.
+8. Запустить B0-B4 screening с LightGBM.
+9. Перепроверить только прошедшие gate варианты с TabPFN.
+10. После этого расширять эксперимент на полную AMLB grid.
 
 Полный benchmark нельзя запускать сразу после реализации: точкой первого повторного запуска является synthetic Phase A smoke, а первой значимой real-data серией является Phase A LightGBM screening.
