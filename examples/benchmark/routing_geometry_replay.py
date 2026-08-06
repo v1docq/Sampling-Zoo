@@ -10,9 +10,12 @@ import pandas as pd
 from tqdm.auto import tqdm
 
 from sampling_zoo.core.experiment.routing_replay import (
+    RoutingGeometrySelection,
+    RoutingGeometrySelectionPolicy,
     RoutingReplayEvaluator,
     RoutingReplayRequest,
     RoutingReplayResult,
+    ValidationRoutingGeometrySelector,
 )
 from sampling_zoo.core.sampling_strategies.spectral.routing_contracts import (
     PartitionGeometrySpec,
@@ -21,6 +24,11 @@ from sampling_zoo.core.sampling_strategies.spectral.routing_contracts import (
 
 
 DEFAULT_ROUTING_TEMPERATURES: tuple[float, ...] = (0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0)
+DEFAULT_VALIDATION_SELECTOR_ARM_NAMES: tuple[str, ...] = (
+    "A2_median_scaled_euclidean",
+    "A5_gmm_posterior",
+    "A6_cosine_negative_control",
+)
 
 
 @dataclass(frozen=True)
@@ -69,6 +77,24 @@ def default_routing_geometry_arms() -> tuple[RoutingGeometryArm, ...]:
             name="A6_cosine_negative_control",
             spec=PartitionGeometrySpec(metric="cosine"),
         ),
+    )
+
+
+def default_validation_selector_arms() -> tuple[RoutingGeometryArm, ...]:
+    """Return the selector candidates identified by the Phase A screen."""
+
+    by_name = {arm.name: arm for arm in default_routing_geometry_arms()}
+    return tuple(by_name[name] for name in DEFAULT_VALIDATION_SELECTOR_ARM_NAMES)
+
+
+def default_validation_selector_policy(
+    *,
+    minimum_improvement: float = 0.0,
+) -> RoutingGeometrySelectionPolicy:
+    return RoutingGeometrySelectionPolicy(
+        candidate_arm_names=DEFAULT_VALIDATION_SELECTOR_ARM_NAMES,
+        fallback_arm_name="A2_median_scaled_euclidean",
+        minimum_improvement=minimum_improvement,
     )
 
 
@@ -150,6 +176,20 @@ class FittedEnsembleRoutingReplay:
                 )
             )
         return results
+
+    @staticmethod
+    def select_validation_geometry(
+        results: Sequence[RoutingReplayResult],
+        *,
+        policy: Optional[RoutingGeometrySelectionPolicy] = None,
+        selector: Optional[ValidationRoutingGeometrySelector] = None,
+    ) -> RoutingGeometrySelection:
+        """Select one geometry from held-out validation results."""
+
+        return (selector or ValidationRoutingGeometrySelector()).select(
+            results,
+            policy or default_validation_selector_policy(),
+        )
 
     def _prepare_context(
         self,

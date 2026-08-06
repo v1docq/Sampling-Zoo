@@ -7,8 +7,11 @@ import pandas as pd
 import pytest
 
 from sampling_zoo.core.experiment.routing_replay import (
+    RoutingGeometrySelectionPolicy,
     RoutingReplayEvaluator,
     RoutingReplayRequest,
+    RoutingReplayResult,
+    ValidationRoutingGeometrySelector,
 )
 from sampling_zoo.core.sampling_strategies.spectral.backend.matrix_backend import MatrixRMTBackend
 from sampling_zoo.core.sampling_strategies.spectral.backend.tensor_backend import TensorRMTBackend
@@ -19,6 +22,7 @@ from sampling_zoo.core.sampling_strategies.spectral.routing_contracts import (
     PartitionGeometryContract,
     PartitionGeometrySpec,
     RoutingDistanceContract,
+    RoutingWeightContract,
 )
 from sampling_zoo.core.metrics.eval_metrics import classification_brier_score
 from sampling_zoo.core.sampling_strategies.spectral.routing_geometry import (
@@ -28,10 +32,16 @@ from sampling_zoo.core.sampling_strategies.spectral.routing_geometry import (
 from examples.benchmark.routing_geometry_replay import (
     FittedEnsembleRoutingReplay,
     default_routing_geometry_arms,
+    default_validation_selector_arms,
+    default_validation_selector_policy,
 )
 from examples.benchmark.rmt_routing_geometry_experiment import (
     RoutingGeometryExperimentConfig,
     RoutingGeometryExperimentOrchestrator,
+)
+from examples.benchmark.rmt_validation_geometry_selector_experiment import (
+    RoutingGeometrySelectorExperimentConfig,
+    ValidationRoutingGeometryExperimentOrchestrator,
 )
 from examples.benchmark.benchmark_dataset_interfaces import make_synthetic_regression_smoke_dataset
 
@@ -55,6 +65,27 @@ def _geometry_inputs() -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray], d
     }
     mapping = {"chunk_0": 0, "chunk_1": 1}
     return embedding, labels, partitions, mapping
+
+
+def _selector_result(
+    arm_name: str,
+    metric: str,
+    value: float,
+) -> RoutingReplayResult:
+    routing = RoutingWeightContract(
+        partition_names=("chunk_0", "chunk_1"),
+        weights=np.full((2, 2), 0.5),
+        temperature=1.0,
+    )
+    return RoutingReplayResult(
+        arm_name=arm_name,
+        temperature=1.0,
+        primary_metric=metric,
+        primary_value=value,
+        metrics={metric: value},
+        routing=routing,
+        blended_output=np.zeros(2),
+    )
 
 
 @pytest.mark.parametrize(
@@ -330,6 +361,77 @@ def test_classification_replay_uses_probability_metrics() -> None:
     assert np.allclose(result.blended_output.sum(axis=1), 1.0)
 
 
+def test_validation_geometry_selector_is_metric_aware_and_order_independent() -> None:
+    policy = default_validation_selector_policy()
+    results = (
+        _selector_result("A2_median_scaled_euclidean", "rmse", 2.0),
+        _selector_result("A5_gmm_posterior", "rmse", 1.0),
+        _selector_result("A6_cosine_negative_control", "rmse", 3.0),
+    )
+    selector = ValidationRoutingGeometrySelector()
+
+    forward = selector.select(results, policy)
+    reverse = selector.select(tuple(reversed(results)), policy)
+
+    assert forward.selected.arm_name == "A5_gmm_posterior"
+    assert reverse.selected.arm_name == forward.selected.arm_name
+    assert forward.improvement_vs_fallback == pytest.approx(1.0)
+    assert forward.fallback_used is False
+
+
+def test_validation_geometry_selector_maximizes_roc_auc() -> None:
+    policy = default_validation_selector_policy()
+    selection = ValidationRoutingGeometrySelector().select(
+        (
+            _selector_result("A2_median_scaled_euclidean", "roc_auc", 0.80),
+            _selector_result("A5_gmm_posterior", "roc_auc", 0.82),
+            _selector_result("A6_cosine_negative_control", "roc_auc", 0.81),
+        ),
+        policy,
+    )
+
+    assert selection.selected.arm_name == "A5_gmm_posterior"
+    assert selection.improvement_vs_fallback == pytest.approx(0.02)
+
+
+def test_validation_geometry_selector_keeps_fallback_below_minimum_improvement() -> None:
+    policy = RoutingGeometrySelectionPolicy(
+        candidate_arm_names=("fallback", "candidate"),
+        fallback_arm_name="fallback",
+        minimum_improvement=0.01,
+    )
+    selection = ValidationRoutingGeometrySelector().select(
+        (
+            _selector_result("fallback", "roc_auc", 0.80),
+            _selector_result("candidate", "roc_auc", 0.805),
+        ),
+        policy,
+    )
+
+    assert selection.selected.arm_name == "fallback"
+    assert selection.fallback_used is True
+    assert selection.reason == "fallback_minimum_improvement"
+
+
+def test_validation_geometry_selector_rejects_incomplete_or_mixed_results() -> None:
+    selector = ValidationRoutingGeometrySelector()
+    policy = RoutingGeometrySelectionPolicy(
+        candidate_arm_names=("fallback", "candidate"),
+        fallback_arm_name="fallback",
+    )
+
+    with pytest.raises(ValueError, match="Missing validation results"):
+        selector.select((_selector_result("fallback", "rmse", 1.0),), policy)
+    with pytest.raises(ValueError, match="same primary metric"):
+        selector.select(
+            (
+                _selector_result("fallback", "rmse", 1.0),
+                _selector_result("candidate", "roc_auc", 0.8),
+            ),
+            policy,
+        )
+
+
 def test_default_phase_a_arms_have_stable_order() -> None:
     arms = default_routing_geometry_arms()
 
@@ -344,6 +446,14 @@ def test_default_phase_a_arms_have_stable_order() -> None:
     )
     assert arms[0].use_validation_priors is False
     assert arms[1].temperature_candidates == (1.0,)
+
+
+def test_default_phase_a_selector_arms_have_stable_order_and_a2_fallback() -> None:
+    arms = default_validation_selector_arms()
+    policy = default_validation_selector_policy()
+
+    assert tuple(arm.name for arm in arms) == policy.candidate_arm_names
+    assert policy.fallback_arm_name == "A2_median_scaled_euclidean"
 
 
 def test_fitted_ensemble_adapter_replays_without_model_fit() -> None:
@@ -429,6 +539,68 @@ def test_targeted_runner_persists_incremental_synthetic_results(tmp_path) -> Non
         encoding="utf-8"
     ).splitlines()
     assert len(lines) == 2
+
+
+def test_validation_selector_runner_uses_independent_holdout_and_resumes(tmp_path) -> None:
+    config = RoutingGeometrySelectorExperimentConfig(
+        regression_suite=None,
+        classification_suite=None,
+        regression_tasks=(),
+        classification_tasks=(),
+        models=("ridge",),
+        budget_ratios=(0.20,),
+        seeds=(42,),
+        n_partitions=3,
+        output_dir=tmp_path,
+        show_progress=False,
+    )
+
+    class _SyntheticOrchestrator(ValidationRoutingGeometryExperimentOrchestrator):
+        def _load_datasets(self):
+            return [make_synthetic_regression_smoke_dataset(42)]
+
+    orchestrator = _SyntheticOrchestrator(config)
+    result = orchestrator.run()
+
+    assert result.shape[0] == 4
+    assert set(result["status"]) == {"completed"}
+    selector_row = result.loc[
+        result["arm_name"] == "A7_validation_selected_top3"
+    ].iloc[0]
+    assert selector_row["selected_arm_name"] in {
+        arm.name for arm in default_validation_selector_arms()
+    }
+    assert selector_row["n_calibration"] > 0
+    assert selector_row["n_selection"] > 0
+    assert selector_row["calibration_primary_metric"] == "rmse"
+    assert selector_row["validation_primary_metric"] == "rmse"
+    assert selector_row["test_primary_metric"] == "rmse"
+
+    resumed = _SyntheticOrchestrator(config).run()
+    assert resumed.shape[0] == 4
+    lines = (tmp_path / "routing_geometry_runs.jsonl").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert len(lines) == 4
+
+
+def test_validation_selector_stratifies_only_when_both_splits_can_preserve_classes() -> None:
+    safe_target = pd.Series([0, 0, 0, 1, 1, 1])
+    rare_target = pd.Series([0, 0, 0, 1])
+
+    safe = ValidationRoutingGeometryExperimentOrchestrator._selection_stratify_target(
+        safe_target,
+        problem_type="classification",
+        selector_fraction=0.5,
+    )
+    rare = ValidationRoutingGeometryExperimentOrchestrator._selection_stratify_target(
+        rare_target,
+        problem_type="classification",
+        selector_fraction=0.5,
+    )
+
+    assert safe is safe_target
+    assert rare is None
 
 
 @pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch is optional")

@@ -71,10 +71,13 @@ from .resume import (
 )
 from .resume_runtime import ResumeSession, load_resume_session
 from .routing_replay import (
+    RoutingGeometrySelection,
+    RoutingGeometrySelectionPolicy,
     RoutingReplayEvaluator,
     RoutingReplayRequest,
     RoutingReplayResult,
     RoutingTemperatureSelection,
+    ValidationRoutingGeometrySelector,
 )
 from .stages import ExperimentPlan, ExperimentStageId, StageRegistry, StageRequest, StageResult
 
@@ -111,6 +114,8 @@ __all__ = [
     "PartitionTrainingResult",
     "PackageVersion",
     "RoutingContract",
+    "RoutingGeometrySelection",
+    "RoutingGeometrySelectionPolicy",
     "RoutingReplayEvaluator",
     "RoutingReplayRequest",
     "RoutingReplayResult",
@@ -132,6 +137,7 @@ __all__ = [
     "StageResult",
     "StrategyGridContract",
     "StrategySpec",
+    "ValidationRoutingGeometrySelector",
     "build_artifact_manifest",
     "build_partition_budget_plan",
     "build_resume_plan",

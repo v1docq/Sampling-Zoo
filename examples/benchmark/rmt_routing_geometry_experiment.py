@@ -488,9 +488,12 @@ class RoutingGeometryExperimentOrchestrator:
                     "budget_ratio",
                     "model",
                     "arm_name",
+                    "selected_arm_name",
                     "status",
                     "selected_temperature",
                     "n_train",
+                    "n_calibration",
+                    "n_selection",
                     "n_validation",
                     "n_test",
                     "n_experts",
@@ -498,7 +501,7 @@ class RoutingGeometryExperimentOrchestrator:
                     "error",
                 )
             }
-            for split_name in ("validation", "test"):
+            for split_name in ("calibration", "validation", "test"):
                 split = record.get(split_name, {}) or {}
                 row[f"{split_name}_primary_metric"] = split.get("primary_metric")
                 row[f"{split_name}_primary_value"] = split.get("primary_value")
@@ -508,6 +511,15 @@ class RoutingGeometryExperimentOrchestrator:
                     row[f"{split_name}_routing_{name}"] = value
                 for name, value in (split.get("diagnostics", {}) or {}).items():
                     row[f"{split_name}_{name}"] = value
+            selection = record.get("selection", {}) or {}
+            for name in (
+                "fallback_arm_name",
+                "fallback_used",
+                "reason",
+                "improvement_vs_fallback",
+                "candidate_scores",
+            ):
+                row[f"selection_{name}"] = selection.get(name)
             rows.append(row)
         return pd.DataFrame(rows)
 
