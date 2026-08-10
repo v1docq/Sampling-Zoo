@@ -7,8 +7,15 @@ from typing import Any, Iterable, Mapping, Optional, Sequence
 
 import numpy as np
 import pandas as pd
+from sklearn.metrics import f1_score
+from sklearn.model_selection import KFold, StratifiedKFold
 from tqdm.auto import tqdm
 
+from sampling_zoo.core.experiment.routing_geometry_selection import (
+    CrossFittedRoutingGeometrySelector,
+    RoutingGeometryFoldScore,
+    RoutingGeometrySelectionDecision,
+)
 from sampling_zoo.core.experiment.routing_replay import (
     RoutingGeometrySelection,
     RoutingGeometrySelectionPolicy,
@@ -17,6 +24,7 @@ from sampling_zoo.core.experiment.routing_replay import (
     RoutingReplayResult,
     ValidationRoutingGeometrySelector,
 )
+from sampling_zoo.core.metrics.eval_metrics import HIGHER_IS_BETTER, LOWER_IS_BETTER
 from sampling_zoo.core.sampling_strategies.spectral.routing_contracts import (
     PartitionGeometrySpec,
     RoutingDistanceContract,
@@ -37,6 +45,25 @@ class RoutingGeometryArm:
     spec: PartitionGeometrySpec
     temperature_candidates: tuple[float, ...] = DEFAULT_ROUTING_TEMPERATURES
     use_validation_priors: bool = True
+
+
+@dataclass(frozen=True)
+class CrossFittedRoutingReplaySelection:
+    """Cross-fitted decision plus full-validation calibration for outer testing."""
+
+    decision: RoutingGeometrySelectionDecision
+    selected_arm: RoutingGeometryArm
+    validation_results: tuple[RoutingReplayResult, ...]
+    fold_scores: tuple[RoutingGeometryFoldScore, ...]
+    expert_priors: Optional[tuple[float, ...]]
+
+    @property
+    def validation_result(self) -> RoutingReplayResult:
+        return next(
+            result
+            for result in self.validation_results
+            if result.arm_name == self.selected_arm.name
+        )
 
 
 def default_routing_geometry_arms() -> tuple[RoutingGeometryArm, ...]:
@@ -149,6 +176,7 @@ class FittedEnsembleRoutingReplay:
         target: Any,
         arms: Sequence[RoutingGeometryArm],
         temperatures: Mapping[str, float],
+        expert_priors: Optional[Sequence[float]] = None,
         metadata: Optional[dict[str, Any]] = None,
     ) -> list[RoutingReplayResult]:
         """Evaluate validation-selected arms on held-out rows without recalibration."""
@@ -168,6 +196,7 @@ class FittedEnsembleRoutingReplay:
                 arm=arm,
                 context=context,
                 metadata=metadata,
+                expert_priors=expert_priors,
             )
             results.append(
                 self.evaluator.evaluate(
@@ -176,6 +205,111 @@ class FittedEnsembleRoutingReplay:
                 )
             )
         return results
+
+    def select_geometry_cross_fitted(
+        self,
+        *,
+        ensemble: Any,
+        X_val: pd.DataFrame,
+        y_val: Any,
+        arms: Sequence[RoutingGeometryArm],
+        selector: CrossFittedRoutingGeometrySelector,
+        n_folds: int = 5,
+        random_state: int = 42,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> CrossFittedRoutingReplaySelection:
+        """Select geometry on inner folds without consulting outer test rows."""
+
+        selected_arms = tuple(arms)
+        arm_by_name = self._index_arms(selected_arms)
+        expected_names = (
+            selector.spec.reference_arm,
+            *selector.spec.candidate_arms,
+        )
+        if tuple(arm_by_name) != expected_names:
+            raise ValueError(
+                "Cross-fitted arms must match selector reference and candidates in stable order"
+            )
+
+        context = self._prepare_context(
+            ensemble=ensemble,
+            features=X_val,
+            stage="validation",
+        )
+        requests = {
+            arm.name: self._build_request(
+                ensemble=ensemble,
+                target=y_val,
+                arm=arm,
+                context=context,
+                metadata=metadata,
+            )
+            for arm in selected_arms
+        }
+        splits = self._selection_splits(
+            np.asarray(y_val),
+            problem_type=str(ensemble.problem),
+            n_folds=int(n_folds),
+            random_state=int(random_state),
+        )
+        fold_scores = []
+        reference_request = requests[selector.spec.reference_arm]
+        for fold_index, (calibration_indices, evaluation_indices) in enumerate(splits):
+            fold_priors = self._fit_cross_fitted_priors(
+                reference_request,
+                calibration_indices,
+            )
+            for arm in selected_arms:
+                request = requests[arm.name]
+                calibration_request = self._slice_request(request, calibration_indices)
+                evaluation_request = self._slice_request(request, evaluation_indices)
+                if arm.use_validation_priors:
+                    calibration_request = self._with_expert_priors(
+                        calibration_request,
+                        fold_priors,
+                    )
+                    evaluation_request = self._with_expert_priors(
+                        evaluation_request,
+                        fold_priors,
+                    )
+                temperature = self.evaluator.calibrate_temperature(
+                    calibration_request,
+                    arm.temperature_candidates,
+                ).best.temperature
+                result = self.evaluator.evaluate(
+                    evaluation_request,
+                    temperature=temperature,
+                )
+                fold_scores.append(
+                    self._fold_score(
+                        result,
+                        fold_id=str(fold_index),
+                        evaluation_rows=len(evaluation_indices),
+                    )
+                )
+
+        decision = selector.select(fold_scores)
+        full_indices = np.arange(reference_request.target.shape[0])
+        full_priors = self._fit_cross_fitted_priors(reference_request, full_indices)
+        validation_results = []
+        for arm in selected_arms:
+            request = requests[arm.name]
+            if arm.use_validation_priors:
+                request = self._with_expert_priors(request, full_priors)
+            validation_results.append(
+                self.evaluator.calibrate_temperature(
+                    request,
+                    arm.temperature_candidates,
+                ).best
+            )
+
+        return CrossFittedRoutingReplaySelection(
+            decision=decision,
+            selected_arm=arm_by_name[decision.selected_arm],
+            validation_results=tuple(validation_results),
+            fold_scores=tuple(fold_scores),
+            expert_priors=tuple(float(value) for value in full_priors),
+        )
 
     @staticmethod
     def select_validation_geometry(
@@ -227,6 +361,7 @@ class FittedEnsembleRoutingReplay:
         arm: RoutingGeometryArm,
         context: Mapping[str, Any],
         metadata: Optional[dict[str, Any]],
+        expert_priors: Optional[Sequence[float]] = None,
     ) -> RoutingReplayRequest:
         partitioner = context["partitioner"]
         geometry = partitioner.build_partition_geometry(arm.spec)
@@ -238,6 +373,13 @@ class FittedEnsembleRoutingReplay:
             distances,
             context["model_names"],
         )
+        resolved_priors = None
+        if arm.use_validation_priors:
+            resolved_priors = (
+                context["validation_priors"]
+                if expert_priors is None
+                else np.asarray(expert_priors, dtype=float)
+            )
         return RoutingReplayRequest(
             arm_name=arm.name,
             geometry_spec=arm.spec,
@@ -246,13 +388,154 @@ class FittedEnsembleRoutingReplay:
             expert_outputs=context["expert_outputs"],
             problem_type=str(ensemble.problem),
             classes=context["classes"],
-            expert_priors=(
-                context["validation_priors"]
-                if arm.use_validation_priors
-                else None
-            ),
+            expert_priors=resolved_priors,
             metadata=metadata or {},
         )
+
+    @staticmethod
+    def _selection_splits(
+        target: np.ndarray,
+        *,
+        problem_type: str,
+        n_folds: int,
+        random_state: int,
+    ) -> tuple[tuple[np.ndarray, np.ndarray], ...]:
+        if n_folds < 3:
+            raise ValueError("n_folds must be at least 3")
+        if target.shape[0] < n_folds:
+            raise ValueError("Validation rows must be at least n_folds")
+        indices = np.arange(target.shape[0])
+        if problem_type == "classification":
+            _, counts = np.unique(target, return_counts=True)
+            effective_folds = min(n_folds, int(np.min(counts)))
+            if effective_folds < 3:
+                raise ValueError(
+                    "Classification cross-fitting requires at least three rows per class"
+                )
+            splitter = StratifiedKFold(
+                n_splits=effective_folds,
+                shuffle=True,
+                random_state=random_state,
+            )
+            split_iterator = splitter.split(indices, target)
+        else:
+            splitter = KFold(
+                n_splits=n_folds,
+                shuffle=True,
+                random_state=random_state,
+            )
+            split_iterator = splitter.split(indices)
+        return tuple(
+            (np.asarray(calibration), np.asarray(evaluation))
+            for calibration, evaluation in split_iterator
+        )
+
+    @staticmethod
+    def _slice_request(
+        request: RoutingReplayRequest,
+        indices: np.ndarray,
+    ) -> RoutingReplayRequest:
+        distances = RoutingDistanceContract(
+            partition_names=request.distances.partition_names,
+            values=request.distances.values[indices],
+            kind=request.distances.kind,
+            diagnostics=dict(request.distances.diagnostics),
+        )
+        return RoutingReplayRequest(
+            arm_name=request.arm_name,
+            geometry_spec=request.geometry_spec,
+            distances=distances,
+            target=request.target[indices],
+            expert_outputs=request.expert_outputs[indices],
+            problem_type=request.problem_type,
+            classes=request.classes,
+            expert_priors=request.expert_priors,
+            metadata=dict(request.metadata),
+        )
+
+    @staticmethod
+    def _with_expert_priors(
+        request: RoutingReplayRequest,
+        priors: Sequence[float],
+    ) -> RoutingReplayRequest:
+        return RoutingReplayRequest(
+            arm_name=request.arm_name,
+            geometry_spec=request.geometry_spec,
+            distances=request.distances,
+            target=request.target,
+            expert_outputs=request.expert_outputs,
+            problem_type=request.problem_type,
+            classes=request.classes,
+            expert_priors=np.asarray(priors, dtype=float),
+            metadata=dict(request.metadata),
+        )
+
+    @staticmethod
+    def _fit_cross_fitted_priors(
+        request: RoutingReplayRequest,
+        calibration_indices: np.ndarray,
+    ) -> np.ndarray:
+        target = request.target[calibration_indices]
+        outputs = request.expert_outputs[calibration_indices]
+        if request.problem_type == "regression":
+            rmse = np.sqrt(np.mean((outputs - target[:, None]) ** 2, axis=0))
+            quality = 1.0 / np.maximum(rmse, np.finfo(float).eps)
+        else:
+            classes = np.asarray(request.classes)
+            quality = np.asarray(
+                [
+                    f1_score(
+                        target,
+                        classes[np.argmax(outputs[:, expert_index, :], axis=1)],
+                        labels=classes,
+                        average="weighted",
+                        zero_division=0,
+                    )
+                    for expert_index in range(outputs.shape[1])
+                ],
+                dtype=float,
+            )
+            quality = np.maximum(quality, np.finfo(float).eps)
+        return quality / np.sum(quality)
+
+    @staticmethod
+    def _fold_score(
+        result: RoutingReplayResult,
+        *,
+        fold_id: str,
+        evaluation_rows: int,
+    ) -> RoutingGeometryFoldScore:
+        metric_name = result.primary_metric.lower()
+        if metric_name in LOWER_IS_BETTER:
+            direction = "lower"
+        elif metric_name in HIGHER_IS_BETTER:
+            direction = "higher"
+        else:
+            raise ValueError(f"Unknown metric direction for {result.primary_metric!r}")
+        has_mae = "mae" in result.metrics
+        return RoutingGeometryFoldScore(
+            arm_name=result.arm_name,
+            fold_id=fold_id,
+            primary_metric=result.primary_metric,
+            primary_value=result.primary_value,
+            primary_direction=direction,
+            robust_metric="mae" if has_mae else None,
+            robust_value=float(result.metrics["mae"]) if has_mae else None,
+            robust_direction="lower" if has_mae else None,
+            evaluation_rows=evaluation_rows,
+            selected_temperature=result.temperature,
+        )
+
+    @staticmethod
+    def _index_arms(
+        arms: Sequence[RoutingGeometryArm],
+    ) -> dict[str, RoutingGeometryArm]:
+        indexed = {}
+        for arm in arms:
+            if arm.name in indexed:
+                raise ValueError(f"Duplicate routing arm {arm.name!r}")
+            indexed[arm.name] = arm
+        return indexed
 
     def _iter_arms(self, arms: Sequence[RoutingGeometryArm]):
         return tqdm(

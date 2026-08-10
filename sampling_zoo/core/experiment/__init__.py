@@ -70,6 +70,13 @@ from .resume import (
     scientific_experiment_config,
 )
 from .resume_runtime import ResumeSession, load_resume_session
+from .routing_geometry_selection import (
+    CrossFittedRoutingGeometrySelectionSpec,
+    CrossFittedRoutingGeometrySelector,
+    RoutingGeometryCandidateEvidence,
+    RoutingGeometryFoldScore,
+    RoutingGeometrySelectionDecision,
+)
 from .routing_replay import (
     RoutingGeometrySelection,
     RoutingGeometrySelectionPolicy,
@@ -90,6 +97,8 @@ __all__ = [
     "ArtifactManifestParseFailure",
     "ArtifactManifestViolation",
     "ChunkModelContract",
+    "CrossFittedRoutingGeometrySelectionSpec",
+    "CrossFittedRoutingGeometrySelector",
     "DatasetContract",
     "DatasetRunRef",
     "EvaluationContract",
@@ -114,7 +123,10 @@ __all__ = [
     "PartitionTrainingResult",
     "PackageVersion",
     "RoutingContract",
+    "RoutingGeometryCandidateEvidence",
+    "RoutingGeometryFoldScore",
     "RoutingGeometrySelection",
+    "RoutingGeometrySelectionDecision",
     "RoutingGeometrySelectionPolicy",
     "RoutingReplayEvaluator",
     "RoutingReplayRequest",

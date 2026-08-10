@@ -13,6 +13,10 @@ from sampling_zoo.core.experiment.routing_replay import (
     RoutingReplayResult,
     ValidationRoutingGeometrySelector,
 )
+from sampling_zoo.core.experiment.routing_geometry_selection import (
+    CrossFittedRoutingGeometrySelectionSpec,
+    CrossFittedRoutingGeometrySelector,
+)
 from sampling_zoo.core.sampling_strategies.spectral.backend.matrix_backend import MatrixRMTBackend
 from sampling_zoo.core.sampling_strategies.spectral.backend.tensor_backend import TensorRMTBackend
 from sampling_zoo.core.sampling_strategies.spectral.rmt_contraction_sampler import (
@@ -42,6 +46,10 @@ from examples.benchmark.rmt_routing_geometry_experiment import (
 from examples.benchmark.rmt_validation_geometry_selector_experiment import (
     RoutingGeometrySelectorExperimentConfig,
     ValidationRoutingGeometryExperimentOrchestrator,
+)
+from examples.benchmark.rmt_cross_fitted_geometry_selector_experiment import (
+    CrossFittedRoutingGeometryExperimentConfig,
+    CrossFittedRoutingGeometryExperimentOrchestrator,
 )
 from examples.benchmark.benchmark_dataset_interfaces import make_synthetic_regression_smoke_dataset
 
@@ -500,6 +508,68 @@ def test_fitted_ensemble_adapter_replays_without_model_fit() -> None:
     assert all(np.isfinite(result.primary_value) for result in results)
 
 
+def test_cross_fitted_adapter_uses_stratified_classification_folds() -> None:
+    rng = np.random.default_rng(82)
+    frame = pd.DataFrame(rng.normal(size=(60, 4)), columns=[f"x_{idx}" for idx in range(4)])
+    sampler = RMTContractionTensorSampler(
+        n_partitions=2,
+        n_views=2,
+        projection_dim=2,
+        backend="numpy",
+        random_state=82,
+        show_progress=False,
+    ).fit(frame)
+    target = np.tile(np.asarray([0, 1]), 30)
+    names = tuple(sampler.partition_names_)
+    expert_outputs = np.empty((len(frame), len(names), 2), dtype=float)
+    for expert_index in range(len(names)):
+        positive = np.where(
+            target == 1,
+            0.75 - 0.05 * expert_index,
+            0.25 + 0.05 * expert_index,
+        )
+        expert_outputs[:, expert_index, 1] = positive
+        expert_outputs[:, expert_index, 0] = 1.0 - positive
+
+    class _FittedEnsemble:
+        problem = "classification"
+        classes_ = np.asarray([0, 1])
+        partitioner = sampler
+
+        @staticmethod
+        def export_expert_outputs(features, *, stage="validation"):
+            assert stage == "validation"
+            return names, expert_outputs
+
+        @staticmethod
+        def validation_prior_weights():
+            return np.full(len(names), 1.0 / len(names))
+
+    arms = default_validation_selector_arms()
+    selector = CrossFittedRoutingGeometrySelector(
+        CrossFittedRoutingGeometrySelectionSpec(
+            min_folds=3,
+            bootstrap_iterations=100,
+        )
+    )
+    selection = FittedEnsembleRoutingReplay(
+        show_progress=False
+    ).select_geometry_cross_fitted(
+        ensemble=_FittedEnsemble(),
+        X_val=frame,
+        y_val=target,
+        arms=arms,
+        selector=selector,
+        n_folds=3,
+        random_state=82,
+    )
+
+    assert len(selection.fold_scores) == 9
+    assert {score.primary_metric for score in selection.fold_scores} == {"roc_auc"}
+    assert sum(selection.expert_priors) == pytest.approx(1.0)
+    assert selection.selected_arm.name in {arm.name for arm in arms}
+
+
 def test_targeted_runner_persists_incremental_synthetic_results(tmp_path) -> None:
     config = RoutingGeometryExperimentConfig(
         regression_suite=None,
@@ -582,6 +652,65 @@ def test_validation_selector_runner_uses_independent_holdout_and_resumes(tmp_pat
         encoding="utf-8"
     ).splitlines()
     assert len(lines) == 4
+
+
+def test_cross_fitted_selector_runner_persists_fold_evidence_and_resumes(tmp_path) -> None:
+    config = CrossFittedRoutingGeometryExperimentConfig(
+        regression_suite=None,
+        classification_suite=None,
+        regression_tasks=(),
+        classification_tasks=(),
+        models=("ridge",),
+        budget_ratios=(0.20,),
+        seeds=(42,),
+        n_partitions=3,
+        selection_folds=3,
+        bootstrap_iterations=200,
+        output_dir=tmp_path,
+        show_progress=False,
+    )
+
+    class _SyntheticOrchestrator(CrossFittedRoutingGeometryExperimentOrchestrator):
+        def _load_datasets(self):
+            return [make_synthetic_regression_smoke_dataset(42)]
+
+    result = _SyntheticOrchestrator(config).run()
+
+    assert result.shape[0] == 4
+    assert set(result["status"]) == {"completed"}
+    selector_row = result.loc[
+        result["arm_name"] == "A8_cross_fitted_selected"
+    ].iloc[0]
+    assert selector_row["selected_arm_name"] in {
+        arm.name for arm in default_validation_selector_arms()
+    }
+    assert selector_row["selection_status"] in {"selected", "fallback_to_a2"}
+
+    fold_table = pd.read_csv(tmp_path / "geometry_selection_fold_losses.csv")
+    summary_table = pd.read_csv(tmp_path / "geometry_selection_summary.csv")
+    selection_lines = (tmp_path / "cross_fitted_geometry_runs.jsonl").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert fold_table.shape[0] == 9
+    assert summary_table.shape[0] == 2
+    assert len(selection_lines) == 1
+
+    (tmp_path / "geometry_selection_fold_losses.csv").unlink()
+    (tmp_path / "geometry_selection_summary.csv").unlink()
+    resumed = _SyntheticOrchestrator(config).run()
+    assert resumed.shape[0] == 4
+    assert len(
+        (tmp_path / "routing_geometry_runs.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ) == 4
+    assert pd.read_csv(tmp_path / "geometry_selection_fold_losses.csv").shape[0] == 9
+    assert pd.read_csv(tmp_path / "geometry_selection_summary.csv").shape[0] == 2
+    assert len(
+        (tmp_path / "cross_fitted_geometry_runs.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ) == 1
 
 
 def test_validation_selector_stratifies_only_when_both_splits_can_preserve_classes() -> None:
