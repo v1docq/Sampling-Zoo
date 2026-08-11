@@ -93,3 +93,23 @@ def test_real_phase_s_flattens_canonical_tail_metric() -> None:
     )
 
     assert flattened["tail_mae"] == 12.5
+
+
+def test_real_phase_s_ranking_uses_raw_paired_runs() -> None:
+    paired = pd.DataFrame(
+        {
+            "row_arm_id": ["R3", "R3", "R3", "R0", "R0", "R0"],
+            "primary_gain_vs_uniform": [0.4, -0.1, -0.1, 0.0, 0.0, 0.0],
+            "tail_gain_vs_uniform": [0.2, -0.2, 0.0, 0.0, 0.0, 0.0],
+            "gram_relative_error_mean": [0.1, 0.2, 0.3, 0.4, 0.4, 0.4],
+            "fit_time_ratio_vs_uniform": [1.1, 0.9, 1.0, 1.0, 1.0, 1.0],
+        }
+    )
+
+    ranking = RealLeverageSketchOrchestrator._build_arm_ranking(paired)
+    candidate = ranking[ranking["row_arm_id"] == "R3"].iloc[0]
+
+    assert candidate["runs"] == 3
+    assert candidate["median_gain"] == -0.1
+    assert candidate["win_rate"] == 1 / 3
+    assert candidate["worst_gain"] == -0.1

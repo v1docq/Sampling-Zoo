@@ -312,7 +312,7 @@ class RealLeverageSketchOrchestrator:
             json.dumps(gate, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
-        self._write_report(raw, summary, gate)
+        self._write_report(raw, paired, gate)
         self._write_figures(summary)
 
     @staticmethod
@@ -421,41 +421,49 @@ class RealLeverageSketchOrchestrator:
             "by_dataset": by_dataset.to_dict("records"),
         }
 
-    def _write_report(
-        self,
-        raw: pd.DataFrame,
-        summary: pd.DataFrame,
-        gate: Mapping[str, Any],
-    ) -> None:
-        ranking = (
-            summary.groupby("row_arm_id")
+    @staticmethod
+    def _build_arm_ranking(paired: pd.DataFrame) -> pd.DataFrame:
+        return (
+            paired.groupby("row_arm_id")
             .agg(
-                mean_gain=("primary_gain_mean", "mean"),
-                median_gain=("primary_gain_median", "median"),
-                mean_tail_gain=("tail_gain_mean", "mean"),
-                mean_gram_error=("gram_error_mean", "mean"),
-                mean_fit_time_ratio=("fit_time_ratio_mean", "mean"),
+                runs=("primary_gain_vs_uniform", "size"),
+                mean_gain=("primary_gain_vs_uniform", "mean"),
+                median_gain=("primary_gain_vs_uniform", "median"),
+                win_rate=("primary_gain_vs_uniform", lambda values: float((values > 0.0).mean())),
+                worst_gain=("primary_gain_vs_uniform", "min"),
+                mean_tail_gain=("tail_gain_vs_uniform", "mean"),
+                mean_gram_error=("gram_relative_error_mean", "mean"),
+                mean_fit_time_ratio=("fit_time_ratio_vs_uniform", "mean"),
             )
             .sort_values("mean_gain", ascending=False)
             .reset_index()
         )
+
+    def _write_report(
+        self,
+        raw: pd.DataFrame,
+        paired: pd.DataFrame,
+        gate: Mapping[str, Any],
+    ) -> None:
+        ranking = self._build_arm_ranking(paired)
         lines = [
             "# Phase S на реальных данных",
             "",
-            f"- Статус gate: `{gate['status']}`",
+            f"- Статус критерия допуска: `{gate['status']}`",
             f"- A9-записей: `{len(raw)}/{self.config.expected_a9_records}`",
             "- Геометрия роутинга выбирается неизменённым A9-селектором.",
-            "- Между arms меняются только политика выбора строк и режим весов.",
+            "- Между вариантами меняются только политика выбора строк и режим весов.",
+            f"- Медианный выигрыш R3 по всем парным запускам: `{gate['median_primary_gain']:.6f}`.",
             "",
             "## Общий рейтинг",
             "",
             markdown_table(ranking),
             "",
-            "## Gate для R3_robust_mixture_ipw",
+            "## Критерий допуска для R3_robust_mixture_ipw",
             "",
             markdown_table(pd.DataFrame(gate["by_dataset"])),
             "",
-            "Положительный gain означает улучшение относительно `R0_uniform` при одинаковых датасете, бюджете, модели и начальном значении генератора.",
+            "Положительный `gain` означает улучшение относительно `R0_uniform` при одинаковых датасете, бюджете, модели и начальном значении генератора. Все показатели общей таблицы вычисляются непосредственно по парным запускам, без повторного усреднения агрегатов.",
         ]
         (self.output_dir / "phase_s_real_report.md").write_text(
             "\n".join(lines) + "\n",
