@@ -944,6 +944,20 @@ class SamplingEnsemble:
             y_extra_arr = np.array(y_extra)
             chunk['target'] = np.hstack([chunk['target'], y_extra_arr])
 
+        if 'sample_weight' in chunk:
+            existing_weights = np.asarray(chunk['sample_weight'], dtype=float)
+            fill_value = (
+                float(np.mean(existing_weights))
+                if existing_weights.size
+                else 1.0
+            )
+            chunk['sample_weight'] = np.concatenate(
+                [
+                    existing_weights,
+                    np.full(len(y_extra), fill_value, dtype=float),
+                ]
+            )
+
         return chunk
 
     def train_partition_models(
@@ -1226,7 +1240,7 @@ class SamplingEnsemble:
         )
         model = self._create_model_instance()
         fit_started = perf_counter()
-        model.fit(partition_data['feature'], partition_data['target'])
+        self._fit_partition_model(model, partition_data)
         model_fit_time = perf_counter() - fit_started
         self._save_partition_model_if_requested(model, partition_name, cv_fold, save_models_to_disk)
 
@@ -1259,6 +1273,29 @@ class SamplingEnsemble:
         self._register_partition_model(partition_name, model_info, metrics)
         self._log_partition_model_result(partition_name, model_info, metrics)
         return model_info
+
+    @staticmethod
+    def _fit_partition_model(model: Callable, partition_data: Dict[str, Any]) -> None:
+        sample_weight = partition_data.get('sample_weight')
+        if sample_weight is None:
+            model.fit(partition_data['feature'], partition_data['target'])
+            return
+        weights = np.asarray(sample_weight, dtype=float).reshape(-1)
+        if weights.size != len(partition_data['feature']):
+            raise ValueError(
+                "sample_weight must align with the partition feature rows"
+            )
+        try:
+            model.fit(
+                partition_data['feature'],
+                partition_data['target'],
+                sample_weight=weights,
+            )
+        except TypeError as exc:
+            raise ValueError(
+                "training_reweighting='inverse_probability' requires a model "
+                "whose fit method accepts sample_weight"
+            ) from exc
 
     def _ensure_partition_class_coverage(
         self,

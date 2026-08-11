@@ -43,12 +43,40 @@ class RMTSubspaceComparison:
     min_canonical_correlation: float
 
 
+@dataclass(frozen=True)
+class RMTRidgeLeverageResult:
+    """Regularized row leverage scores and the resolved ridge scale."""
+
+    scores: np.ndarray
+    ridge_lambda: float
+    effective_dimension: float
+
+
 def compute_leverage_scores(U: np.ndarray) -> np.ndarray:
     scores = np.sum(U * U, axis=1)
     score_sum = float(np.sum(scores))
     if not np.isfinite(score_sum) or score_sum <= 0:
         return np.full(U.shape[0], 1.0 / U.shape[0])
     return scores / score_sum
+
+
+def _resolve_ridge_lambda(
+    eigenvalues: np.ndarray,
+    ridge_lambda: float | str | None,
+) -> float:
+    if ridge_lambda is None or (
+        isinstance(ridge_lambda, str) and ridge_lambda.strip().lower() == "auto"
+    ):
+        positive = np.asarray(eigenvalues, dtype=float)
+        positive = positive[positive > np.finfo(float).eps]
+        scale = float(np.median(positive)) if positive.size else 1.0
+        return max(scale * 1e-3, np.finfo(float).eps)
+    if isinstance(ridge_lambda, str):
+        raise ValueError("ridge_leverage_lambda must be a non-negative float or 'auto'")
+    value = float(ridge_lambda)
+    if not np.isfinite(value) or value < 0.0:
+        raise ValueError("ridge_leverage_lambda must be a non-negative float or 'auto'")
+    return max(value, np.finfo(float).eps)
 
 
 class RandomizedSVDBackend:
@@ -134,6 +162,30 @@ class MatrixRMTBackend:
             singular_values=S,
             Vt=Vt,
             leverage_scores=compute_leverage_scores(U),
+        )
+
+    @staticmethod
+    def compute_ridge_leverage_scores(
+        matrix: np.ndarray,
+        ridge_lambda: float | str | None = "auto",
+    ) -> RMTRidgeLeverageResult:
+        """Compute ``diag(A (A^T A + lambda I)^-1 A^T)``."""
+
+        values = np.asarray(matrix, dtype=float)
+        if values.ndim != 2:
+            raise ValueError("matrix must be two-dimensional")
+        if not np.all(np.isfinite(values)):
+            raise ValueError("matrix must contain only finite values")
+        gram = values.T @ values
+        eigenvalues = np.linalg.eigvalsh(gram)
+        resolved_lambda = _resolve_ridge_lambda(eigenvalues, ridge_lambda)
+        regularized = gram + resolved_lambda * np.eye(gram.shape[0])
+        solved = np.linalg.solve(regularized, values.T).T
+        scores = np.maximum(np.einsum("ij,ij->i", values, solved), 0.0)
+        return RMTRidgeLeverageResult(
+            scores=scores,
+            ridge_lambda=resolved_lambda,
+            effective_dimension=float(np.sum(scores)),
         )
 
     @staticmethod

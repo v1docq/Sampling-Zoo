@@ -21,6 +21,16 @@ class _MeanRegressor:
         return np.full(len(X), self.mean_, dtype=float)
 
 
+class _WeightedMeanRegressor:
+    def fit(self, X, y, sample_weight=None):
+        self.sample_weight_ = np.asarray(sample_weight, dtype=float)
+        self.mean_ = float(np.average(y, weights=self.sample_weight_))
+        return self
+
+    def predict(self, X):
+        return np.full(len(X), self.mean_, dtype=float)
+
+
 def test_concatenated_training_partition_preserves_rows_and_order() -> None:
     partitions = {
         "chunk_0": {
@@ -49,6 +59,45 @@ def test_concatenated_training_partition_preserves_rows_and_order() -> None:
         20.0,
         30.0,
     ]
+
+
+def test_concatenated_training_partition_preserves_sample_weights() -> None:
+    partitions = {
+        "chunk_0": {
+            "feature": pd.DataFrame({"x": [1.0, 2.0]}),
+            "target": pd.Series([10.0, 20.0]),
+            "sample_weight": np.asarray([0.5, 1.5]),
+        },
+        "chunk_1": {
+            "feature": pd.DataFrame({"x": [3.0]}),
+            "target": pd.Series([30.0]),
+            "sample_weight": np.asarray([2.0]),
+        },
+    }
+
+    result = build_model_training_partitions(
+        partitions,
+        PartitionModelMode.CONCATENATED,
+    )
+
+    assert np.array_equal(
+        result["concatenated_budget"]["sample_weight"],
+        np.asarray([0.5, 1.5, 2.0]),
+    )
+
+
+def test_sampling_ensemble_passes_partition_sample_weights_to_model() -> None:
+    partition = {
+        "feature": pd.DataFrame({"x": [1.0, 2.0, 3.0]}),
+        "target": pd.Series([2.0, 4.0, 9.0]),
+        "sample_weight": np.asarray([1.0, 1.0, 4.0]),
+    }
+    model = _WeightedMeanRegressor()
+
+    SamplingEnsemble._fit_partition_model(model, partition)
+
+    assert np.array_equal(model.sample_weight_, partition["sample_weight"])
+    assert model.mean_ == pytest.approx(7.0)
 
 
 def test_sampling_ensemble_trains_one_model_on_concatenated_budget() -> None:

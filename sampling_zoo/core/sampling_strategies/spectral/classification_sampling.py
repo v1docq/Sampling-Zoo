@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 import numpy as np
 from sklearn.utils.multiclass import type_of_target
 
-from .partition_sampling import select_partition_indices
+from .leverage_sketch import combine_stratified_sketch_plans
+from .partition_sampling import build_partition_sketch_plan
+from .sketch_contracts import ExactBudgetSketchPlan
 
 
 @dataclass(frozen=True)
@@ -26,6 +28,14 @@ class ClassCoverageSelectionPlan:
     feasible: bool
     violations: tuple[str, ...]
     distribution_total_variation: float | None
+    selected_probabilities: np.ndarray = field(
+        default_factory=lambda: np.asarray([], dtype=float)
+    )
+    training_weights: np.ndarray = field(
+        default_factory=lambda: np.asarray([], dtype=float)
+    )
+    sketch_plans: tuple[ExactBudgetSketchPlan, ...] = ()
+    combined_sketch_plan: ExactBudgetSketchPlan | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -43,6 +53,22 @@ class ClassCoverageSelectionPlan:
             "feasible": bool(self.feasible),
             "violations": list(self.violations),
             "distribution_total_variation": self.distribution_total_variation,
+            "weight_min": (
+                float(np.min(self.training_weights))
+                if self.training_weights.size
+                else None
+            ),
+            "weight_max": (
+                float(np.max(self.training_weights))
+                if self.training_weights.size
+                else None
+            ),
+            "sketch_plans": [plan.to_dict() for plan in self.sketch_plans],
+            "combined_sketch_plan": (
+                self.combined_sketch_plan.to_dict()
+                if self.combined_sketch_plan is not None
+                else None
+            ),
         }
 
 
@@ -77,6 +103,11 @@ def select_class_aware_partition_indices(
     embedding: np.ndarray,
     random_state: int | np.random.Generator | None = None,
     leverage_cap_quantile: float = 0.95,
+    leverage_mixture_alpha: float = 0.25,
+    leverage_uniform_floor: float = 1e-12,
+    ridge_scores: np.ndarray | None = None,
+    ridge_lambda: float | None = None,
+    training_reweighting: str = "none",
 ) -> ClassCoverageSelectionPlan:
     """Select an exact-size subset while preserving every locally observed class."""
 
@@ -135,8 +166,8 @@ def select_class_aware_partition_indices(
             target_size=resolved_size,
             minimum=minimum,
         )
-        selected_by_class = [
-            select_partition_indices(
+        sketch_plans = [
+            build_partition_sketch_plan(
                 indices[encoded == class_index],
                 target_size=int(class_size),
                 selection_method=selection_method,
@@ -144,14 +175,21 @@ def select_class_aware_partition_indices(
                 embedding=embedding,
                 random_state=rng,
                 leverage_cap_quantile=leverage_cap_quantile,
+                leverage_mixture_alpha=leverage_mixture_alpha,
+                leverage_uniform_floor=leverage_uniform_floor,
+                ridge_scores=ridge_scores,
+                ridge_lambda=ridge_lambda,
+                training_reweighting=training_reweighting,
             )
             for class_index, class_size in enumerate(allocation)
         ]
-        selected = np.concatenate(selected_by_class).astype(int, copy=False)
+        selected = np.concatenate(
+            [plan.selected_indices for plan in sketch_plans]
+        ).astype(int, copy=False)
     else:
         allocation = np.full(classes.size, minimum, dtype=int)
-        reserved = [
-            select_partition_indices(
+        sketch_plans = [
+            build_partition_sketch_plan(
                 indices[encoded == class_index],
                 target_size=minimum,
                 selection_method=selection_method,
@@ -159,25 +197,39 @@ def select_class_aware_partition_indices(
                 embedding=embedding,
                 random_state=rng,
                 leverage_cap_quantile=leverage_cap_quantile,
+                leverage_mixture_alpha=leverage_mixture_alpha,
+                leverage_uniform_floor=leverage_uniform_floor,
+                ridge_scores=ridge_scores,
+                ridge_lambda=ridge_lambda,
+                training_reweighting=training_reweighting,
             )
             for class_index in range(classes.size)
         ]
-        selected = np.concatenate(reserved).astype(int, copy=False)
+        selected = np.concatenate(
+            [plan.selected_indices for plan in sketch_plans]
+        ).astype(int, copy=False)
         remaining_size = resolved_size - selected.size
         if remaining_size > 0:
             remaining = indices[~np.isin(indices, selected)]
+            remaining_plan = build_partition_sketch_plan(
+                remaining,
+                target_size=remaining_size,
+                selection_method=selection_method,
+                scores=scores,
+                embedding=embedding,
+                random_state=rng,
+                leverage_cap_quantile=leverage_cap_quantile,
+                leverage_mixture_alpha=leverage_mixture_alpha,
+                leverage_uniform_floor=leverage_uniform_floor,
+                ridge_scores=ridge_scores,
+                ridge_lambda=ridge_lambda,
+                training_reweighting=training_reweighting,
+            )
+            sketch_plans.append(remaining_plan)
             selected = np.concatenate(
                 [
                     selected,
-                    select_partition_indices(
-                        remaining,
-                        target_size=remaining_size,
-                        selection_method=selection_method,
-                        scores=scores,
-                        embedding=embedding,
-                        random_state=rng,
-                        leverage_cap_quantile=leverage_cap_quantile,
-                    ),
+                    remaining_plan.selected_indices,
                 ]
             )
         selected_target_for_allocation = target_values[selected]
@@ -200,6 +252,17 @@ def select_class_aware_partition_indices(
         label for label, count in selected_pairs if int(count) < minimum
     )
     drift = _distribution_total_variation(source_counts, selected_counts)
+    selected_probabilities = np.concatenate(
+        [plan.selected_probabilities for plan in sketch_plans]
+    )
+    training_weights = np.concatenate(
+        [plan.training_weights for plan in sketch_plans]
+    )
+    combined_sketch_plan = combine_stratified_sketch_plans(
+        indices,
+        sketch_plans,
+        scores=scores,
+    )
     return ClassCoverageSelectionPlan(
         selected_indices=selected,
         target_size=resolved_size,
@@ -212,6 +275,10 @@ def select_class_aware_partition_indices(
         feasible=selected.size == resolved_size and not missing,
         violations=(() if selected.size == resolved_size and not missing else ("selection_invariant_failed",)),
         distribution_total_variation=drift,
+        selected_probabilities=selected_probabilities,
+        training_weights=training_weights,
+        sketch_plans=tuple(sketch_plans),
+        combined_sketch_plan=combined_sketch_plan,
     )
 
 

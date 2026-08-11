@@ -7,6 +7,12 @@ from typing import Sequence
 
 import numpy as np
 
+from .leverage_sketch import (
+    build_deterministic_sketch_plan,
+    build_exact_budget_sketch_plan,
+)
+from .sketch_contracts import ExactBudgetSketchPlan, RowSamplingPolicy
+
 
 def partition_membership_fingerprint(
     labels: Sequence[int] | np.ndarray,
@@ -30,31 +36,85 @@ def select_partition_indices(
     embedding: np.ndarray,
     random_state: int | np.random.Generator | None = None,
     leverage_cap_quantile: float = 0.95,
+    leverage_mixture_alpha: float = 0.25,
+    leverage_uniform_floor: float = 1e-12,
+    ridge_scores: np.ndarray | None = None,
+    ridge_lambda: float | None = None,
+    training_reweighting: str = "none",
 ) -> np.ndarray:
+    """Return selected indices while retaining the legacy array interface."""
+
+    return build_partition_sketch_plan(
+        candidate_indices,
+        target_size=target_size,
+        selection_method=selection_method,
+        scores=scores,
+        embedding=embedding,
+        random_state=random_state,
+        leverage_cap_quantile=leverage_cap_quantile,
+        leverage_mixture_alpha=leverage_mixture_alpha,
+        leverage_uniform_floor=leverage_uniform_floor,
+        ridge_scores=ridge_scores,
+        ridge_lambda=ridge_lambda,
+        training_reweighting=training_reweighting,
+    ).selected_indices.copy()
+
+
+def build_partition_sketch_plan(
+    candidate_indices: Sequence[int] | np.ndarray,
+    *,
+    target_size: int,
+    selection_method: str,
+    scores: np.ndarray,
+    embedding: np.ndarray,
+    random_state: int | np.random.Generator | None = None,
+    leverage_cap_quantile: float = 0.95,
+    leverage_mixture_alpha: float = 0.25,
+    leverage_uniform_floor: float = 1e-12,
+    ridge_scores: np.ndarray | None = None,
+    ridge_lambda: float | None = None,
+    training_reweighting: str = "none",
+) -> ExactBudgetSketchPlan:
+    """Plan one exact-size row sketch without sampler or model side effects."""
+
     indices = np.asarray(candidate_indices, dtype=int)
     target_size = max(0, min(int(target_size), indices.size))
-    if target_size == 0:
-        return np.asarray([], dtype=int)
-    if indices.size <= target_size:
-        return indices.copy()
     method = str(selection_method).strip().lower()
-    if method == "all":
-        return indices[:target_size].copy()
-    if method == "leverage":
-        return _top_score_indices(indices, scores, target_size)
-    if method == "capped_leverage":
-        return _capped_leverage_indices(
+    exact_policies = {
+        RowSamplingPolicy.ALL.value,
+        RowSamplingPolicy.UNIFORM.value,
+        RowSamplingPolicy.LEVERAGE.value,
+        RowSamplingPolicy.CAPPED_LEVERAGE.value,
+        RowSamplingPolicy.SATURATED_LEVERAGE.value,
+        RowSamplingPolicy.ROBUST_LEVERAGE_MIXTURE.value,
+        RowSamplingPolicy.SATURATED_RIDGE_LEVERAGE.value,
+    }
+    if method in exact_policies:
+        return build_exact_budget_sketch_plan(
             indices,
-            scores,
-            target_size,
+            target_size=target_size,
+            policy=method,
+            scores=scores,
             random_state=random_state,
-            cap_quantile=leverage_cap_quantile,
+            leverage_cap_quantile=leverage_cap_quantile,
+            leverage_mixture_alpha=leverage_mixture_alpha,
+            leverage_uniform_floor=leverage_uniform_floor,
+            ridge_scores=ridge_scores,
+            ridge_lambda=ridge_lambda,
+            reweighting=training_reweighting,
         )
     if method == "maxvol":
-        return greedy_maxvol_indices(indices, target_size, embedding)
+        selected = greedy_maxvol_indices(indices, target_size, embedding)
+        return build_deterministic_sketch_plan(
+            indices,
+            selected,
+            policy=method,
+            scores=scores,
+        )
     if method != "hybrid":
         raise ValueError(
-            "selection_method must be all, leverage, capped_leverage, maxvol, or hybrid"
+            "selection_method must be one of: "
+            + ", ".join(sorted(exact_policies | {"maxvol", "hybrid"}))
         )
 
     leverage_size = max(1, target_size // 2)
@@ -67,7 +127,13 @@ def select_partition_indices(
             embedding,
         )
         picked.extend(extra.tolist())
-    return np.asarray(picked[:target_size], dtype=int)
+    selected = np.asarray(picked[:target_size], dtype=int)
+    return build_deterministic_sketch_plan(
+        indices,
+        selected,
+        policy=method,
+        scores=scores,
+    )
 
 
 def greedy_maxvol_indices(
@@ -106,47 +172,6 @@ def _top_score_indices(
         raise ValueError("scores must align with candidate indices")
     order = np.argsort(-score_values[indices], kind="mergesort")
     return indices[order[:target_size]].copy()
-
-
-def _capped_leverage_indices(
-    indices: np.ndarray,
-    scores: np.ndarray,
-    target_size: int,
-    *,
-    random_state: int | np.random.Generator | None,
-    cap_quantile: float,
-) -> np.ndarray:
-    if not 0 < float(cap_quantile) <= 1:
-        raise ValueError("leverage_cap_quantile must be in (0, 1]")
-    score_values = np.asarray(scores, dtype=float)
-    if score_values.ndim != 1 or score_values.size <= int(np.max(indices)):
-        raise ValueError("scores must align with candidate indices")
-
-    local_scores = np.nan_to_num(
-        score_values[indices],
-        nan=0.0,
-        posinf=0.0,
-        neginf=0.0,
-    )
-    local_scores = np.maximum(local_scores, 0.0)
-    cap = float(np.quantile(local_scores, float(cap_quantile)))
-    weights = np.minimum(local_scores, cap)
-    weight_sum = float(np.sum(weights))
-    probabilities = (
-        None if weight_sum <= np.finfo(float).eps else weights / weight_sum
-    )
-    rng = (
-        random_state
-        if isinstance(random_state, np.random.Generator)
-        else np.random.default_rng(random_state)
-    )
-    picked_local = rng.choice(
-        indices.size,
-        size=target_size,
-        replace=False,
-        p=probabilities,
-    )
-    return indices[np.asarray(picked_local, dtype=int)]
 
 
 def _orthonormal_basis(rows: np.ndarray) -> np.ndarray:

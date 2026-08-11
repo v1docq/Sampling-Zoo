@@ -19,8 +19,13 @@ from .classification_sampling import (
     select_class_aware_partition_indices,
 )
 from .partition_sampling import (
+    build_partition_sketch_plan,
     partition_membership_fingerprint,
-    select_partition_indices,
+)
+from .leverage_sketch import evaluate_subspace_preservation
+from .sketch_contracts import (
+    ExactBudgetSketchPlan,
+    SubspacePreservationContract,
 )
 from .null_diagnostics import (
     SpectralNullDiagnostic,
@@ -134,6 +139,10 @@ class RMTContractionConfig:
     max_chunk_size: Optional[int] = None
     selection_method: str = "hybrid"
     leverage_cap_quantile: float = 0.95
+    leverage_mixture_alpha: float = 0.25
+    leverage_uniform_floor: float = 1e-12
+    ridge_leverage_lambda: Union[float, str] = "auto"
+    training_reweighting: str = "none"
     routing_representation: str = "source_centroid"
     routing_metric: str = "squared_euclidean"
     routing_kernel: str = "softmax"
@@ -255,6 +264,10 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             max_chunk_size=cfg.max_chunk_size,
             selection_method=cfg.selection_method,
             leverage_cap_quantile=cfg.leverage_cap_quantile,
+            leverage_mixture_alpha=cfg.leverage_mixture_alpha,
+            leverage_uniform_floor=cfg.leverage_uniform_floor,
+            ridge_leverage_lambda=cfg.ridge_leverage_lambda,
+            training_reweighting=cfg.training_reweighting,
             routing_temperature=cfg.routing_temperature,
             routing_shrinkage=cfg.routing_shrinkage,
             backend=cfg.backend,
@@ -426,6 +439,9 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             cfg.embedding_mode,
             ("sv_scaled", "whitened"),
         )
+        self.ridge_leverage_lambda = self._normalize_ridge_leverage_lambda(
+            cfg.ridge_leverage_lambda
+        )
         if self.n_views_requested != "auto":
             self.n_views = int(self.n_views_requested)
         self.view_size = cfg.view_size
@@ -507,6 +523,25 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self.partition_geometry_: Optional[PartitionGeometryContract] = None
         self.last_routing_distances_: Optional[RoutingDistanceContract] = None
         self.last_routing_weights_: Optional[RoutingWeightContract] = None
+        self.partition_subspace_preservation_: Dict[
+            str, SubspacePreservationContract
+        ] = {}
+
+    @staticmethod
+    def _normalize_ridge_leverage_lambda(value: Union[float, str]) -> Union[float, str]:
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized != "auto":
+                raise ValueError(
+                    "ridge_leverage_lambda must be a non-negative float or 'auto'"
+                )
+            return normalized
+        normalized = float(value)
+        if not np.isfinite(normalized) or normalized < 0.0:
+            raise ValueError(
+                "ridge_leverage_lambda must be a non-negative float or 'auto'"
+            )
+        return normalized
 
     @staticmethod
     def _normalize_config_inputs(
@@ -735,6 +770,10 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self.partition_selection_info_ = None
         self.partition_budget_plan_ = None
         self.class_coverage_selection_plans_ = {}
+        self.partition_training_weights_ = {}
+        self.partition_inclusion_probabilities_ = {}
+        self.partition_sketch_plans_ = {}
+        self.partition_subspace_preservation_ = {}
         self.resolved_class_coverage_policy_ = "off"
         self.class_coverage_guaranteed_ = False
         self.cluster_centers_ = None
@@ -1057,12 +1096,28 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         if data is None:
             return self.partitions
         return {
-            name: {
-                "feature": safe_index(data, indices),
-                **({"target": safe_index(target, indices)} if target is not None else {}),
-            }
+            name: self._build_partition_payload(name, indices, data, target)
             for name, indices in self.partitions.items()
         }
+
+    def _build_partition_payload(
+        self,
+        name: str,
+        indices: np.ndarray,
+        data: ArrayLike,
+        target: Optional[Union[np.ndarray, pd.Series]],
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"feature": safe_index(data, indices)}
+        if target is not None:
+            payload["target"] = safe_index(target, indices)
+        if self.training_reweighting == "inverse_probability":
+            weights = self.partition_training_weights_.get(name)
+            if weights is None or len(weights) != len(indices):
+                raise RuntimeError(
+                    f"Training weights do not align with partition {name!r}"
+                )
+            payload["sample_weight"] = np.asarray(weights, dtype=float).copy()
+        return payload
 
     def sample_indices(self, replace: bool = False) -> List[int]:
         if self.leverage_scores_ is None:
@@ -1469,13 +1524,21 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
                         f"class coverage ({name}): {coverage_plan.to_dict()}"
                     )
                 selected = coverage_plan.selected_indices
+                if coverage_plan.combined_sketch_plan is None:
+                    raise RuntimeError("Class-aware selection did not build a sketch plan")
+                self._record_partition_sketch(
+                    name,
+                    coverage_plan.combined_sketch_plan,
+                )
             else:
-                selected = self._select_from_cluster(
+                sketch_plan = self._build_sketch_from_cluster(
                     cluster_idx,
                     scores,
                     target_size=allocation[name],
                     random_state=row_selection_rng,
                 )
+                self._record_partition_sketch(name, sketch_plan)
+                selected = sketch_plan.selected_indices
             if selected.size == 0:
                 continue
             partitions[name] = selected
@@ -1490,6 +1553,27 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
 
         self.partitions = partitions
         self.partition_names_ = list(partitions.keys())
+        active_names = set(self.partition_names_)
+        self.partition_sketch_plans_ = {
+            name: value
+            for name, value in self.partition_sketch_plans_.items()
+            if name in active_names
+        }
+        self.partition_training_weights_ = {
+            name: value
+            for name, value in self.partition_training_weights_.items()
+            if name in active_names
+        }
+        self.partition_inclusion_probabilities_ = {
+            name: value
+            for name, value in self.partition_inclusion_probabilities_.items()
+            if name in active_names
+        }
+        self.partition_subspace_preservation_ = {
+            name: value
+            for name, value in self.partition_subspace_preservation_.items()
+            if name in active_names
+        }
         self.partition_to_cluster_ = {name: int(name.split("_")[-1]) for name in self.partition_names_}
         self.class_coverage_guaranteed_ = bool(
             self.resolved_class_coverage_policy_ == "preserve_local_classes"
@@ -1543,14 +1627,70 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             if target_size is None
             else int(target_size)
         )
-        return select_partition_indices(
+        return self._build_sketch_from_cluster(
             cluster_idx,
+            scores,
             target_size=resolved_target_size,
+            random_state=random_state,
+        ).selected_indices.copy()
+
+    def _build_sketch_from_cluster(
+        self,
+        cluster_idx: np.ndarray,
+        scores: np.ndarray,
+        *,
+        target_size: int,
+        random_state: int | np.random.Generator | None,
+    ) -> ExactBudgetSketchPlan:
+        if self.sample_embedding_ is None:
+            raise RuntimeError("Sample embedding is not available")
+        ridge_scores = None
+        ridge_lambda = None
+        if self.selection_method == "saturated_ridge_leverage":
+            ridge_result = self._get_rmt_backend().compute_ridge_leverage_scores(
+                self.sample_embedding_[cluster_idx],
+                self.ridge_leverage_lambda,
+            )
+            ridge_scores = np.zeros_like(np.asarray(scores, dtype=float))
+            ridge_scores[cluster_idx] = ridge_result.scores
+            ridge_lambda = ridge_result.ridge_lambda
+        return build_partition_sketch_plan(
+            cluster_idx,
+            target_size=int(target_size),
             selection_method=self.selection_method,
             scores=scores,
             embedding=self.sample_embedding_,
             random_state=random_state,
             leverage_cap_quantile=self.leverage_cap_quantile,
+            leverage_mixture_alpha=self.leverage_mixture_alpha,
+            leverage_uniform_floor=self.leverage_uniform_floor,
+            ridge_scores=ridge_scores,
+            ridge_lambda=ridge_lambda,
+            training_reweighting=self.training_reweighting,
+        )
+
+    def _record_partition_sketch(
+        self,
+        name: str,
+        plan: ExactBudgetSketchPlan,
+    ) -> None:
+        if self.sample_embedding_ is None:
+            raise RuntimeError("Sample embedding is not available")
+        self.partition_sketch_plans_[name] = plan
+        self.partition_training_weights_[name] = plan.training_weights.copy()
+        self.partition_inclusion_probabilities_[name] = (
+            plan.selected_probabilities.copy()
+        )
+        rank = min(
+            int(self.sample_embedding_.shape[1]),
+            max(1, int(plan.selected_indices.size)),
+        )
+        self.partition_subspace_preservation_[name] = (
+            evaluate_subspace_preservation(
+                self.sample_embedding_[plan.candidate_indices],
+                plan,
+                rank=rank,
+            )
         )
 
     def _select_class_aware_from_cluster(
@@ -1564,6 +1704,16 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
     ) -> ClassCoverageSelectionPlan:
         if self.sample_embedding_ is None:
             raise RuntimeError("Sample embedding is not available")
+        ridge_scores = None
+        ridge_lambda = None
+        if self.selection_method == "saturated_ridge_leverage":
+            ridge_result = self._get_rmt_backend().compute_ridge_leverage_scores(
+                self.sample_embedding_[cluster_idx],
+                self.ridge_leverage_lambda,
+            )
+            ridge_scores = np.zeros_like(np.asarray(scores, dtype=float))
+            ridge_scores[cluster_idx] = ridge_result.scores
+            ridge_lambda = ridge_result.ridge_lambda
         return select_class_aware_partition_indices(
             cluster_idx,
             target=target,
@@ -1575,6 +1725,11 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             embedding=self.sample_embedding_,
             random_state=random_state,
             leverage_cap_quantile=self.leverage_cap_quantile,
+            leverage_mixture_alpha=self.leverage_mixture_alpha,
+            leverage_uniform_floor=self.leverage_uniform_floor,
+            ridge_scores=ridge_scores,
+            ridge_lambda=ridge_lambda,
+            training_reweighting=self.training_reweighting,
         )
 
     def _project_new_unfolding(self, M_new: np.ndarray) -> np.ndarray:
@@ -1679,6 +1834,18 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             "effective_sample_count": eff_n,
             "row_selection_method": self.selection_method,
             "leverage_cap_quantile": float(self.leverage_cap_quantile),
+            "leverage_mixture_alpha": float(self.leverage_mixture_alpha),
+            "leverage_uniform_floor": float(self.leverage_uniform_floor),
+            "ridge_leverage_lambda": self.ridge_leverage_lambda,
+            "training_reweighting": self.training_reweighting,
+            "partition_sketch_plans": {
+                name: plan.to_dict()
+                for name, plan in self.partition_sketch_plans_.items()
+            },
+            "partition_subspace_preservation": {
+                name: diagnostic.to_dict()
+                for name, diagnostic in self.partition_subspace_preservation_.items()
+            },
             "routing_geometry": (
                 self.partition_geometry_.to_dict()
                 if self.partition_geometry_ is not None
