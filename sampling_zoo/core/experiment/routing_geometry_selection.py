@@ -13,6 +13,28 @@ _METRIC_DIRECTIONS = {"lower", "higher"}
 
 
 @dataclass(frozen=True)
+class RoutingGeometryTailRiskScore:
+    """One upper-tail risk metric attached to a held-out regression fold."""
+
+    metric: str
+    value: float
+    direction: str
+    quantile: float
+
+    def __post_init__(self) -> None:
+        if not self.metric:
+            raise ValueError("tail risk metric must be non-empty")
+        if self.direction not in _METRIC_DIRECTIONS:
+            raise ValueError("tail risk direction must be lower or higher")
+        if not np.isfinite(float(self.value)):
+            raise ValueError("tail risk value must be finite")
+        if not 0.0 <= float(self.quantile) < 1.0:
+            raise ValueError("tail risk quantile must be in [0, 1)")
+        object.__setattr__(self, "value", float(self.value))
+        object.__setattr__(self, "quantile", float(self.quantile))
+
+
+@dataclass(frozen=True)
 class RoutingGeometryFoldScore:
     """Metrics for one geometry evaluated on one held-out inner fold."""
 
@@ -26,6 +48,7 @@ class RoutingGeometryFoldScore:
     robust_metric: Optional[str] = None
     robust_value: Optional[float] = None
     robust_direction: Optional[str] = None
+    tail_risk: Optional[RoutingGeometryTailRiskScore] = None
 
     def __post_init__(self) -> None:
         if not self.arm_name:
@@ -71,6 +94,18 @@ class RoutingGeometryFoldScore:
                 None if self.robust_value is None else float(self.robust_value)
             ),
             "robust_direction": self.robust_direction,
+            "tail_metric": (
+                None if self.tail_risk is None else self.tail_risk.metric
+            ),
+            "tail_value": (
+                None if self.tail_risk is None else float(self.tail_risk.value)
+            ),
+            "tail_direction": (
+                None if self.tail_risk is None else self.tail_risk.direction
+            ),
+            "tail_quantile": (
+                None if self.tail_risk is None else float(self.tail_risk.quantile)
+            ),
             "evaluation_rows": self.evaluation_rows,
             "selected_temperature": self.selected_temperature,
         }
@@ -93,6 +128,8 @@ class CrossFittedRoutingGeometrySelectionSpec:
     min_median_relative_gain: float = 0.0
     noninferiority_margin: float = 0.005
     require_robust_metric: bool = False
+    tail_guard_primary_metrics: Tuple[str, ...] = ()
+    tail_noninferiority_margin: Optional[float] = None
     random_state: int = 42
 
     def __post_init__(self) -> None:
@@ -115,7 +152,20 @@ class CrossFittedRoutingGeometrySelectionSpec:
             raise ValueError("min_positive_fold_fraction must be in (0, 1]")
         if float(self.noninferiority_margin) < 0.0:
             raise ValueError("noninferiority_margin must be non-negative")
+        tail_metrics = tuple(
+            str(metric).strip().lower() for metric in self.tail_guard_primary_metrics
+        )
+        if any(not metric for metric in tail_metrics):
+            raise ValueError("tail_guard_primary_metrics must contain non-empty names")
+        if len(set(tail_metrics)) != len(tail_metrics):
+            raise ValueError("tail_guard_primary_metrics must be unique")
+        if (
+            self.tail_noninferiority_margin is not None
+            and float(self.tail_noninferiority_margin) < 0.0
+        ):
+            raise ValueError("tail_noninferiority_margin must be non-negative")
         object.__setattr__(self, "candidate_arms", candidates)
+        object.__setattr__(self, "tail_guard_primary_metrics", tail_metrics)
 
 
 @dataclass(frozen=True)
@@ -134,6 +184,12 @@ class RoutingGeometryCandidateEvidence:
     robust_median_relative_gain: Optional[float]
     robust_confidence_interval: Optional[Tuple[float, float]]
     robust_positive_fold_fraction: Optional[float]
+    tail_metric: Optional[str]
+    tail_quantile: Optional[float]
+    tail_mean_relative_gain: Optional[float]
+    tail_median_relative_gain: Optional[float]
+    tail_confidence_interval: Optional[Tuple[float, float]]
+    tail_positive_fold_fraction: Optional[float]
     eligible: bool
     rejection_reasons: Tuple[str, ...] = ()
 
@@ -151,6 +207,12 @@ class RoutingGeometryCandidateEvidence:
             "robust_median_relative_gain": self.robust_median_relative_gain,
             "robust_confidence_interval": self.robust_confidence_interval,
             "robust_positive_fold_fraction": self.robust_positive_fold_fraction,
+            "tail_metric": self.tail_metric,
+            "tail_quantile": self.tail_quantile,
+            "tail_mean_relative_gain": self.tail_mean_relative_gain,
+            "tail_median_relative_gain": self.tail_median_relative_gain,
+            "tail_confidence_interval": self.tail_confidence_interval,
+            "tail_positive_fold_fraction": self.tail_positive_fold_fraction,
             "eligible": self.eligible,
             "rejection_reasons": list(self.rejection_reasons),
         }
@@ -272,8 +334,11 @@ class CrossFittedRoutingGeometrySelector:
 
         primary_gains = []
         robust_gains = []
+        tail_gains = []
         primary_metric = None
         robust_metric = None
+        tail_metric = None
+        tail_quantile = None
         for fold_id in paired_folds:
             reference_score = reference[fold_id]
             candidate_score = candidate[fold_id]
@@ -293,6 +358,16 @@ class CrossFittedRoutingGeometrySelector:
                         float(reference_score.robust_value),
                         float(candidate_score.robust_value),
                         str(reference_score.robust_direction),
+                    )
+                )
+            if reference_score.tail_risk is not None:
+                tail_metric = reference_score.tail_risk.metric
+                tail_quantile = reference_score.tail_risk.quantile
+                tail_gains.append(
+                    self._relative_gain(
+                        reference_score.tail_risk.value,
+                        candidate_score.tail_risk.value,
+                        reference_score.tail_risk.direction,
                     )
                 )
 
@@ -330,6 +405,35 @@ class CrossFittedRoutingGeometrySelector:
         elif self.spec.require_robust_metric:
             reasons.append("robust_metric_required")
 
+        tail_mean = None
+        tail_median = None
+        tail_ci = None
+        tail_positive_fraction = None
+        tail_required = (
+            primary_metric is not None
+            and primary_metric.lower() in self.spec.tail_guard_primary_metrics
+        )
+        if tail_gains:
+            tail = np.asarray(tail_gains, dtype=float)
+            tail_mean = float(np.mean(tail))
+            tail_median = float(np.median(tail))
+            tail_ci = self._bootstrap_interval(tail, arm_name, offset=2)
+            tail_positive_fraction = float(np.mean(tail > 0.0))
+            tail_margin = (
+                self.spec.noninferiority_margin
+                if self.spec.tail_noninferiority_margin is None
+                else float(self.spec.tail_noninferiority_margin)
+            )
+            if tail_required:
+                if tail_mean < -tail_margin:
+                    reasons.append("tail_mean_exceeds_harm_margin")
+                if tail_median < -tail_margin:
+                    reasons.append("tail_median_exceeds_harm_margin")
+                if tail_ci[0] < -tail_margin:
+                    reasons.append("tail_confidence_interval_exceeds_harm_margin")
+        elif tail_required:
+            reasons.append("tail_metric_required")
+
         return RoutingGeometryCandidateEvidence(
             arm_name=arm_name,
             paired_fold_count=len(paired_folds),
@@ -343,6 +447,12 @@ class CrossFittedRoutingGeometrySelector:
             robust_median_relative_gain=robust_median,
             robust_confidence_interval=robust_ci,
             robust_positive_fold_fraction=robust_positive_fraction,
+            tail_metric=tail_metric,
+            tail_quantile=tail_quantile,
+            tail_mean_relative_gain=tail_mean,
+            tail_median_relative_gain=tail_median,
+            tail_confidence_interval=tail_ci,
+            tail_positive_fold_fraction=tail_positive_fraction,
             eligible=not reasons,
             rejection_reasons=tuple(reasons),
         )
@@ -365,6 +475,12 @@ class CrossFittedRoutingGeometrySelector:
             robust_median_relative_gain=None,
             robust_confidence_interval=None,
             robust_positive_fold_fraction=None,
+            tail_metric=None,
+            tail_quantile=None,
+            tail_mean_relative_gain=None,
+            tail_median_relative_gain=None,
+            tail_confidence_interval=None,
+            tail_positive_fold_fraction=None,
             eligible=False,
             rejection_reasons=tuple(reasons),
         )
@@ -388,6 +504,21 @@ class CrossFittedRoutingGeometrySelector:
             or reference.robust_direction != candidate.robust_direction
         ):
             raise ValueError("Paired robust metrics and directions must match")
+        reference_has_tail = reference.tail_risk is not None
+        candidate_has_tail = candidate.tail_risk is not None
+        if reference_has_tail != candidate_has_tail:
+            raise ValueError("Paired scores must agree on tail risk availability")
+        if reference_has_tail and (
+            reference.tail_risk.metric != candidate.tail_risk.metric
+            or reference.tail_risk.direction != candidate.tail_risk.direction
+            or not np.isclose(
+                reference.tail_risk.quantile,
+                candidate.tail_risk.quantile,
+            )
+        ):
+            raise ValueError(
+                "Paired tail risk metrics, directions, and quantiles must match"
+            )
 
     @staticmethod
     def _relative_gain(reference: float, candidate: float, direction: str) -> float:

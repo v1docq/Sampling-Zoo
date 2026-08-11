@@ -15,6 +15,7 @@ from sampling_zoo.core.experiment.routing_geometry_selection import (
     CrossFittedRoutingGeometrySelector,
     RoutingGeometryFoldScore,
     RoutingGeometrySelectionDecision,
+    RoutingGeometryTailRiskScore,
 )
 from sampling_zoo.core.experiment.routing_replay import (
     RoutingGeometrySelection,
@@ -216,6 +217,7 @@ class FittedEnsembleRoutingReplay:
         selector: CrossFittedRoutingGeometrySelector,
         n_folds: int = 5,
         random_state: int = 42,
+        regression_stratification_bins: Optional[int] = None,
         metadata: Optional[dict[str, Any]] = None,
     ) -> CrossFittedRoutingReplaySelection:
         """Select geometry on inner folds without consulting outer test rows."""
@@ -251,6 +253,7 @@ class FittedEnsembleRoutingReplay:
             problem_type=str(ensemble.problem),
             n_folds=int(n_folds),
             random_state=int(random_state),
+            regression_stratification_bins=regression_stratification_bins,
         )
         fold_scores = []
         reference_request = requests[selector.spec.reference_arm]
@@ -399,6 +402,7 @@ class FittedEnsembleRoutingReplay:
         problem_type: str,
         n_folds: int,
         random_state: int,
+        regression_stratification_bins: Optional[int] = None,
     ) -> tuple[tuple[np.ndarray, np.ndarray], ...]:
         if n_folds < 3:
             raise ValueError("n_folds must be at least 3")
@@ -418,17 +422,56 @@ class FittedEnsembleRoutingReplay:
                 random_state=random_state,
             )
             split_iterator = splitter.split(indices, target)
-        else:
+        elif regression_stratification_bins is None:
             splitter = KFold(
                 n_splits=n_folds,
                 shuffle=True,
                 random_state=random_state,
             )
             split_iterator = splitter.split(indices)
+        else:
+            labels = FittedEnsembleRoutingReplay._regression_stratification_labels(
+                target,
+                n_folds=n_folds,
+                requested_bins=int(regression_stratification_bins),
+            )
+            splitter = StratifiedKFold(
+                n_splits=n_folds,
+                shuffle=True,
+                random_state=random_state,
+            )
+            split_iterator = splitter.split(indices, labels)
         return tuple(
             (np.asarray(calibration), np.asarray(evaluation))
             for calibration, evaluation in split_iterator
         )
+
+    @staticmethod
+    def _regression_stratification_labels(
+        target: np.ndarray,
+        *,
+        n_folds: int,
+        requested_bins: int,
+    ) -> np.ndarray:
+        """Assign balanced target-rank bins for regression cross-fitting."""
+
+        values = np.asarray(target, dtype=float).reshape(-1)
+        if not np.all(np.isfinite(values)):
+            raise ValueError("Regression stratification target must be finite")
+        if requested_bins < 2:
+            raise ValueError("regression_stratification_bins must be at least 2")
+        effective_bins = min(int(requested_bins), values.size // int(n_folds))
+        if effective_bins < 2:
+            raise ValueError(
+                "Regression stratification requires at least two bins with n_folds rows"
+            )
+        order = np.argsort(values, kind="stable")
+        labels = np.empty(values.size, dtype=int)
+        labels[order] = np.minimum(
+            np.arange(values.size, dtype=int) * effective_bins // values.size,
+            effective_bins - 1,
+        )
+        return labels
 
     @staticmethod
     def _slice_request(
@@ -513,6 +556,8 @@ class FittedEnsembleRoutingReplay:
         else:
             raise ValueError(f"Unknown metric direction for {result.primary_metric!r}")
         has_mae = "mae" in result.metrics
+        has_tail = "tail_mean_absolute_error" in result.metrics
+        tail_quantile = result.diagnostics.get("tail_absolute_error_quantile")
         return RoutingGeometryFoldScore(
             arm_name=result.arm_name,
             fold_id=fold_id,
@@ -522,6 +567,16 @@ class FittedEnsembleRoutingReplay:
             robust_metric="mae" if has_mae else None,
             robust_value=float(result.metrics["mae"]) if has_mae else None,
             robust_direction="lower" if has_mae else None,
+            tail_risk=(
+                RoutingGeometryTailRiskScore(
+                    metric="tail_mean_absolute_error",
+                    value=float(result.metrics["tail_mean_absolute_error"]),
+                    direction="lower",
+                    quantile=float(tail_quantile),
+                )
+                if has_tail and tail_quantile is not None
+                else None
+            ),
             evaluation_rows=evaluation_rows,
             selected_temperature=result.temperature,
         )

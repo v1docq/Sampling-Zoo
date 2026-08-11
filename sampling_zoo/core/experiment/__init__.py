@@ -76,6 +76,7 @@ from .routing_geometry_selection import (
     RoutingGeometryCandidateEvidence,
     RoutingGeometryFoldScore,
     RoutingGeometrySelectionDecision,
+    RoutingGeometryTailRiskScore,
 )
 from .routing_replay import (
     RoutingGeometrySelection,
@@ -85,6 +86,7 @@ from .routing_replay import (
     RoutingReplayResult,
     RoutingTemperatureSelection,
     ValidationRoutingGeometrySelector,
+    upper_tail_mean_absolute_error,
 )
 from .stages import ExperimentPlan, ExperimentStageId, StageRegistry, StageRequest, StageResult
 
@@ -127,6 +129,7 @@ __all__ = [
     "RoutingGeometryFoldScore",
     "RoutingGeometrySelection",
     "RoutingGeometrySelectionDecision",
+    "RoutingGeometryTailRiskScore",
     "RoutingGeometrySelectionPolicy",
     "RoutingReplayEvaluator",
     "RoutingReplayRequest",
@@ -150,6 +153,7 @@ __all__ = [
     "StrategyGridContract",
     "StrategySpec",
     "ValidationRoutingGeometrySelector",
+    "upper_tail_mean_absolute_error",
     "build_artifact_manifest",
     "build_partition_budget_plan",
     "build_resume_plan",

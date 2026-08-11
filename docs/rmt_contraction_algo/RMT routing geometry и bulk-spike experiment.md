@@ -211,6 +211,35 @@ python examples/benchmark/rmt_cross_fitted_geometry_selector_experiment.py \
 - `geometry_selection_fold_losses.csv` с метриками каждого варианта на каждом внутреннем фолде;
 - `geometry_selection_summary.csv` с bootstrap-интервалами, долей положительных фолдов и причинами отклонения кандидатов.
 
+### 4.7. Phase A.3: A9 с контролем хвоста регрессионной ошибки
+
+Итог Phase A.2 выявил различие между типичной и хвостовой ошибкой: в четырёх регрессионных конфигурациях A8 улучшил `MAE`, но проиграл A2 по `RMSE`. Поэтому A9 использует условное среднее крупнейших абсолютных ошибок:
+
+\[
+\operatorname{TailMAE}_q(y,\hat y)
+=\frac{1}{k}\sum_{i\in\operatorname{TopK}(|y-\hat y|,k)}|y_i-\hat y_i|,
+\qquad
+k=\max\left(1,\left\lceil(1-q)n\right\rceil\right),
+\quad q=0.9.
+\]
+
+`TailMAE` является эмпирическим аналогом CVaR для абсолютной ошибки. В A9 он вычисляется на каждом внутреннем фолде и становится обязательным ограничением только при основной метрике `rmse`. Кандидат отклоняется, если средний или медианный относительный выигрыш по `TailMAE` ниже `-0.005` либо нижняя граница 95%-го бутстрэп-доверительного интервала ниже этого порога.
+
+Регрессионные внутренние фолды A9 формируются по десяти сбалансированным слоям рангов целевой переменной. Это не превращает целевую переменную в категориальную: слои используются только для равномерного распределения диапазона целей между отложенными частями фолдов.
+
+```bash
+python examples/benchmark/rmt_cross_fitted_geometry_selector_experiment.py \
+  --tail-risk-guard \
+  --tail-risk-quantile 0.90 \
+  --tail-noninferiority-margin 0.005 \
+  --regression-stratification-bins 10 \
+  --selection-folds 5 \
+  --seeds 42 43 44 45 46 \
+  --budgets 0.01 0.05 0.10 0.20
+```
+
+По умолчанию Phase A.3 использует новые относительно A.2 задачи: `diamonds`, `OnlineNewsPopularity`, `bank-marketing`, `covertype`. В `geometry_selection_fold_losses.csv` сохраняются `tail_metric`, `tail_value`, `tail_quantile`; в `geometry_selection_summary.csv` — средний и медианный выигрыш, доля положительных фолдов и границы доверительного интервала хвостовой метрики.
+
 ## 5. Phase B: Bulk/Spike Hierarchical Experts
 
 ### 5.1. Спектральное разделение
@@ -319,11 +348,13 @@ Phase B:
 4. [x] Реализовать независимый calibration/selection split и A7 selector contracts.
 5. [x] Запустить real-data A7 selector gate и выявить чувствительность выбора к одному holdout-разбиению.
 6. [x] Реализовать cross-fitted A8 selector и инкрементальные артефакты доказательств.
-7. [ ] Запустить малый real-data A8 gate на четырех датасетах и 320 записях.
-8. Реализовать component split и row participation contracts.
-9. Выполнить synthetic bulk/spike gate.
-10. Запустить B0-B4 screening с LightGBM.
-11. Перепроверить только прошедшие gate варианты с TabPFN.
-12. После этого расширять эксперимент на полную AMLB grid.
+7. [x] Запустить малую реальную проверку A8 на четырёх датасетах: `320/320`, `0 failed`.
+8. [x] Реализовать A9 с `TailMAE`, квантильными регрессионными фолдами и защитой возобновления запуска.
+9. [ ] Запустить малую проверку A9 на новых датасетах и восстановить контрфактические решения A8 из оценок на тех же внутренних фолдах.
+10. Реализовать component split и row participation contracts.
+11. Выполнить synthetic bulk/spike gate.
+12. Запустить B0-B4 screening с LightGBM.
+13. Перепроверить только прошедшие gate варианты с TabPFN.
+14. После этого расширять эксперимент на полную AMLB grid.
 
 Полный benchmark нельзя запускать сразу после реализации: точкой первого повторного запуска является synthetic Phase A smoke, а первой значимой real-data серией является Phase A LightGBM screening.

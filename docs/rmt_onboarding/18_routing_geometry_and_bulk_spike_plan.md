@@ -1,6 +1,6 @@
 # RMT routing geometry и bulk/spike experts: актуальный план разработки
 
-Дата актуализации: 2026-08-10. Статус: `phase_a2_cross_fitted_selector_implemented`.
+Дата актуализации: 2026-08-11. Статус: `phase_a3_tail_guarded_selector_implemented`.
 
 Формальная постановка проверки гипотез: [Эксперимент: routing geometry и bulk/spike experts](../rmt_contraction_algo/RMT%20routing%20geometry%20и%20bulk-spike%20experiment.md).
 
@@ -17,11 +17,12 @@
 | P2 | завершен для Phase A | Matrix/Torch kernels для scaled L2, shrinkage Mahalanobis, cosine и GMM posterior; row-wise routing diagnostics. |
 | P3 | завершен | Offline replay фиксированных expert outputs, validation-only temperature calibration, incremental artifacts и synthetic smoke. |
 | P3.1 | реализован, ожидает real-data gate | `ValidationRoutingGeometrySelector`, независимые calibration/selection holdouts и A7 selector arm с A2 fallback. |
-| P3.2 | реализован, ожидает малую проверку на реальных данных | `CrossFittedRoutingGeometrySelector`, попарные оценки на внутренних фолдах, надежный возврат к A2 и селектор A8. |
+| P3.2 | реализован | `CrossFittedRoutingGeometrySelector`, попарные оценки на внутренних фолдах, надежный возврат к A2 и селектор A8. |
+| P3.3 | реализован, ожидает малую проверку на реальных данных | Селектор A9 с контролем хвостовой ошибки, стратификацией регрессионных фолдов по рангам целевой переменной и проверкой совместимости возобновляемого запуска. |
 | P4 | не начат | Component split и row participation реализуются только после real-data gate Phase A. |
 | P5-P6 | заблокированы gate-ом | Bulk/spike experts и full grid не запускаются до выбора routing geometry. |
 
-Целевые сценарии запуска: `examples/benchmark/rmt_routing_geometry_experiment.py` для первичного отбора, `examples/benchmark/rmt_validation_geometry_selector_experiment.py` для A7 и `examples/benchmark/rmt_cross_fitted_geometry_selector_experiment.py` для устойчивой проверки A8. Быстрая локальная проверка: `examples/benchmark/rmt_routing_geometry_smoke.py`.
+Целевые сценарии запуска: `examples/benchmark/rmt_routing_geometry_experiment.py` для первичного отбора, `examples/benchmark/rmt_validation_geometry_selector_experiment.py` для A7 и `examples/benchmark/rmt_cross_fitted_geometry_selector_experiment.py` для устойчивых проверок A8/A9. Быстрая локальная проверка: `examples/benchmark/rmt_routing_geometry_smoke.py`.
 
 ### Результат Phase A и следующий gate
 
@@ -186,6 +187,25 @@ Default остается `spectral_component_policy="explained_variance"` и `ex
 - сохранять оценки каждого фолда, сводку обоснований и итоговое решение до обращения к внешней тестовой выборке.
 
 Первый запуск после слияния ограничен задачами `Brazilian_houses`, `elevators`, `adult`, `jannis`, пятью seeds и бюджетами `(0.01, 0.05, 0.10, 0.20)`. Ожидаемый объем: `4 datasets x 5 seeds x 4 budgets x 4 arms = 320` завершенных записей.
+
+### P3.3. Контроль хвостового риска в регрессии
+
+Phase A.2 показала, что A8 может одновременно улучшать `MAE` и ухудшать `RMSE` из-за редких крупных ошибок. Вариант `A9_tail_guarded_cross_fitted_selected` добавляет отдельную метрику верхнего хвоста абсолютной ошибки:
+
+\[
+T_q(e)=\frac{1}{k}\sum_{i\in\operatorname{TopK}(|e|,k)} |e_i|,
+\qquad
+k=\max\left(1,\left\lceil(1-q)n\right\rceil\right),
+\qquad q=0.9.
+\]
+
+Для основной метрики `rmse` кандидат должен пройти те же ограничения неухудшения по `T_q`, что уже применяются к `MAE`: средний и медианный относительный выигрыш, а также нижняя граница бутстрэп-интервала не могут быть ниже `-0.005`. Для классификации это ограничение не применяется.
+
+Чтобы крупные значения целевой переменной не концентрировались в одном внутреннем фолде, A9 ранжирует регрессионные цели, разбивает их на десять сбалансированных квантильных слоев и использует стратифицированное разбиение. A8 сохраняет прежний `KFold`; наличие хвостовой диагностики не меняет его решение.
+
+Первый подтверждающий запуск A9 использует задачи, не входившие в Phase A.2: `diamonds`, `OnlineNewsPopularity`, `bank-marketing`, `covertype`. Пороги A8/A9 по результатам внешней тестовой выборки не перенастраиваются. Решение A8 можно восстановить из артефактов внутренних фолдов A9 с отключенным хвостовым ограничением, поэтому повторное обучение моделей для контрфактического сравнения не требуется.
+
+Каталоги A8 и A9 не взаимозаменяемы: механизм возобновления отклоняет существующий каталог с другой семантикой селектора, числом фолдов, хвостовым порогом или схемой стратификации.
 
 ### P4. Component-aware spectral diagnostics
 

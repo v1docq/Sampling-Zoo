@@ -36,7 +36,11 @@ from sampling_zoo.core.experiment.routing_geometry_selection import (  # noqa: E
     CrossFittedRoutingGeometrySelectionSpec,
     CrossFittedRoutingGeometrySelector,
 )
-from sampling_zoo.core.experiment.routing_replay import RoutingReplayResult  # noqa: E402
+from sampling_zoo.core.experiment.errors import ResumeCompatibilityError  # noqa: E402
+from sampling_zoo.core.experiment.routing_replay import (  # noqa: E402
+    RoutingReplayEvaluator,
+    RoutingReplayResult,
+)
 
 
 DEFAULT_CROSS_FITTED_REGRESSION_TASKS: tuple[str, ...] = (
@@ -48,6 +52,15 @@ DEFAULT_CROSS_FITTED_CLASSIFICATION_TASKS: tuple[str, ...] = (
     "jannis",
 )
 DEFAULT_CROSS_FITTED_SELECTOR_ARM_NAME = "A8_cross_fitted_selected"
+DEFAULT_TAIL_GUARDED_SELECTOR_ARM_NAME = "A9_tail_guarded_cross_fitted_selected"
+DEFAULT_TAIL_GUARD_REGRESSION_TASKS: tuple[str, ...] = (
+    "diamonds",
+    "OnlineNewsPopularity",
+)
+DEFAULT_TAIL_GUARD_CLASSIFICATION_TASKS: tuple[str, ...] = (
+    "bank-marketing",
+    "covertype",
+)
 
 
 @dataclass(frozen=True)
@@ -62,6 +75,10 @@ class CrossFittedRoutingGeometryExperimentConfig(RoutingGeometryExperimentConfig
     bootstrap_iterations: int = 2_000
     min_positive_fold_fraction: float = 2.0 / 3.0
     noninferiority_margin: float = 0.005
+    regression_tail_guard: bool = False
+    tail_risk_quantile: float = 0.90
+    tail_noninferiority_margin: float = 0.005
+    regression_stratification_bins: Optional[int] = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -77,6 +94,20 @@ class CrossFittedRoutingGeometryExperimentConfig(RoutingGeometryExperimentConfig
             raise ValueError("min_positive_fold_fraction must be in (0, 1]")
         if float(self.noninferiority_margin) < 0.0:
             raise ValueError("noninferiority_margin must be non-negative")
+        if not 0.5 <= float(self.tail_risk_quantile) < 1.0:
+            raise ValueError("tail_risk_quantile must be in [0.5, 1)")
+        if float(self.tail_noninferiority_margin) < 0.0:
+            raise ValueError("tail_noninferiority_margin must be non-negative")
+        if (
+            self.regression_stratification_bins is not None
+            and int(self.regression_stratification_bins) < 2
+        ):
+            raise ValueError("regression_stratification_bins must be at least 2")
+        if self.regression_tail_guard and self.regression_stratification_bins is None:
+            raise ValueError(
+                "regression_stratification_bins is required when "
+                "regression_tail_guard is enabled"
+            )
 
 
 class CrossFittedRoutingGeometryExperimentOrchestrator(
@@ -94,10 +125,12 @@ class CrossFittedRoutingGeometryExperimentOrchestrator(
         selector: Optional[CrossFittedRoutingGeometrySelector] = None,
     ) -> None:
         if config.output_dir is None:
-            run_id = (
-                "run_rmt_cross_fitted_geometry_selector_"
-                f"{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            prefix = (
+                "run_rmt_tail_guarded_geometry_selector_"
+                if config.regression_tail_guard
+                else "run_rmt_cross_fitted_geometry_selector_"
             )
+            run_id = f"{prefix}{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             config = replace(
                 config,
                 output_dir=BENCHMARK_DIR / "results" / run_id,
@@ -112,6 +145,10 @@ class CrossFittedRoutingGeometryExperimentOrchestrator(
             bootstrap_iterations=int(config.bootstrap_iterations),
             min_positive_fold_fraction=float(config.min_positive_fold_fraction),
             noninferiority_margin=float(config.noninferiority_margin),
+            tail_guard_primary_metrics=(
+                ("rmse",) if config.regression_tail_guard else ()
+            ),
+            tail_noninferiority_margin=float(config.tail_noninferiority_margin),
             random_state=int(config.seeds[0]),
         )
         self.selector = selector or CrossFittedRoutingGeometrySelector(spec)
@@ -121,6 +158,7 @@ class CrossFittedRoutingGeometryExperimentOrchestrator(
         self.summary_rows_: list[dict[str, Any]] = []
 
     def _initialize_artifacts(self) -> None:
+        self._validate_resume_selector_config()
         super()._initialize_artifacts()
         if self.output_dir_ is None:
             raise RuntimeError("Artifacts are not initialized")
@@ -138,6 +176,61 @@ class CrossFittedRoutingGeometryExperimentOrchestrator(
         self.summary_rows_ = self._load_csv_records(
             self.output_dir_ / "geometry_selection_summary.csv"
         )
+
+    def _validate_resume_selector_config(self) -> None:
+        if self.config.output_dir is None:
+            return
+        output_dir = Path(self.config.output_dir)
+        metadata_path = output_dir / "run_meta.json"
+        if not metadata_path.exists():
+            return
+        try:
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            raise ResumeCompatibilityError(
+                scope="routing_geometry.resume",
+                message="Existing run metadata cannot be read.",
+                code="routing_geometry_resume_metadata_invalid",
+                details={"path": str(metadata_path)},
+            ) from exc
+        existing = payload.get("config", {}) if isinstance(payload, dict) else {}
+        expected = {
+            "selector_arm_name": self.config.selector_arm_name,
+            "selection_folds": int(self.config.selection_folds),
+            "regression_tail_guard": bool(self.config.regression_tail_guard),
+            "tail_risk_quantile": float(self.config.tail_risk_quantile),
+            "tail_noninferiority_margin": float(
+                self.config.tail_noninferiority_margin
+            ),
+            "regression_stratification_bins": (
+                None
+                if self.config.regression_stratification_bins is None
+                else int(self.config.regression_stratification_bins)
+            ),
+        }
+        defaults = {
+            "regression_tail_guard": False,
+            "tail_risk_quantile": 0.90,
+            "tail_noninferiority_margin": 0.005,
+            "regression_stratification_bins": None,
+        }
+        mismatches = {
+            name: {
+                "existing": existing.get(name, defaults.get(name)),
+                "requested": value,
+            }
+            for name, value in expected.items()
+            if existing.get(name, defaults.get(name)) != value
+        }
+        if mismatches:
+            raise ResumeCompatibilityError(
+                scope="routing_geometry.resume",
+                message=(
+                    "Existing selector artifacts use incompatible selection semantics."
+                ),
+                code="routing_geometry_resume_selector_mismatch",
+                details={"path": str(output_dir), "mismatches": mismatches},
+            )
 
     def _run_leaf(
         self,
@@ -167,7 +260,12 @@ class CrossFittedRoutingGeometryExperimentOrchestrator(
                 budget=budget,
                 model_factory=model_factory,
             )
-            replay = FittedEnsembleRoutingReplay(show_progress=self.config.show_progress)
+            replay = FittedEnsembleRoutingReplay(
+                evaluator=RoutingReplayEvaluator(
+                    regression_tail_quantile=float(self.config.tail_risk_quantile),
+                ),
+                show_progress=self.config.show_progress,
+            )
             selection = replay.select_geometry_cross_fitted(
                 ensemble=ensemble,
                 X_val=prepared.X_validation,
@@ -176,6 +274,11 @@ class CrossFittedRoutingGeometryExperimentOrchestrator(
                 selector=self.selector,
                 n_folds=int(self.config.selection_folds),
                 random_state=int(prepared.seed) + 20_000,
+                regression_stratification_bins=(
+                    int(self.config.regression_stratification_bins)
+                    if self.config.regression_stratification_bins is not None
+                    else None
+                ),
                 metadata=identity,
             )
             validation_by_arm = self._results_by_arm(selection.validation_results)
@@ -307,6 +410,7 @@ class CrossFittedRoutingGeometryExperimentOrchestrator(
             summary = evidence.summary()
             primary_interval = summary.pop("confidence_interval")
             robust_interval = summary.pop("robust_confidence_interval")
+            tail_interval = summary.pop("tail_confidence_interval")
             row = json_ready(
                 {
                     **identity,
@@ -324,6 +428,12 @@ class CrossFittedRoutingGeometryExperimentOrchestrator(
                     ),
                     "robust_confidence_upper": (
                         None if robust_interval is None else robust_interval[1]
+                    ),
+                    "tail_confidence_lower": (
+                        None if tail_interval is None else tail_interval[0]
+                    ),
+                    "tail_confidence_upper": (
+                        None if tail_interval is None else tail_interval[1]
                     ),
                 }
             )
@@ -462,9 +572,19 @@ def run_rmt_cross_fitted_geometry_selector_experiment(
     seeds: Sequence[int] = DEFAULT_ROUTING_SEEDS,
     max_train_rows: Optional[int] = 100_000,
     selection_folds: int = 5,
+    regression_tail_guard: bool = False,
+    tail_risk_quantile: float = 0.90,
+    tail_noninferiority_margin: float = 0.005,
+    regression_stratification_bins: Optional[int] = None,
+    selector_arm_name: Optional[str] = None,
     output_dir: Optional[str | Path] = None,
     show_progress: bool = True,
 ) -> pd.DataFrame:
+    effective_selector_arm_name = selector_arm_name or (
+        DEFAULT_TAIL_GUARDED_SELECTOR_ARM_NAME
+        if regression_tail_guard
+        else DEFAULT_CROSS_FITTED_SELECTOR_ARM_NAME
+    )
     config = CrossFittedRoutingGeometryExperimentConfig(
         regression_tasks=(
             DEFAULT_CROSS_FITTED_REGRESSION_TASKS
@@ -481,10 +601,58 @@ def run_rmt_cross_fitted_geometry_selector_experiment(
         seeds=seeds,
         max_train_rows=max_train_rows,
         selection_folds=selection_folds,
+        selector_arm_name=effective_selector_arm_name,
+        regression_tail_guard=regression_tail_guard,
+        tail_risk_quantile=tail_risk_quantile,
+        tail_noninferiority_margin=tail_noninferiority_margin,
+        regression_stratification_bins=regression_stratification_bins,
         output_dir=None if output_dir is None else Path(output_dir),
         show_progress=show_progress,
     )
     return CrossFittedRoutingGeometryExperimentOrchestrator(config).run()
+
+
+def run_rmt_tail_guarded_geometry_selector_experiment(
+    *,
+    regression_tasks: Optional[Sequence[str]] = None,
+    classification_tasks: Optional[Sequence[str]] = None,
+    models: Sequence[str] = ("lightgbm",),
+    budget_ratios: Sequence[float] = DEFAULT_ROUTING_BUDGETS,
+    seeds: Sequence[int] = DEFAULT_ROUTING_SEEDS,
+    max_train_rows: Optional[int] = 100_000,
+    selection_folds: int = 5,
+    tail_risk_quantile: float = 0.90,
+    tail_noninferiority_margin: float = 0.005,
+    regression_stratification_bins: int = 10,
+    output_dir: Optional[str | Path] = None,
+    show_progress: bool = True,
+) -> pd.DataFrame:
+    """Run Phase A.3 with RMSE tail-risk gates on previously unseen tasks."""
+
+    return run_rmt_cross_fitted_geometry_selector_experiment(
+        regression_tasks=(
+            DEFAULT_TAIL_GUARD_REGRESSION_TASKS
+            if regression_tasks is None
+            else tuple(regression_tasks)
+        ),
+        classification_tasks=(
+            DEFAULT_TAIL_GUARD_CLASSIFICATION_TASKS
+            if classification_tasks is None
+            else tuple(classification_tasks)
+        ),
+        models=models,
+        budget_ratios=budget_ratios,
+        seeds=seeds,
+        max_train_rows=max_train_rows,
+        selection_folds=selection_folds,
+        regression_tail_guard=True,
+        tail_risk_quantile=tail_risk_quantile,
+        tail_noninferiority_margin=tail_noninferiority_margin,
+        regression_stratification_bins=regression_stratification_bins,
+        selector_arm_name=DEFAULT_TAIL_GUARDED_SELECTOR_ARM_NAME,
+        output_dir=output_dir,
+        show_progress=show_progress,
+    )
 
 
 def _parse_args() -> argparse.Namespace:
@@ -500,18 +668,36 @@ def _parse_args() -> argparse.Namespace:
         default=list(DEFAULT_ROUTING_BUDGETS),
     )
     parser.add_argument("--models", nargs="+", default=["lightgbm"])
+    parser.add_argument("--tail-risk-guard", action="store_true")
+    parser.add_argument("--tail-risk-quantile", type=float, default=0.90)
+    parser.add_argument("--tail-noninferiority-margin", type=float, default=0.005)
+    parser.add_argument("--regression-stratification-bins", type=int, default=10)
     parser.add_argument("--no-progress", action="store_true")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
-    table = run_rmt_cross_fitted_geometry_selector_experiment(
+    runner = (
+        run_rmt_tail_guarded_geometry_selector_experiment
+        if args.tail_risk_guard
+        else run_rmt_cross_fitted_geometry_selector_experiment
+    )
+    table = runner(
         models=tuple(args.models),
         budget_ratios=tuple(args.budgets),
         seeds=tuple(args.seeds),
         max_train_rows=args.max_train_rows,
         selection_folds=args.selection_folds,
+        **(
+            {
+                "tail_risk_quantile": args.tail_risk_quantile,
+                "tail_noninferiority_margin": args.tail_noninferiority_margin,
+                "regression_stratification_bins": args.regression_stratification_bins,
+            }
+            if args.tail_risk_guard
+            else {}
+        ),
         output_dir=args.output_dir,
         show_progress=not args.no_progress,
     )
