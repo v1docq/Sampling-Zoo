@@ -235,20 +235,42 @@ def write_tail_guard_holdout_figures(
         return
 
     budget_summary = build_holdout_budget_summary(comparison)
-    figure, axis = plt.subplots(figsize=(10, 5.5))
-    for task_name, values in budget_summary.groupby("task_name"):
+    grouped = list(budget_summary.groupby("task_name"))
+    n_columns = 2
+    n_rows = max(1, int(np.ceil(len(grouped) / n_columns)))
+    figure, axes = plt.subplots(
+        n_rows,
+        n_columns,
+        figsize=(12, 4 * n_rows),
+        squeeze=False,
+        sharex=True,
+    )
+    for axis, (task_name, values) in zip(axes.flat, grouped):
+        axis.plot(
+            values["budget_ratio"],
+            values["mean_gain_vs_a2"],
+            marker="o",
+            linewidth=1.8,
+            color="#3274a1",
+            label="Средний выигрыш",
+        )
         axis.plot(
             values["budget_ratio"],
             values["median_gain_vs_a2"],
-            marker="o",
-            linewidth=1.8,
-            label=task_name,
+            marker="s",
+            linewidth=1.4,
+            linestyle="--",
+            color="#e1812c",
+            label="Медианный выигрыш",
         )
-    axis.axhline(0.0, color="#555555", linewidth=0.8)
-    axis.set_xlabel("Доля бюджета")
-    axis.set_ylabel("Медианный относительный выигрыш A9 к A2")
-    axis.grid(alpha=0.25)
-    axis.legend(fontsize=8, ncol=2)
+        axis.axhline(0.0, color="#555555", linewidth=0.8)
+        axis.set_title(task_name)
+        axis.set_xlabel("Доля бюджета")
+        axis.set_ylabel("Относительный выигрыш A9 к A2")
+        axis.grid(alpha=0.25)
+        axis.legend(fontsize=8)
+    for axis in axes.flat[len(grouped):]:
+        axis.set_visible(False)
     figure.tight_layout()
     figure.savefig(output_dir / "tail_guard_holdout_gain_by_budget.png", dpi=180)
     plt.close(figure)
@@ -303,7 +325,7 @@ def write_tail_guard_holdout_artifacts(
         f"**{result.nonnegative_dataset_fraction:.1%}**.",
         f"Доля побед при выборе небазовой геометрии: "
         f"**{result.nonbaseline_win_rate:.1%}** "
-        f"({result.nonbaseline_selection_count} выборов).",
+        f"({result.nonbaseline_selection_count} небазовых решений).",
         f"Худший выигрыш основной метрики: **{result.worst_primary_gain:+.3%}**; "
         f"худший выигрыш TailMAE: **{result.worst_tail_gain:+.3%}**.",
         "",

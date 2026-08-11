@@ -1,0 +1,23 @@
+{
+  "spec": {
+    "min_nonnegative_dataset_fraction": 0.75,
+    "min_nonbaseline_win_rate": 0.8,
+    "max_primary_relative_degradation": 0.005,
+    "max_tail_relative_degradation": 0.01
+  },
+  "result": {
+    "passed": true,
+    "expected_records": 320,
+    "completed_records": 320,
+    "failed_records": 0,
+    "paired_runs": 80,
+    "median_gain_vs_a2": 0.0,
+    "mean_gain_vs_a2": 0.06024727854534075,
+    "nonnegative_dataset_fraction": 1.0,
+    "nonbaseline_selection_count": 33,
+    "nonbaseline_win_rate": 0.9696969696969697,
+    "worst_primary_gain": -5.190792226933187e-05,
+    "worst_tail_gain": -0.00739188651977704,
+    "violations": []
+  }
+}
