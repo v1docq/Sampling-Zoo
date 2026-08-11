@@ -20,6 +20,8 @@ for module_path in (ROOT_DIR, BENCHMARK_DIR):
     if str(module_path) not in sys.path:
         sys.path.insert(0, str(module_path))
 
+from rmt_experiment_utils import markdown_table  # noqa: E402
+
 REFERENCE_ARM = "A2_median_scaled_euclidean"
 DEFAULT_TAIL_GUARDED_SELECTOR_ARM_NAME = "A9_tail_guarded_cross_fitted_selected"
 DEFAULT_HOLDOUT_TASKS: tuple[str, ...] = (
@@ -204,6 +206,68 @@ def evaluate_tail_guard_holdout(
     return result, comparison, by_dataset
 
 
+def build_holdout_budget_summary(comparison: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate paired holdout gains without mixing budget levels."""
+
+    return (
+        comparison.groupby(["task_name", "budget_ratio"], as_index=False)
+        .agg(
+            paired_runs=("primary_gain_vs_a2", "size"),
+            median_gain_vs_a2=("primary_gain_vs_a2", "median"),
+            mean_gain_vs_a2=("primary_gain_vs_a2", "mean"),
+            median_tail_gain_vs_a2=("tail_gain_vs_a2", "median"),
+            nonbaseline_selection_rate=("selected_nonbaseline", "mean"),
+        )
+        .sort_values(["task_name", "budget_ratio"])
+        .reset_index(drop=True)
+    )
+
+
+def write_tail_guard_holdout_figures(
+    output_dir: Path,
+    comparison: pd.DataFrame,
+) -> None:
+    """Persist compact diagnostics for gain curves and selector behavior."""
+
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return
+
+    budget_summary = build_holdout_budget_summary(comparison)
+    figure, axis = plt.subplots(figsize=(10, 5.5))
+    for task_name, values in budget_summary.groupby("task_name"):
+        axis.plot(
+            values["budget_ratio"],
+            values["median_gain_vs_a2"],
+            marker="o",
+            linewidth=1.8,
+            label=task_name,
+        )
+    axis.axhline(0.0, color="#555555", linewidth=0.8)
+    axis.set_xlabel("Доля бюджета")
+    axis.set_ylabel("Медианный относительный выигрыш A9 к A2")
+    axis.grid(alpha=0.25)
+    axis.legend(fontsize=8, ncol=2)
+    figure.tight_layout()
+    figure.savefig(output_dir / "tail_guard_holdout_gain_by_budget.png", dpi=180)
+    plt.close(figure)
+
+    selection_counts = (
+        comparison["selected_arm_name_a9"]
+        .value_counts()
+        .sort_values(ascending=True)
+    )
+    figure, axis = plt.subplots(figsize=(10, 5.5))
+    axis.barh(selection_counts.index, selection_counts.values, color="#3274a1")
+    axis.set_xlabel("Число выборов")
+    axis.set_ylabel("Выбранная геометрия")
+    axis.grid(axis="x", alpha=0.25)
+    figure.tight_layout()
+    figure.savefig(output_dir / "tail_guard_holdout_selection_counts.png", dpi=180)
+    plt.close(figure)
+
+
 def write_tail_guard_holdout_artifacts(
     output_dir: Path,
     *,
@@ -215,6 +279,11 @@ def write_tail_guard_holdout_artifacts(
     output_dir.mkdir(parents=True, exist_ok=True)
     comparison.to_csv(output_dir / "tail_guard_holdout_pairs.csv", index=False)
     by_dataset.to_csv(output_dir / "tail_guard_holdout_by_dataset.csv", index=False)
+    budget_summary = build_holdout_budget_summary(comparison)
+    budget_summary.to_csv(
+        output_dir / "tail_guard_holdout_by_budget.csv",
+        index=False,
+    )
     payload = {"spec": asdict(spec), "result": result.to_dict()}
     (output_dir / "tail_guard_holdout_gate.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
@@ -238,6 +307,14 @@ def write_tail_guard_holdout_artifacts(
         f"Худший выигрыш основной метрики: **{result.worst_primary_gain:+.3%}**; "
         f"худший выигрыш TailMAE: **{result.worst_tail_gain:+.3%}**.",
         "",
+        "## Результаты по датасетам",
+        "",
+        markdown_table(by_dataset),
+        "",
+        "## Результаты по бюджетам",
+        "",
+        markdown_table(budget_summary),
+        "",
         "## Нарушения",
         "",
         *(f"- `{value}`" for value in result.violations),
@@ -248,6 +325,7 @@ def write_tail_guard_holdout_artifacts(
         "\n".join(rows) + "\n",
         encoding="utf-8",
     )
+    write_tail_guard_holdout_figures(output_dir, comparison)
 
 
 def run_rmt_tail_guard_holdout(

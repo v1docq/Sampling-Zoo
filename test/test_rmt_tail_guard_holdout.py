@@ -7,6 +7,7 @@ from examples.benchmark.rmt_tail_guard_holdout import (
     DEFAULT_TAIL_GUARDED_SELECTOR_ARM_NAME,
     REFERENCE_ARM,
     TailGuardHoldoutGateSpec,
+    build_holdout_budget_summary,
     evaluate_tail_guard_holdout,
 )
 
@@ -81,3 +82,26 @@ def test_holdout_gate_reports_worst_case_primary_violation() -> None:
 
     assert not result.passed
     assert "primary_worst_case_exceeds_limit" in result.violations
+
+
+def test_holdout_budget_summary_preserves_budget_identity() -> None:
+    replay = pd.concat(
+        [
+            _replay((9.8, 9.9)).assign(budget_ratio=0.05),
+            _replay((10.1, 9.7)).assign(budget_ratio=0.20),
+        ],
+        ignore_index=True,
+    )
+    _, comparison, _ = evaluate_tail_guard_holdout(
+        replay,
+        expected_records=16,
+        spec=TailGuardHoldoutGateSpec(
+            max_primary_relative_degradation=1.0,
+            max_tail_relative_degradation=1.0,
+        ),
+    )
+
+    summary = build_holdout_budget_summary(comparison)
+
+    assert summary["budget_ratio"].tolist() == [0.05, 0.20]
+    assert summary["paired_runs"].tolist() == [2, 2]
