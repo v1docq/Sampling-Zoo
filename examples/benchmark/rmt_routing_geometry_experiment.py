@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 import json
 from pathlib import Path
 import sys
+from time import perf_counter
 from typing import Any, Mapping, Optional, Sequence
 
 import numpy as np
@@ -67,6 +68,7 @@ class RoutingGeometryExperimentConfig:
     n_partitions: int = 5
     max_train_rows: Optional[int] = 100_000
     validation_fraction: float = 0.20
+    sampler_extra_params: Mapping[str, Any] = field(default_factory=dict)
     output_dir: Optional[Path] = None
     show_progress: bool = True
 
@@ -81,6 +83,7 @@ class RoutingGeometryExperimentConfig:
             raise ValueError("n_partitions must be positive")
         if not 0 < float(self.validation_fraction) < 1:
             raise ValueError("validation_fraction must be in (0, 1)")
+        object.__setattr__(self, "sampler_extra_params", dict(self.sampler_extra_params))
 
 
 @dataclass(frozen=True)
@@ -352,6 +355,16 @@ class RoutingGeometryExperimentOrchestrator:
         budget: float,
         model_factory: Any,
     ) -> SamplingEnsemble:
+        sampler_params = {
+            "view_strategy": "gaussian",
+            "embedding_mode": "sv_scaled",
+            "router": "spectral",
+            "routing_representation": "source_centroid",
+            "routing_metric": "squared_euclidean",
+            "routing_kernel": "softmax",
+            "show_progress": self.config.show_progress,
+            **dict(self.config.sampler_extra_params),
+        }
         config = make_chunking_strategy_configs(
             problem_type=prepared.dataset.problem_type,
             strategy_names=("rmt_contraction",),
@@ -361,15 +374,7 @@ class RoutingGeometryExperimentOrchestrator:
             budget_ratio=budget,
             force_chunking=True,
             extra_strategy_params={
-                "rmt_contraction": {
-                    "view_strategy": "gaussian",
-                    "embedding_mode": "sv_scaled",
-                    "router": "spectral",
-                    "routing_representation": "source_centroid",
-                    "routing_metric": "squared_euclidean",
-                    "routing_kernel": "softmax",
-                    "show_progress": self.config.show_progress,
-                }
+                "rmt_contraction": sampler_params
             },
         )["rmt_contraction"]
         ensemble = SamplingEnsemble(
@@ -379,6 +384,7 @@ class RoutingGeometryExperimentOrchestrator:
             ensemble_method="routed_weighted",
             show_progress=self.config.show_progress,
         )
+        fit_started = perf_counter()
         ensemble.train_partition_models(
             X_train=prepared.X_train,
             y_train=prepared.y_train,
@@ -397,6 +403,13 @@ class RoutingGeometryExperimentOrchestrator:
             train_all_chunks=True,
             save_models_to_disk=False,
         )
+        ensemble_fit_seconds = float(perf_counter() - fit_started)
+        sampler_diagnostics = getattr(ensemble.partitioner, "diagnostics_", None)
+        if isinstance(sampler_diagnostics, dict):
+            sampler_diagnostics["ensemble_fit_seconds"] = ensemble_fit_seconds
+            sampler_diagnostics["ensemble_training_runtime"] = dict(
+                getattr(ensemble, "runtime_diagnostics_", {})
+            )
         return ensemble
 
     def _leaf_identity(
@@ -591,7 +604,9 @@ def run_rmt_routing_geometry_experiment(
     models: Sequence[str] = ("lightgbm",),
     budget_ratios: Sequence[float] = DEFAULT_ROUTING_BUDGETS,
     seeds: Sequence[int] = DEFAULT_ROUTING_SEEDS,
+    n_partitions: int = 5,
     max_train_rows: Optional[int] = 100_000,
+    sampler_extra_params: Optional[Mapping[str, Any]] = None,
     output_dir: Optional[str | Path] = None,
     show_progress: bool = True,
 ) -> pd.DataFrame:
@@ -601,7 +616,9 @@ def run_rmt_routing_geometry_experiment(
         models=models,
         budget_ratios=budget_ratios,
         seeds=seeds,
+        n_partitions=n_partitions,
         max_train_rows=max_train_rows,
+        sampler_extra_params=dict(sampler_extra_params or {}),
         output_dir=None if output_dir is None else Path(output_dir),
         show_progress=show_progress,
     )
