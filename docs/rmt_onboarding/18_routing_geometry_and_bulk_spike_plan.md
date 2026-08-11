@@ -1,6 +1,6 @@
 # RMT routing geometry и bulk/spike experts: актуальный план разработки
 
-Дата актуализации: 2026-08-06. Статус: `phase_a_completed_selector_gate_implemented`.
+Дата актуализации: 2026-08-10. Статус: `phase_a2_cross_fitted_selector_implemented`.
 
 Формальная постановка проверки гипотез: [Эксперимент: routing geometry и bulk/spike experts](../rmt_contraction_algo/RMT%20routing%20geometry%20и%20bulk-spike%20experiment.md).
 
@@ -17,10 +17,11 @@
 | P2 | завершен для Phase A | Matrix/Torch kernels для scaled L2, shrinkage Mahalanobis, cosine и GMM posterior; row-wise routing diagnostics. |
 | P3 | завершен | Offline replay фиксированных expert outputs, validation-only temperature calibration, incremental artifacts и synthetic smoke. |
 | P3.1 | реализован, ожидает real-data gate | `ValidationRoutingGeometrySelector`, независимые calibration/selection holdouts и A7 selector arm с A2 fallback. |
+| P3.2 | реализован, ожидает малую проверку на реальных данных | `CrossFittedRoutingGeometrySelector`, попарные оценки на внутренних фолдах, надежный возврат к A2 и селектор A8. |
 | P4 | не начат | Component split и row participation реализуются только после real-data gate Phase A. |
 | P5-P6 | заблокированы gate-ом | Bulk/spike experts и full grid не запускаются до выбора routing geometry. |
 
-Targeted runners: `examples/benchmark/rmt_routing_geometry_experiment.py` для screening и `examples/benchmark/rmt_validation_geometry_selector_experiment.py` для честного selector gate. Быстрая локальная проверка: `examples/benchmark/rmt_routing_geometry_smoke.py`.
+Целевые сценарии запуска: `examples/benchmark/rmt_routing_geometry_experiment.py` для первичного отбора, `examples/benchmark/rmt_validation_geometry_selector_experiment.py` для A7 и `examples/benchmark/rmt_cross_fitted_geometry_selector_experiment.py` для устойчивой проверки A8. Быстрая локальная проверка: `examples/benchmark/rmt_routing_geometry_smoke.py`.
 
 ### Результат Phase A и следующий gate
 
@@ -32,7 +33,7 @@ Phase A завершен без ошибок: `1120/1120` leaf runs, восем�
 - squared Euclidean дает переуверенный routing и остается только воспроизводимым baseline;
 - diagonal/full Mahalanobis не проходят в основной selector до отдельной temperature/covariance ablation.
 
-Следующий gate выбирает один вариант из A2/A5/A6. Исходный validation split делится на calibration и geometry-selection части. Calibration используется для temperature и expert priors, selection выбирает arm, outer test оценивается один раз после выбора. Синтетический selector arm называется `A7_validation_selected_top3`; имя `B0` остается зарезервированным для bulk/spike topology.
+A7 показал, что выбор по одному разбиению валидационной выборки чувствителен к случайному составу строк. Поэтому A8 выбирает один вариант из A2/A5/A6 по пяти внутренним фолдам. На каждом фолде `temperature` и `expert_priors` оцениваются только по калибровочным строкам, а качество измеряется на непересекающихся строках. Внешняя тестовая выборка оценивается один раз после выбора. Синтетический селектор называется `A8_cross_fitted_selected`; имя `B0` остается зарезервированным для bulk/spike topology.
 
 ## 1. Принятые решения
 
@@ -173,6 +174,18 @@ Default остается `spectral_component_policy="explained_variance"` и `ex
 - сохранять candidate scores, причину выбора, fallback flag и выбранный arm;
 - не передавать outer-test данные в selector;
 - запускать A7 gate до начала bulk/spike topology.
+
+### P3.2. Устойчивый выбор геометрии по внутренним фолдам
+
+- использовать всю валидационную выборку как набор внутренних фолдов, не отделяя единственную выборку для выбора геометрии;
+- для каждого фолда оценивать `temperature` и веса надежности экспертов только на его калибровочной части;
+- вычислять попарный относительный выигрыш A5 и A6 относительно A2 на отложенной части каждого фолда;
+- пропускать кандидата только при неотрицательных среднем и медианном выигрыше, положительном выигрыше как минимум на двух третях фолдов и нижней границе 95% bootstrap-интервала не ниже `-0.005`;
+- для regression дополнительно применять те же ограничения по `MAE` как устойчивой метрике;
+- возвращать явный статус `fallback_to_a2`, если ни один кандидат не прошел все ограничения;
+- сохранять оценки каждого фолда, сводку обоснований и итоговое решение до обращения к внешней тестовой выборке.
+
+Первый запуск после слияния ограничен задачами `Brazilian_houses`, `elevators`, `adult`, `jannis`, пятью seeds и бюджетами `(0.01, 0.05, 0.10, 0.20)`. Ожидаемый объем: `4 datasets x 5 seeds x 4 budgets x 4 arms = 320` завершенных записей.
 
 ### P4. Component-aware spectral diagnostics
 

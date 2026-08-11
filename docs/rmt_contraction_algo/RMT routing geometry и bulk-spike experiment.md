@@ -161,6 +161,56 @@ results = run_rmt_validation_geometry_selector_experiment(
 
 A7 проходит gate, если улучшает средний paired rank относительно fixed A2, не увеличивает worst-case degradation и выбирает test-победителя чаще любой фиксированной geometry. `B0` не используется на этом этапе: идентификатор зарезервирован для bulk/spike baseline.
 
+### 4.6. Phase A.2: выбор геометрии по внутренним фолдам
+
+Единственное разбиение для калибровки и выбора из Phase A.1 дает мало наблюдений и может выбрать вариант из-за случайного состава валидационных строк. Phase A.2 использует `K=5` внутренних фолдов. Для каждого варианта и фолда:
+
+1. на калибровочной части выбирается `temperature`;
+2. на той же части заново оцениваются веса надежности экспертов;
+3. на отложенной части вычисляются основная метрика и, для regression, `MAE`;
+4. внешняя тестовая выборка остается недоступной до окончательного выбора варианта.
+
+Для кандидата `a` и базовой геометрии A2 относительный выигрыш на фолде `f` равен
+
+\[
+g_{a,f}=
+\begin{cases}
+\dfrac{L_{A2,f}-L_{a,f}}{|L_{A2,f}|+\varepsilon},
+& \text{для метрик, где меньше лучше},\\[6pt]
+\dfrac{S_{a,f}-S_{A2,f}}{|S_{A2,f}|+\varepsilon},
+& \text{для метрик, где больше лучше}.
+\end{cases}
+\]
+
+Кандидат проходит отбор, только если одновременно выполнены условия:
+
+\[
+\operatorname{mean}_f g_{a,f}\ge 0,
+\qquad
+\operatorname{median}_f g_{a,f}\ge 0,
+\]
+
+\[
+\frac{1}{K}\sum_f \mathbf{1}[g_{a,f}>0]\ge\frac{2}{3},
+\qquad
+CI^{95\%}_{\mathrm{bootstrap,lower}}(\bar g_a)\ge -0.005.
+\]
+
+Для regression аналогичная проверка неухудшения выполняется по `MAE`. Если A5 и A6 отклонены, решение получает статус `fallback_to_a2`. Если оба кандидата допустимы, выбирается вариант с наибольшей нижней границей доверительного интервала, затем с наибольшими медианным и средним выигрышем. Порядок входных записей на решение не влияет.
+
+```bash
+python examples/benchmark/rmt_cross_fitted_geometry_selector_experiment.py \
+  --selection-folds 5 \
+  --seeds 42 43 44 45 46 \
+  --budgets 0.01 0.05 0.10 0.20
+```
+
+Первая серия ограничена датасетами `Brazilian_houses`, `elevators`, `adult`, `jannis`. Она создает 320 основных записей и три дополнительных артефакта:
+
+- `cross_fitted_geometry_runs.jsonl` с одним решением на сочетание dataset/seed/budget/model;
+- `geometry_selection_fold_losses.csv` с метриками каждого варианта на каждом внутреннем фолде;
+- `geometry_selection_summary.csv` с bootstrap-интервалами, долей положительных фолдов и причинами отклонения кандидатов.
+
 ## 5. Phase B: Bulk/Spike Hierarchical Experts
 
 ### 5.1. Спектральное разделение
@@ -267,11 +317,13 @@ Phase B:
 2. [x] Выполнить synthetic routing smoke для regression и multiclass classification.
 3. [x] Запустить real-data Phase A с LightGBM: `1120/1120`, `0 failed`.
 4. [x] Реализовать независимый calibration/selection split и A7 selector contracts.
-5. [ ] Запустить real-data A7 selector gate и зафиксировать routing policy.
-6. Реализовать component split и row participation contracts.
-7. Выполнить synthetic bulk/spike gate.
-8. Запустить B0-B4 screening с LightGBM.
-9. Перепроверить только прошедшие gate варианты с TabPFN.
-10. После этого расширять эксперимент на полную AMLB grid.
+5. [x] Запустить real-data A7 selector gate и выявить чувствительность выбора к одному holdout-разбиению.
+6. [x] Реализовать cross-fitted A8 selector и инкрементальные артефакты доказательств.
+7. [ ] Запустить малый real-data A8 gate на четырех датасетах и 320 записях.
+8. Реализовать component split и row participation contracts.
+9. Выполнить synthetic bulk/spike gate.
+10. Запустить B0-B4 screening с LightGBM.
+11. Перепроверить только прошедшие gate варианты с TabPFN.
+12. После этого расширять эксперимент на полную AMLB grid.
 
 Полный benchmark нельзя запускать сразу после реализации: точкой первого повторного запуска является synthetic Phase A smoke, а первой значимой real-data серией является Phase A LightGBM screening.
