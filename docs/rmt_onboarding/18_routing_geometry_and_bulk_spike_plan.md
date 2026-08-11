@@ -18,11 +18,12 @@
 | P3 | завершен | Offline replay фиксированных expert outputs, validation-only temperature calibration, incremental artifacts и synthetic smoke. |
 | P3.1 | реализован, ожидает real-data gate | `ValidationRoutingGeometrySelector`, независимые calibration/selection holdouts и A7 selector arm с A2 fallback. |
 | P3.2 | реализован | `CrossFittedRoutingGeometrySelector`, попарные оценки на внутренних фолдах, надежный возврат к A2 и селектор A8. |
-| P3.3 | реализован, ожидает малую проверку на реальных данных | Селектор A9 с контролем хвостовой ошибки, стратификацией регрессионных фолдов по рангам целевой переменной и проверкой совместимости возобновляемого запуска. |
-| P4 | не начат | Component split и row participation реализуются только после real-data gate Phase A. |
+| P3.3 | первичная проверка завершена | Селектор A9 проверен на 320 запусках без ошибок. Он изменил три решения A8, во всех трёх улучшил основную метрику и в двух улучшил `TailMAE`. Перед фиксацией политики требуется независимая регрессионная проверка. |
+| P3.4 | реализован, ожидает запуска | `rmt_tail_guard_holdout.py` фиксирует четыре новые регрессионные задачи, неизменяемые пороги и машиночитаемый критерий допуска. |
+| P4 | следующий этап реализации | Контракты leverage-семплирования, точный бюджет и диагностика сохранения подпространства. |
 | P5-P6 | заблокированы gate-ом | Bulk/spike experts и full grid не запускаются до выбора routing geometry. |
 
-Целевые сценарии запуска: `examples/benchmark/rmt_routing_geometry_experiment.py` для первичного отбора, `examples/benchmark/rmt_validation_geometry_selector_experiment.py` для A7 и `examples/benchmark/rmt_cross_fitted_geometry_selector_experiment.py` для устойчивых проверок A8/A9. Быстрая локальная проверка: `examples/benchmark/rmt_routing_geometry_smoke.py`.
+Целевые сценарии запуска: `examples/benchmark/rmt_routing_geometry_experiment.py` для первичного отбора, `examples/benchmark/rmt_validation_geometry_selector_experiment.py` для A7, `examples/benchmark/rmt_cross_fitted_geometry_selector_experiment.py` для A8/A9 и `examples/benchmark/rmt_tail_guard_holdout.py` для независимого подтверждения A9. Быстрая локальная проверка: `examples/benchmark/rmt_routing_geometry_smoke.py`.
 
 ### Результат Phase A и следующий gate
 
@@ -206,6 +207,10 @@ k=\max\left(1,\left\lceil(1-q)n\right\rceil\right),
 Первый подтверждающий запуск A9 использует задачи, не входившие в Phase A.2: `diamonds`, `OnlineNewsPopularity`, `bank-marketing`, `covertype`. Пороги A8/A9 по результатам внешней тестовой выборки не перенастраиваются. Решение A8 можно восстановить из артефактов внутренних фолдов A9 с отключенным хвостовым ограничением, поэтому повторное обучение моделей для контрфактического сравнения не требуется.
 
 Каталоги A8 и A9 не взаимозаменяемы: механизм возобновления отклоняет существующий каталог с другой семантикой селектора, числом фолдов, хвостовым порогом или схемой стратификации.
+
+Первичная проверка Phase A.3 завершена на задачах `diamonds`, `OnlineNewsPopularity`, `bank-marketing` и `covertype`: получено 320 из 320 записей без ошибок. A9 выбрал A2 38 раз, A5 — 6 раз, A6 — 36 раз. Среди 42 выборов небазовой геометрии 40 улучшили A2. Хвостовое ограничение изменило три решения A8; основная метрика улучшилась во всех трёх случаях, а `TailMAE` — в двух.
+
+Независимая проверка P3.4 использует только новые регрессионные задачи `house_16H`, `house_sales`, `pol` и `topo_2_1`. Значения `q=0.9`, `tail_noninferiority_margin=0.005`, пять внутренних фолдов, пять значений `seed` и бюджеты `(0.01, 0.05, 0.10, 0.20)` зафиксированы до запуска. Критерий допуска требует неотрицательной общей медианы, неотрицательной медианы минимум на трёх из четырёх задач, не менее 80% побед при выборе A5/A6, максимального ухудшения основной метрики не более 0,5% и `TailMAE` не более 1%.
 
 ### P4. Component-aware spectral diagnostics
 
