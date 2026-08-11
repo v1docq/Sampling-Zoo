@@ -12,6 +12,13 @@ from sklearn.cluster import KMeans
 from .backend.matrix_backend import MatrixRMTBackend
 from .backend.tensor_backend import TensorRMTBackend
 from .base_sampler import SpectralSamplerBase
+from .bulk_spike import (
+    ComponentSplitStatus,
+    RowSpectralParticipationContract,
+    SpectralComponentSplitContract,
+    build_spectral_component_split,
+    compute_row_spectral_participation,
+)
 from .cluster_selection import ClusterSelectionResult, SpectralClusterSelector
 from .classification_sampling import (
     ClassCoverageSelectionPlan,
@@ -126,6 +133,7 @@ class RMTContractionConfig:
     null_quantile: float = 0.95
     null_min_selection_frequency: float = 0.80
     null_primary_policy: str = "feature_permutation"
+    component_diagnostic_enabled: bool = False
     subspace_diagnostic_enabled: bool = False
     subspace_resamples: int = 16
     subspace_quantile: float = 0.90
@@ -470,6 +478,12 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             random_state=cfg.random_state,
         )
         self.spectral_null_diagnostic = SpectralNullDiagnostic(null_config)
+        self.component_diagnostic_enabled = bool(cfg.component_diagnostic_enabled)
+        if self.component_diagnostic_enabled and not null_config.enabled:
+            raise ValueError(
+                "component_diagnostic_enabled=True requires "
+                "null_diagnostic_enabled=True"
+            )
         subspace_config = SpectralSubspaceDiagnosticConfig.from_values(
             enabled=cfg.subspace_diagnostic_enabled,
             n_resamples=cfg.subspace_resamples,
@@ -504,6 +518,7 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self.cluster_selector_ = self._make_cluster_selector()
         self.cluster_centers_: Optional[np.ndarray] = None
         self.initial_singular_values_: Optional[np.ndarray] = None
+        self.initial_left_basis_: Optional[np.ndarray] = None
         self.left_basis_: Optional[np.ndarray] = None
         self.spectral_null_diagnostic_result_ = SpectralNullDiagnosticResult.disabled(
             null_config.primary_policy
@@ -526,6 +541,17 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self.partition_subspace_preservation_: Dict[
             str, SubspacePreservationContract
         ] = {}
+        self.spectral_component_split_ = (
+            SpectralComponentSplitContract.unavailable(
+                (),
+                status=ComponentSplitStatus.DISABLED,
+                min_selection_frequency=null_config.min_selection_frequency,
+                reason="component diagnostics are disabled",
+            )
+        )
+        self.row_spectral_participation_: Optional[
+            RowSpectralParticipationContract
+        ] = None
 
     @staticmethod
     def _normalize_ridge_leverage_lambda(value: Union[float, str]) -> Union[float, str]:
@@ -705,7 +731,7 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         with progress_bar(
             enabled=self.show_progress,
             desc="RMT sampler fit",
-            total=8,
+            total=9,
         ) as stage:
             started = perf_counter()
             rng = self._start_fit()
@@ -726,6 +752,10 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             started = perf_counter()
             self._fit_spectral_null_diagnostic(X_num)
             stage_seconds["null_diagnostics"] = perf_counter() - started
+            stage.update(1)
+            started = perf_counter()
+            self._fit_component_diagnostics()
+            stage_seconds["component_diagnostics"] = perf_counter() - started
             stage.update(1)
             started = perf_counter()
             self._fit_spectral_subspace_diagnostic(X_num)
@@ -758,6 +788,7 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self._rmt_backend = self._make_rmt_backend()
         self.view_specs_ = []
         self.initial_singular_values_ = None
+        self.initial_left_basis_ = None
         self.left_basis_ = None
         self.spectral_null_diagnostic_result_ = SpectralNullDiagnosticResult.disabled(
             self.spectral_null_diagnostic.config.primary_policy
@@ -780,6 +811,17 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self.partition_geometry_ = None
         self.last_routing_distances_ = None
         self.last_routing_weights_ = None
+        self.spectral_component_split_ = (
+            SpectralComponentSplitContract.unavailable(
+                (),
+                status=ComponentSplitStatus.DISABLED,
+                min_selection_frequency=(
+                    self.spectral_null_diagnostic.config.min_selection_frequency
+                ),
+                reason="component diagnostics are disabled",
+            )
+        )
+        self.row_spectral_participation_ = None
         if self.n_views_requested == "auto":
             self.n_views = self.min_views
         return np.random.default_rng(self.random_state)
@@ -819,6 +861,7 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         n_samples, n_features = self._matrix_shape(M)
         initial_rank = self._resolve_initial_rank(n_samples, n_features)
         basis = self._get_rmt_backend().compute_spectral_basis(M, rank=initial_rank)
+        self.initial_left_basis_ = np.asarray(basis.U, dtype=np.float64).copy()
         self.initial_singular_values_ = np.asarray(
             basis.singular_values,
             dtype=np.float64,
@@ -883,6 +926,39 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
                 spectrum_evaluator=evaluate_spectrum,
                 on_progress=lambda: progress.update(1),
             )
+
+    def _fit_component_diagnostics(self) -> None:
+        singular = (
+            np.asarray(self.initial_singular_values_, dtype=float)
+            if self.initial_singular_values_ is not None
+            else np.asarray([], dtype=float)
+        )
+        threshold = (
+            self.spectral_null_diagnostic.config.min_selection_frequency
+        )
+        if not self.component_diagnostic_enabled:
+            self.spectral_component_split_ = (
+                SpectralComponentSplitContract.unavailable(
+                    singular,
+                    status=ComponentSplitStatus.DISABLED,
+                    min_selection_frequency=threshold,
+                    reason="component diagnostics are disabled",
+                )
+            )
+            self.row_spectral_participation_ = None
+            return
+        if self.initial_left_basis_ is None:
+            raise RuntimeError("Initial left spectral basis is not available")
+        split = build_spectral_component_split(
+            singular,
+            self.spectral_null_diagnostic_result_,
+            min_selection_frequency=threshold,
+        )
+        self.spectral_component_split_ = split
+        self.row_spectral_participation_ = compute_row_spectral_participation(
+            self.initial_left_basis_,
+            split,
+        )
 
     def _fit_spectral_subspace_diagnostic(self, X: np.ndarray) -> None:
         if self.left_basis_ is None:
@@ -1808,6 +1884,14 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             "null_max_outlier_excess": null_result.max_outlier_excess,
             "null_successful_resamples": null_result.successful_resamples,
             "spectral_null_diagnostic": null_diagnostic,
+            "spectral_component_split": (
+                self.spectral_component_split_.to_dict(include_arrays=True)
+            ),
+            "row_spectral_participation": (
+                self.row_spectral_participation_.to_dict()
+                if self.row_spectral_participation_ is not None
+                else None
+            ),
             "subspace_stability_status": subspace_result.status.value,
             "subspace_comparison_rank": subspace_result.comparison_rank,
             "subspace_rank_source": subspace_result.rank_source,
