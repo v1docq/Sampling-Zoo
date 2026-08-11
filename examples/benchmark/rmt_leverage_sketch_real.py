@@ -49,6 +49,7 @@ class RealLeverageSketchArm:
         return {
             "selection_method": self.selection_method,
             "training_reweighting": self.training_reweighting,
+            "class_allocation_policy": "proportional",
             "leverage_mixture_alpha": float(self.leverage_mixture_alpha),
             "leverage_cap_quantile": float(self.leverage_cap_quantile),
         }

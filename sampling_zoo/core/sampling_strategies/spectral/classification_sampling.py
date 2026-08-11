@@ -8,7 +8,10 @@ from typing import Any, Sequence
 import numpy as np
 from sklearn.utils.multiclass import type_of_target
 
-from .leverage_sketch import combine_stratified_sketch_plans
+from .leverage_sketch import (
+    build_deterministic_sketch_plan,
+    combine_stratified_sketch_plans,
+)
 from .partition_sampling import build_partition_sketch_plan
 from .sketch_contracts import ExactBudgetSketchPlan
 
@@ -252,17 +255,34 @@ def select_class_aware_partition_indices(
         label for label, count in selected_pairs if int(count) < minimum
     )
     drift = _distribution_total_variation(source_counts, selected_counts)
-    selected_probabilities = np.concatenate(
-        [plan.selected_probabilities for plan in sketch_plans]
-    )
-    training_weights = np.concatenate(
-        [plan.training_weights for plan in sketch_plans]
-    )
-    combined_sketch_plan = combine_stratified_sketch_plans(
-        indices,
-        sketch_plans,
-        scores=scores,
-    )
+    if allocation_policy == "proportional":
+        combined_sketch_plan = combine_stratified_sketch_plans(
+            indices,
+            sketch_plans,
+            scores=scores,
+        )
+    else:
+        if str(training_reweighting).strip().lower() == "inverse_probability":
+            raise ValueError(
+                "training_reweighting='inverse_probability' requires "
+                "class_allocation_policy='proportional'; exact first-order "
+                "inclusion probabilities are unavailable for the sequential "
+                "minimum_then_global policy"
+            )
+        combined_sketch_plan = build_deterministic_sketch_plan(
+            indices,
+            selected,
+            policy=selection_method,
+            scores=scores,
+            metadata={
+                "stratified": True,
+                "sequential": True,
+                "class_allocation_policy": allocation_policy,
+                "n_stages": len(sketch_plans),
+            },
+        )
+    selected_probabilities = combined_sketch_plan.selected_probabilities
+    training_weights = combined_sketch_plan.training_weights
     return ClassCoverageSelectionPlan(
         selected_indices=selected,
         target_size=resolved_size,

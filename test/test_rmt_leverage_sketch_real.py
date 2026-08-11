@@ -20,6 +20,10 @@ def test_real_phase_s_expected_record_count() -> None:
     )
 
     assert config.expected_a9_records == 2 * 1 * 2 * 2 * len(DEFAULT_REAL_ARMS)
+    assert all(
+        arm.sampler_params()["class_allocation_policy"] == "proportional"
+        for arm in config.arms
+    )
 
 
 def test_real_phase_s_pairing_respects_metric_direction(tmp_path) -> None:

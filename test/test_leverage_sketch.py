@@ -131,6 +131,27 @@ def test_class_aware_sketch_preserves_exact_budget_and_weights() -> None:
     assert all(count >= 2 for _label, count in plan.selected_class_counts)
 
 
+def test_sequential_class_allocation_rejects_unidentifiable_ipw() -> None:
+    target = np.repeat(np.asarray([0, 1]), [12, 8])
+    embedding = np.column_stack(
+        [np.arange(target.size, dtype=float), np.ones(target.size)]
+    )
+
+    with pytest.raises(ValueError, match="class_allocation_policy='proportional'"):
+        select_class_aware_partition_indices(
+            np.arange(target.size),
+            target=target,
+            target_size=10,
+            min_samples_per_class=1,
+            class_allocation_policy="minimum_then_global",
+            selection_method="robust_leverage_mixture",
+            scores=np.linspace(0.1, 1.0, target.size),
+            embedding=embedding,
+            random_state=7,
+            training_reweighting="inverse_probability",
+        )
+
+
 def test_matrix_ridge_leverage_is_finite_and_has_effective_dimension() -> None:
     rng = np.random.default_rng(9)
     matrix = rng.normal(size=(40, 5))
