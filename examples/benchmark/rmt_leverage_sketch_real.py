@@ -7,11 +7,21 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 import json
 from pathlib import Path
+import sys
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
 from tqdm.auto import tqdm
+
+
+ROOT_DIR = Path(__file__).resolve().parents[2]
+BENCHMARK_DIR = Path(__file__).resolve().parent
+for module_path in (ROOT_DIR, BENCHMARK_DIR):
+    if str(module_path) not in sys.path:
+        sys.path.insert(0, str(module_path))
+
+from rmt_experiment_utils import markdown_table
 
 
 DEFAULT_REAL_REGRESSION_TASKS: tuple[str, ...] = (
@@ -435,11 +445,11 @@ class RealLeverageSketchOrchestrator:
             "",
             "## Общий рейтинг",
             "",
-            ranking.to_markdown(index=False, floatfmt=".6f"),
+            markdown_table(ranking),
             "",
             "## Gate для R3_robust_mixture_ipw",
             "",
-            pd.DataFrame(gate["by_dataset"]).to_markdown(index=False, floatfmt=".6f"),
+            markdown_table(pd.DataFrame(gate["by_dataset"])),
             "",
             "Положительный gain означает улучшение относительно `R0_uniform` при одинаковых датасете, бюджете, модели и начальном значении генератора.",
         ]

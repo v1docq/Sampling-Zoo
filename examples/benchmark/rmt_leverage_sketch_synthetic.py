@@ -19,8 +19,10 @@ from tqdm.auto import tqdm
 
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
+BENCHMARK_DIR = Path(__file__).resolve().parent
+for module_path in (ROOT_DIR, BENCHMARK_DIR):
+    if str(module_path) not in sys.path:
+        sys.path.insert(0, str(module_path))
 
 from sampling_zoo.core.sampling_strategies.spectral.backend.matrix_backend import (  # noqa: E402
     MatrixRMTBackend,
@@ -30,6 +32,7 @@ from sampling_zoo.core.sampling_strategies.spectral.leverage_sketch import (  # 
     build_exact_budget_sketch_plan,
     evaluate_subspace_preservation,
 )
+from rmt_experiment_utils import markdown_table  # noqa: E402
 
 
 DEFAULT_SCENARIOS: tuple[str, ...] = (
@@ -560,25 +563,19 @@ class LeverageSketchSyntheticOrchestrator:
             "",
             "## Общий рейтинг политик",
             "",
-            ranking.to_markdown(index=False, floatfmt=".6f"),
+            markdown_table(ranking),
             "",
             "## Кандидаты для Phase S на реальных данных",
             "",
-            pd.DataFrame(gate["shortlisted_arms"]).to_markdown(
-                index=False,
-                floatfmt=".6f",
-            ),
+            markdown_table(pd.DataFrame(gate["shortlisted_arms"])),
             "",
             "## Эффекты по сценариям",
             "",
-            by_scenario.to_markdown(index=False, floatfmt=".6f"),
+            markdown_table(by_scenario),
             "",
             "## Диагностические контроли для реальных данных",
             "",
-            pd.DataFrame(gate["diagnostic_arms"]).to_markdown(
-                index=False,
-                floatfmt=".6f",
-            ),
+            markdown_table(pd.DataFrame(gate["diagnostic_arms"])),
             "",
             "## Интерпретация",
             "",
