@@ -4,6 +4,7 @@ import pandas as pd
 
 from examples.benchmark.rmt_leverage_sketch_real import (
     DEFAULT_REAL_ARMS,
+    RealLeverageSketchArm,
     RealLeverageSketchConfig,
     RealLeverageSketchOrchestrator,
 )
@@ -65,3 +66,30 @@ def test_real_phase_s_pairing_respects_metric_direction(tmp_path) -> None:
     assert candidate["primary_gain_vs_uniform"] == 0.1
     assert candidate["tail_gain_vs_uniform"] == 0.1
     assert candidate["gram_error_delta_vs_uniform"] == -0.2
+
+
+def test_real_phase_s_flattens_canonical_tail_metric() -> None:
+    record = {
+        "dataset": "diamonds",
+        "problem_type": "regression",
+        "seed": 1,
+        "budget_ratio": 0.1,
+        "model": "lightgbm",
+        "status": "completed",
+        "test": {
+            "primary_metric": "rmse",
+            "primary_value": 9.0,
+            "metrics": {
+                "rmse": 9.0,
+                "mae": 5.0,
+                "tail_mean_absolute_error": 12.5,
+            },
+        },
+    }
+
+    flattened = RealLeverageSketchOrchestrator._flatten_a9_record(
+        record,
+        RealLeverageSketchArm("R0_uniform", "uniform"),
+    )
+
+    assert flattened["tail_mae"] == 12.5

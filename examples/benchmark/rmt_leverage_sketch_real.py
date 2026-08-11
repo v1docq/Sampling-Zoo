@@ -263,7 +263,10 @@ class RealLeverageSketchOrchestrator:
             "primary_value": test.get("primary_value"),
             "rmse": metrics.get("rmse"),
             "mae": metrics.get("mae"),
-            "tail_mae": metrics.get("tail_mae"),
+            "tail_mae": metrics.get(
+                "tail_mean_absolute_error",
+                metrics.get("tail_mae"),
+            ),
             "roc_auc": metrics.get("roc_auc"),
             "log_loss": metrics.get("log_loss"),
             "n_experts": record.get("n_experts"),
