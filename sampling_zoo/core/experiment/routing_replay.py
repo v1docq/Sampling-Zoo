@@ -29,6 +29,30 @@ def _readonly(value: Any) -> np.ndarray:
     return array
 
 
+def upper_tail_mean_absolute_error(
+    y_true: Any,
+    y_pred: Any,
+    *,
+    quantile: float = 0.90,
+) -> float:
+    """Return the empirical CVaR of absolute error above ``quantile``."""
+
+    if not 0.0 <= float(quantile) < 1.0:
+        raise ValueError("quantile must be in [0, 1)")
+    target = np.asarray(y_true, dtype=float).reshape(-1)
+    prediction = np.asarray(y_pred, dtype=float).reshape(-1)
+    if target.shape != prediction.shape:
+        raise ValueError("y_true and y_pred must have the same shape")
+    if target.size < 1:
+        raise ValueError("y_true and y_pred must be non-empty")
+    errors = np.abs(target - prediction)
+    if not np.all(np.isfinite(errors)):
+        raise ValueError("absolute errors must be finite")
+    tail_size = max(1, int(np.ceil((1.0 - float(quantile)) * errors.size)))
+    tail = np.partition(errors, errors.size - tail_size)[-tail_size:]
+    return float(np.mean(tail))
+
+
 @dataclass(frozen=True)
 class RoutingReplayRequest:
     """Cached validation/test state needed to replay routing without model fitting."""
@@ -257,8 +281,16 @@ class ValidationRoutingGeometrySelector:
 class RoutingReplayEvaluator:
     """Pure evaluator and temperature selector for cached chunk-model outputs."""
 
-    def __init__(self, backend: Optional[MatrixRMTBackend] = None) -> None:
+    def __init__(
+        self,
+        backend: Optional[MatrixRMTBackend] = None,
+        *,
+        regression_tail_quantile: float = 0.90,
+    ) -> None:
+        if not 0.0 <= float(regression_tail_quantile) < 1.0:
+            raise ValueError("regression_tail_quantile must be in [0, 1)")
         self.backend = backend or MatrixRMTBackend()
+        self.regression_tail_quantile = float(regression_tail_quantile)
 
     def evaluate(
         self,
@@ -290,6 +322,10 @@ class RoutingReplayEvaluator:
         blended = self._blend(weights, request.expert_outputs, request.problem_type)
         metrics, primary_metric = self._evaluate_output(request, blended)
         diagnostics = self._expert_alignment_diagnostics(request, weights, blended)
+        if request.problem_type == "regression":
+            diagnostics["tail_absolute_error_quantile"] = (
+                self.regression_tail_quantile
+            )
         return RoutingReplayResult(
             arm_name=request.arm_name,
             temperature=selected_temperature,
@@ -353,8 +389,8 @@ class RoutingReplayEvaluator:
         probabilities = np.clip(probabilities, 1e-15, 1.0)
         return probabilities / np.sum(probabilities, axis=1, keepdims=True)
 
-    @staticmethod
     def _evaluate_output(
+        self,
         request: RoutingReplayRequest,
         blended: np.ndarray,
     ) -> tuple[dict[str, float], str]:
@@ -366,6 +402,11 @@ class RoutingReplayEvaluator:
                 problem_type="regression",
             )
             metrics["mae"] = float(mean_absolute_error(request.target, blended))
+            metrics["tail_mean_absolute_error"] = upper_tail_mean_absolute_error(
+                request.target,
+                blended,
+                quantile=self.regression_tail_quantile,
+            )
             return {name: float(value) for name, value in metrics.items()}, "rmse"
 
         classes = np.asarray(request.classes)

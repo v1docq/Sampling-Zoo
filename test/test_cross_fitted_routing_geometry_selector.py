@@ -8,6 +8,7 @@ from sampling_zoo.core.experiment.routing_geometry_selection import (
     CrossFittedRoutingGeometrySelectionSpec,
     CrossFittedRoutingGeometrySelector,
     RoutingGeometryFoldScore,
+    RoutingGeometryTailRiskScore,
 )
 
 
@@ -21,6 +22,7 @@ def _regression_score(
     *,
     rmse: float,
     mae: float,
+    tail_error: float | None = None,
 ) -> RoutingGeometryFoldScore:
     return RoutingGeometryFoldScore(
         arm_name=arm_name,
@@ -31,6 +33,16 @@ def _regression_score(
         robust_metric="mae",
         robust_value=mae,
         robust_direction="lower",
+        tail_risk=(
+            RoutingGeometryTailRiskScore(
+                metric="tail_mean_absolute_error",
+                value=tail_error,
+                direction="lower",
+                quantile=0.90,
+            )
+            if tail_error is not None
+            else None
+        ),
         evaluation_rows=20,
         selected_temperature=0.5,
     )
@@ -106,6 +118,81 @@ def test_selector_robust_gate_blocks_rmse_only_improvement() -> None:
     )
 
 
+def test_tail_gate_blocks_candidate_that_improves_rmse_and_mae() -> None:
+    scores = []
+    for fold in range(5):
+        scores.extend(
+            (
+                _regression_score(
+                    REFERENCE,
+                    fold,
+                    rmse=10.0,
+                    mae=8.0,
+                    tail_error=20.0,
+                ),
+                _regression_score(
+                    CANDIDATE,
+                    fold,
+                    rmse=9.0,
+                    mae=7.5,
+                    tail_error=25.0,
+                ),
+            )
+        )
+
+    decision = _selector(tail_guard_primary_metrics=("rmse",)).select(scores)
+
+    assert decision.status == "fallback_to_a2"
+    assert decision.selected_arm == REFERENCE
+    assert "tail_mean_exceeds_harm_margin" in decision.evidence[0].rejection_reasons
+    assert decision.evidence[0].tail_mean_relative_gain == pytest.approx(-0.25)
+
+
+def test_tail_diagnostics_do_not_change_a8_without_tail_gate() -> None:
+    scores = []
+    for fold in range(5):
+        scores.extend(
+            (
+                _regression_score(
+                    REFERENCE,
+                    fold,
+                    rmse=10.0,
+                    mae=8.0,
+                    tail_error=20.0,
+                ),
+                _regression_score(
+                    CANDIDATE,
+                    fold,
+                    rmse=9.0,
+                    mae=7.5,
+                    tail_error=25.0,
+                ),
+            )
+        )
+
+    decision = _selector().select(scores)
+
+    assert decision.status == "selected"
+    assert decision.selected_arm == CANDIDATE
+    assert decision.evidence[0].tail_mean_relative_gain == pytest.approx(-0.25)
+
+
+def test_required_tail_metric_must_be_present_for_rmse() -> None:
+    scores = []
+    for fold in range(5):
+        scores.extend(
+            (
+                _regression_score(REFERENCE, fold, rmse=10.0, mae=8.0),
+                _regression_score(CANDIDATE, fold, rmse=9.0, mae=7.5),
+            )
+        )
+
+    decision = _selector(tail_guard_primary_metrics=("rmse",)).select(scores)
+
+    assert decision.status == "fallback_to_a2"
+    assert "tail_metric_required" in decision.evidence[0].rejection_reasons
+
+
 def test_higher_is_better_metric_is_converted_to_positive_gain() -> None:
     scores = []
     for fold in range(3):
@@ -131,7 +218,10 @@ def test_higher_is_better_metric_is_converted_to_positive_gain() -> None:
                 ),
             )
         )
-    selector = _selector(require_robust_metric=False)
+    selector = _selector(
+        require_robust_metric=False,
+        tail_guard_primary_metrics=("rmse",),
+    )
 
     decision = selector.select(scores)
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 
 import numpy as np
 import pandas as pd
@@ -12,11 +13,13 @@ from sampling_zoo.core.experiment.routing_replay import (
     RoutingReplayRequest,
     RoutingReplayResult,
     ValidationRoutingGeometrySelector,
+    upper_tail_mean_absolute_error,
 )
 from sampling_zoo.core.experiment.routing_geometry_selection import (
     CrossFittedRoutingGeometrySelectionSpec,
     CrossFittedRoutingGeometrySelector,
 )
+from sampling_zoo.core.experiment.errors import ResumeCompatibilityError
 from sampling_zoo.core.sampling_strategies.spectral.backend.matrix_backend import MatrixRMTBackend
 from sampling_zoo.core.sampling_strategies.spectral.backend.tensor_backend import TensorRMTBackend
 from sampling_zoo.core.sampling_strategies.spectral.rmt_contraction_sampler import (
@@ -326,6 +329,55 @@ def test_temperature_replay_selects_better_regression_routing() -> None:
     assert selection.best.temperature == 0.1
     assert selection.best.primary_metric == "rmse"
     assert selection.best.diagnostics["oracle_expert_regret"] >= 0.0
+    assert "tail_mean_absolute_error" in selection.best.metrics
+    assert selection.best.diagnostics["tail_absolute_error_quantile"] == pytest.approx(0.9)
+
+
+def test_upper_tail_mean_absolute_error_uses_worst_requested_fraction() -> None:
+    target = np.zeros(10)
+    prediction = np.arange(10, dtype=float)
+
+    value = upper_tail_mean_absolute_error(target, prediction, quantile=0.8)
+
+    assert value == pytest.approx(8.5)
+
+
+def test_regression_stratification_balances_target_rank_bins() -> None:
+    target = np.linspace(-5.0, 5.0, 100)
+    labels = FittedEnsembleRoutingReplay._regression_stratification_labels(
+        target,
+        n_folds=5,
+        requested_bins=10,
+    )
+    splits = FittedEnsembleRoutingReplay._selection_splits(
+        target,
+        problem_type="regression",
+        n_folds=5,
+        random_state=91,
+        regression_stratification_bins=10,
+    )
+
+    assert set(labels) == set(range(10))
+    assert all(set(labels[evaluation]) == set(range(10)) for _, evaluation in splits)
+
+
+def test_tail_guarded_config_keeps_classification_and_validates_tail_policy() -> None:
+    config = CrossFittedRoutingGeometryExperimentConfig(
+        regression_tasks=("regression",),
+        classification_tasks=("classification",),
+        regression_tail_guard=True,
+        tail_risk_quantile=0.9,
+        regression_stratification_bins=10,
+        show_progress=False,
+    )
+    orchestrator = CrossFittedRoutingGeometryExperimentOrchestrator(config)
+
+    assert orchestrator.selector.spec.tail_guard_primary_metrics == ("rmse",)
+
+    with pytest.raises(ValueError, match="tail_risk_quantile"):
+        CrossFittedRoutingGeometryExperimentConfig(tail_risk_quantile=0.4)
+    with pytest.raises(ValueError, match="regression_stratification_bins is required"):
+        CrossFittedRoutingGeometryExperimentConfig(regression_tail_guard=True)
 
 
 def test_classification_replay_uses_probability_metrics() -> None:
@@ -693,6 +745,9 @@ def test_cross_fitted_selector_runner_persists_fold_evidence_and_resumes(tmp_pat
     ).splitlines()
     assert fold_table.shape[0] == 9
     assert summary_table.shape[0] == 2
+    assert fold_table["tail_metric"].eq("tail_mean_absolute_error").all()
+    assert fold_table["tail_quantile"].eq(0.9).all()
+    assert "tail_mean_relative_gain" in summary_table
     assert len(selection_lines) == 1
 
     (tmp_path / "geometry_selection_fold_losses.csv").unlink()
@@ -711,6 +766,71 @@ def test_cross_fitted_selector_runner_persists_fold_evidence_and_resumes(tmp_pat
             encoding="utf-8"
         ).splitlines()
     ) == 1
+
+
+def test_tail_guarded_selector_runner_persists_a9_tail_evidence(tmp_path) -> None:
+    config = CrossFittedRoutingGeometryExperimentConfig(
+        regression_suite=None,
+        classification_suite=None,
+        regression_tasks=(),
+        classification_tasks=(),
+        models=("ridge",),
+        budget_ratios=(0.20,),
+        seeds=(42,),
+        n_partitions=3,
+        selection_folds=3,
+        selector_arm_name="A9_tail_guarded_cross_fitted_selected",
+        bootstrap_iterations=200,
+        regression_tail_guard=True,
+        tail_risk_quantile=0.90,
+        regression_stratification_bins=5,
+        output_dir=tmp_path,
+        show_progress=False,
+    )
+
+    class _SyntheticOrchestrator(CrossFittedRoutingGeometryExperimentOrchestrator):
+        def _load_datasets(self):
+            return [make_synthetic_regression_smoke_dataset(42)]
+
+    result = _SyntheticOrchestrator(config).run()
+
+    assert result.shape[0] == 4
+    selector_row = result.loc[
+        result["arm_name"] == "A9_tail_guarded_cross_fitted_selected"
+    ].iloc[0]
+    assert selector_row["selection_status"] in {"selected", "fallback_to_a2"}
+    summary = pd.read_csv(tmp_path / "geometry_selection_summary.csv")
+    assert summary["tail_metric"].eq("tail_mean_absolute_error").all()
+    assert summary["tail_quantile"].eq(0.9).all()
+    assert summary["tail_confidence_lower"].notna().all()
+
+
+def test_tail_guarded_runner_rejects_a8_resume_directory(tmp_path) -> None:
+    (tmp_path / "run_meta.json").write_text(
+        json.dumps(
+            {
+                "config": {
+                    "selector_arm_name": "A8_cross_fitted_selected",
+                    "selection_folds": 5,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = CrossFittedRoutingGeometryExperimentConfig(
+        selector_arm_name="A9_tail_guarded_cross_fitted_selected",
+        regression_tail_guard=True,
+        regression_stratification_bins=10,
+        output_dir=tmp_path,
+        show_progress=False,
+    )
+
+    with pytest.raises(ResumeCompatibilityError) as exc_info:
+        CrossFittedRoutingGeometryExperimentOrchestrator(
+            config
+        )._initialize_artifacts()
+
+    assert exc_info.value.code == "routing_geometry_resume_selector_mismatch"
 
 
 def test_validation_selector_stratifies_only_when_both_splits_can_preserve_classes() -> None:
