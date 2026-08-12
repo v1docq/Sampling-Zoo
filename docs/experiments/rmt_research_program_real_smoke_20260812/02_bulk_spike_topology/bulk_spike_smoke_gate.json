@@ -1,0 +1,14 @@
+{
+  "status": "passed",
+  "checks": {
+    "expected_record_count": true,
+    "all_records_completed": true,
+    "full_dataset_references_completed": true,
+    "specialized_topologies_preserve_exact_budget": true,
+    "regression_tail_contract": true,
+    "classification_probability_and_balance_contract": true
+  },
+  "scientific_gate_status": "failed",
+  "scientific_gate_is_informative": false,
+  "reason": "A one-seed smoke validates execution and invariants; specialization effectiveness is evaluated by the multi-seed pilot."
+}

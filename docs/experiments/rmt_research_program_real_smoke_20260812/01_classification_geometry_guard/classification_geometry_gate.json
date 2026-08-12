@@ -1,0 +1,27 @@
+{
+  "status": "passed",
+  "evidence_status": "safe_and_effective",
+  "spec": {
+    "expected_records": 8,
+    "expected_selector_records": 2,
+    "roc_auc_absolute_margin": 0.005,
+    "log_loss_relative_margin": 0.01,
+    "min_nonbaseline_win_rate": 0.7
+  },
+  "checks": {
+    "expected_record_count": true,
+    "all_records_completed": true,
+    "expected_selector_record_count": true,
+    "primary_metric_contract": true,
+    "class_coverage_guaranteed": true,
+    "metric_alignment": true,
+    "selected_policy_noninferior": true
+  },
+  "record_count": 8,
+  "failed_count": 0,
+  "selector_record_count": 2,
+  "selected_nonbaseline_count": 0,
+  "selected_nonbaseline_win_rate": null,
+  "selector_effectiveness_passed": true,
+  "worst_gain_vs_a2": 0.0
+}
