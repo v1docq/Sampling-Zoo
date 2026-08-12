@@ -75,6 +75,9 @@
   `examples/benchmark/rmt_bulk_spike_research_smoke.py`.
 - результаты проверки на реальных данных:
   `docs/experiments/rmt_research_program_real_smoke_20260812/`.
+- аудит публикуемых артефактов и подготовленное описание PR:
+  `artifact_publication_audit.json` и `pull_request.md` в каталоге этого
+  отчёта.
 
 ## Следующая точка
 
