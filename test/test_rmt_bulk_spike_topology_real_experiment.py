@@ -81,11 +81,18 @@ def test_real_topology_runner_selects_away_from_test_and_resumes(tmp_path) -> No
         encoding="utf-8"
     ).splitlines()
     metadata = json.loads((tmp_path / "run_meta.json").read_text(encoding="utf-8"))
+    reference = json.loads(
+        (tmp_path / "bulk_spike_full_references.jsonl").read_text(
+            encoding="utf-8"
+        )
+    )
 
     assert resumed.shape[0] == 4
     assert len(lines) == 4
     assert metadata["status"] == "completed"
     assert metadata["full_reference_record_count"] == 1
+    assert reference["n_train"] > int(selected["n_train"])
+    assert reference["n_train"] + reference["n_test"] == len(dataset.X)
     assert (tmp_path / "bulk_spike_full_references.jsonl").exists()
     assert (tmp_path / "bulk_spike_full_references.json").exists()
     assert (tmp_path / "bulk_spike_paired.csv").exists()
@@ -166,3 +173,34 @@ def test_real_topology_runner_preserves_multiclass_probability_contract(tmp_path
     ]
     assert specialized["topology_exact_budget"].all()
     assert specialized["class_coverage_guaranteed"].all()
+
+
+def test_real_topology_public_runner_preserves_explicit_empty_task_group(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    captured = {}
+
+    def fake_run(self):
+        captured["regression_tasks"] = tuple(self.config.regression_tasks)
+        captured["classification_tasks"] = tuple(
+            self.config.classification_tasks
+        )
+        return pd.DataFrame()
+
+    monkeypatch.setattr(BulkSpikeRealExperimentOrchestrator, "run", fake_run)
+    from examples.benchmark.rmt_bulk_spike_topology_real_experiment import (
+        run_rmt_bulk_spike_topology_real_experiment,
+    )
+
+    run_rmt_bulk_spike_topology_real_experiment(
+        regression_tasks=(),
+        classification_tasks=("adult",),
+        output_dir=tmp_path,
+        show_progress=False,
+    )
+
+    assert captured == {
+        "regression_tasks": (),
+        "classification_tasks": ("adult",),
+    }

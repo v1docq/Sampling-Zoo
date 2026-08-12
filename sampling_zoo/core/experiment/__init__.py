@@ -102,6 +102,14 @@ from .routing_replay import (
     upper_tail_mean_absolute_error,
 )
 from .stages import ExperimentPlan, ExperimentStageId, StageRegistry, StageRequest, StageResult
+from .research_program import (
+    ResearchProgramPlan,
+    ResearchStageResult,
+    ResearchStageSpec,
+    ResearchStageStatus,
+    deserialize_stage_result,
+    selected_stage_closure,
+)
 
 __all__ = [
     "ARTIFACT_MANIFEST_FILENAME",
@@ -126,6 +134,10 @@ __all__ = [
     "ExperimentContractError",
     "ExperimentConfigRef",
     "ExperimentPlan",
+    "ResearchProgramPlan",
+    "ResearchStageResult",
+    "ResearchStageSpec",
+    "ResearchStageStatus",
     "ExperimentStageId",
     "FoldContract",
     "InvalidExperimentConfigError",
@@ -172,6 +184,8 @@ __all__ = [
     "ResumeRecordError",
     "ResumeSession",
     "StageRegistry",
+    "deserialize_stage_result",
+    "selected_stage_closure",
     "StageRequest",
     "StageResult",
     "StrategyGridContract",

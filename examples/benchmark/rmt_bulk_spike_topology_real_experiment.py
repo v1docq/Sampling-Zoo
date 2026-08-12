@@ -347,9 +347,10 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
         existing = self.reference_records_.get(key)
         if existing is not None:
             return existing
+        X_reference, y_reference = self._full_reference_training_data(prepared)
         fit_started = perf_counter()
         model = model_factory()
-        model.fit(prepared.X_train, prepared.y_train)
+        model.fit(X_reference, y_reference)
         fit_seconds = float(perf_counter() - fit_started)
         inference_started = perf_counter()
         if prepared.dataset.problem_type == "classification":
@@ -400,7 +401,7 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
             problem_type=prepared.dataset.problem_type,
             seed=prepared.seed,
             model=model_name,
-            n_train=len(prepared.X_train),
+            n_train=len(X_reference),
             n_test=len(prepared.X_test),
             test={
                 "primary_metric": primary,
@@ -419,6 +420,32 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
         self.reference_records_[key] = payload
         self._append_reference_record(payload)
         return payload
+
+    @staticmethod
+    def _full_reference_training_data(
+        prepared: PreparedBulkSpikeDataset,
+    ) -> tuple[pd.DataFrame, pd.Series]:
+        features = pd.concat(
+            (
+                prepared.X_train,
+                prepared.X_validation,
+                prepared.X_selection,
+            ),
+            axis=0,
+            ignore_index=True,
+        )
+        target = pd.concat(
+            (
+                prepared.y_train,
+                prepared.y_validation,
+                prepared.y_selection,
+            ),
+            axis=0,
+            ignore_index=True,
+        )
+        if len(features) != len(target):
+            raise RuntimeError("Full-reference features and target do not align")
+        return features, target
 
     @staticmethod
     def _aligned_model_probabilities(
@@ -1432,10 +1459,15 @@ def run_rmt_bulk_spike_topology_real_experiment(
 ) -> pd.DataFrame:
     return BulkSpikeRealExperimentOrchestrator(
         BulkSpikeRealExperimentConfig(
-            regression_tasks=(regression_tasks or DEFAULT_REAL_TOPOLOGY_REGRESSION_TASKS),
+            regression_tasks=(
+                DEFAULT_REAL_TOPOLOGY_REGRESSION_TASKS
+                if regression_tasks is None
+                else tuple(regression_tasks)
+            ),
             classification_tasks=(
-                classification_tasks
-                or DEFAULT_REAL_TOPOLOGY_CLASSIFICATION_TASKS
+                DEFAULT_REAL_TOPOLOGY_CLASSIFICATION_TASKS
+                if classification_tasks is None
+                else tuple(classification_tasks)
             ),
             models=models,
             budget_ratios=budget_ratios,
