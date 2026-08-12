@@ -5,9 +5,11 @@ import random
 import pytest
 
 from sampling_zoo.core.experiment.routing_geometry_selection import (
+    ClassificationRoutingGuardSpec,
     CrossFittedRoutingGeometrySelectionSpec,
     CrossFittedRoutingGeometrySelector,
     RoutingGeometryFoldScore,
+    RoutingGeometryGuardMetricScore,
     RoutingGeometryTailRiskScore,
 )
 
@@ -60,6 +62,42 @@ def _selector(**overrides) -> CrossFittedRoutingGeometrySelector:
     params.update(overrides)
     return CrossFittedRoutingGeometrySelector(
         CrossFittedRoutingGeometrySelectionSpec(**params)
+    )
+
+
+def _classification_score(
+    arm_name: str,
+    fold: int,
+    *,
+    primary_metric: str = "roc_auc",
+    primary_value: float = 0.80,
+    brier_score: float = 0.18,
+    ece: float = 0.05,
+    f1_macro: float = 0.75,
+    worst_class_recall: float = 0.70,
+) -> RoutingGeometryFoldScore:
+    return RoutingGeometryFoldScore(
+        arm_name=arm_name,
+        fold_id=str(fold),
+        primary_metric=primary_metric,
+        primary_value=primary_value,
+        primary_direction="higher" if primary_metric == "roc_auc" else "lower",
+        guard_metrics=(
+            RoutingGeometryGuardMetricScore("brier_score", brier_score, "lower"),
+            RoutingGeometryGuardMetricScore(
+                "expected_calibration_error",
+                ece,
+                "lower",
+            ),
+            RoutingGeometryGuardMetricScore("f1_macro", f1_macro, "higher"),
+            RoutingGeometryGuardMetricScore(
+                "worst_class_recall",
+                worst_class_recall,
+                "higher",
+            ),
+        ),
+        evaluation_rows=30,
+        selected_temperature=0.5,
     )
 
 
@@ -227,6 +265,101 @@ def test_higher_is_better_metric_is_converted_to_positive_gain() -> None:
 
     assert decision.status == "selected"
     assert decision.evidence[0].mean_relative_gain == pytest.approx(0.0375)
+
+
+def test_classification_guard_accepts_auc_gain_with_safe_probability_metrics() -> None:
+    scores = []
+    for fold in range(5):
+        scores.extend(
+            (
+                _classification_score(REFERENCE, fold),
+                _classification_score(
+                    CANDIDATE,
+                    fold,
+                    primary_value=0.82,
+                    brier_score=0.17,
+                    ece=0.045,
+                    f1_macro=0.76,
+                    worst_class_recall=0.72,
+                ),
+            )
+        )
+
+    decision = _selector(
+        require_robust_metric=False,
+        classification_guard=ClassificationRoutingGuardSpec(),
+    ).select(scores)
+
+    assert decision.status == "selected"
+    guards = decision.evidence[0].classification_guard_evidence
+    assert tuple(item.metric for item in guards) == (
+        "roc_auc",
+        "brier_score",
+        "expected_calibration_error",
+        "f1_macro",
+        "worst_class_recall",
+    )
+    assert all(item.eligible for item in guards)
+
+
+def test_classification_guard_blocks_candidate_with_worst_class_recall_harm() -> None:
+    scores = []
+    for fold in range(5):
+        scores.extend(
+            (
+                _classification_score(REFERENCE, fold),
+                _classification_score(
+                    CANDIDATE,
+                    fold,
+                    primary_value=0.82,
+                    worst_class_recall=0.60,
+                ),
+            )
+        )
+
+    decision = _selector(
+        require_robust_metric=False,
+        classification_guard=ClassificationRoutingGuardSpec(),
+    ).select(scores)
+
+    assert decision.status == "fallback_to_a2"
+    reasons = decision.evidence[0].rejection_reasons
+    assert any(
+        reason.startswith("classification_guard:worst_class_recall")
+        for reason in reasons
+    )
+
+
+def test_multiclass_primary_guard_uses_relative_log_loss() -> None:
+    scores = []
+    for fold in range(5):
+        scores.extend(
+            (
+                _classification_score(
+                    REFERENCE,
+                    fold,
+                    primary_metric="log_loss",
+                    primary_value=0.50,
+                ),
+                _classification_score(
+                    CANDIDATE,
+                    fold,
+                    primary_metric="log_loss",
+                    primary_value=0.45,
+                ),
+            )
+        )
+
+    decision = _selector(
+        require_robust_metric=False,
+        classification_guard=ClassificationRoutingGuardSpec(),
+    ).select(scores)
+
+    primary_guard = decision.evidence[0].classification_guard_evidence[0]
+    assert decision.status == "selected"
+    assert primary_guard.metric == "log_loss"
+    assert primary_guard.gain_scale == "relative"
+    assert primary_guard.mean_gain == pytest.approx(0.10)
 
 
 def test_selection_is_invariant_to_score_order() -> None:

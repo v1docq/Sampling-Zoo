@@ -13,6 +13,7 @@ from tqdm.auto import tqdm
 
 from sampling_zoo.core.experiment.routing_geometry_selection import (
     CrossFittedRoutingGeometrySelector,
+    RoutingGeometryGuardMetricScore,
     RoutingGeometryFoldScore,
     RoutingGeometrySelectionDecision,
     RoutingGeometryTailRiskScore,
@@ -558,6 +559,24 @@ class FittedEnsembleRoutingReplay:
         has_mae = "mae" in result.metrics
         has_tail = "tail_mean_absolute_error" in result.metrics
         tail_quantile = result.diagnostics.get("tail_absolute_error_quantile")
+        classification_guards = (
+            tuple(
+                RoutingGeometryGuardMetricScore(
+                    metric=metric,
+                    value=float(result.metrics[metric]),
+                    direction=direction,
+                )
+                for metric, direction in (
+                    ("brier_score", "lower"),
+                    ("expected_calibration_error", "lower"),
+                    ("f1_macro", "higher"),
+                    ("worst_class_recall", "higher"),
+                )
+                if metric in result.metrics and np.isfinite(result.metrics[metric])
+            )
+            if metric_name in {"roc_auc", "log_loss"}
+            else ()
+        )
         return RoutingGeometryFoldScore(
             arm_name=result.arm_name,
             fold_id=fold_id,
@@ -577,6 +596,7 @@ class FittedEnsembleRoutingReplay:
                 if has_tail and tail_quantile is not None
                 else None
             ),
+            guard_metrics=classification_guards,
             evaluation_rows=evaluation_rows,
             selected_temperature=result.temperature,
         )

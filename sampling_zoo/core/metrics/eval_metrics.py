@@ -11,6 +11,7 @@ from sklearn.metrics import (
     f1_score,
     log_loss,
     mean_squared_error,
+    recall_score,
     r2_score,
     roc_auc_score,
 )
@@ -34,6 +35,7 @@ HIGHER_IS_BETTER = {
     "recall",
     "precision",
     "roc_auc",
+    "worst_class_recall",
 }
 
 
@@ -84,6 +86,17 @@ def _classification_metrics(
         ),
         "f1_weighted": float(
             f1_score(y_true_array, y_pred, average="weighted", zero_division=0)
+        ),
+        "worst_class_recall": float(
+            np.min(
+                recall_score(
+                    y_true_array,
+                    y_pred,
+                    labels=global_classes,
+                    average=None,
+                    zero_division=0,
+                )
+            )
         ),
         "roc_auc": float("nan"),
         "log_loss": float("nan"),

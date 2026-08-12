@@ -71,10 +71,14 @@ from .resume import (
 )
 from .resume_runtime import ResumeSession, load_resume_session
 from .routing_geometry_selection import (
+    ClassificationMetricGuardSpec,
+    ClassificationRoutingGuardEvidence,
+    ClassificationRoutingGuardSpec,
     CrossFittedRoutingGeometrySelectionSpec,
     CrossFittedRoutingGeometrySelector,
     RoutingGeometryCandidateEvidence,
     RoutingGeometryFoldScore,
+    RoutingGeometryGuardMetricScore,
     RoutingGeometrySelectionDecision,
     RoutingGeometryTailRiskScore,
 )
@@ -99,6 +103,9 @@ __all__ = [
     "ArtifactManifestParseFailure",
     "ArtifactManifestViolation",
     "ChunkModelContract",
+    "ClassificationMetricGuardSpec",
+    "ClassificationRoutingGuardEvidence",
+    "ClassificationRoutingGuardSpec",
     "CrossFittedRoutingGeometrySelectionSpec",
     "CrossFittedRoutingGeometrySelector",
     "DatasetContract",
@@ -127,6 +134,7 @@ __all__ = [
     "RoutingContract",
     "RoutingGeometryCandidateEvidence",
     "RoutingGeometryFoldScore",
+    "RoutingGeometryGuardMetricScore",
     "RoutingGeometrySelection",
     "RoutingGeometrySelectionDecision",
     "RoutingGeometryTailRiskScore",
