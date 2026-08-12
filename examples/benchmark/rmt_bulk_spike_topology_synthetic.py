@@ -342,6 +342,19 @@ class BulkSpikeTopologySyntheticOrchestrator:
                 unit="dataset",
                 disable=not self.config.show_progress,
             ):
+                expected_leaf_keys = {
+                    (
+                        str(regime),
+                        round(float(snr), 12),
+                        int(seed),
+                        round(float(budget_ratio), 12),
+                        str(arm),
+                    )
+                    for budget_ratio in self.config.budget_ratios
+                    for arm in OFFICIAL_TOPOLOGY_ARMS
+                }
+                if expected_leaf_keys.issubset(completed):
+                    continue
                 leaf_records = self._run_dataset(regime=regime, snr=snr, seed=seed)
                 for record in leaf_records:
                     key = self._record_key(record)
@@ -445,6 +458,8 @@ class BulkSpikeTopologySyntheticOrchestrator:
             }
             selected_arm, selection = self._select_topology(
                 evaluations,
+                split=spectral.split,
+                topologies=topologies,
                 y_val=y_val,
                 problem_type=dataset.problem_type,
                 classes=dataset.classes,
@@ -1110,14 +1125,39 @@ class BulkSpikeTopologySyntheticOrchestrator:
         self,
         evaluations: Mapping[str, Mapping[str, Any]],
         *,
+        split: SpectralComponentSplitContract,
+        topologies: Mapping[str, BulkSpikePartitionContract],
         y_val: np.ndarray,
         problem_type: str,
         classes: tuple[Any, ...],
     ) -> tuple[str, dict[str, Any]]:
+        candidate_arms = []
+        b1 = topologies["B1_bulk_single_spike"]
+        b2 = topologies["B2_bulk_multi_spike"]
+        if split.n_spikes >= 1 and b1.n_experts >= 2:
+            candidate_arms.append("B1_bulk_single_spike")
+        if (
+            split.n_spikes >= 2
+            and b2.mode is BulkSpikeTopologyMode.MULTI_SPIKE
+            and b2.n_experts >= 3
+        ):
+            candidate_arms.append("B2_bulk_multi_spike")
+        if not candidate_arms:
+            return "B0_standard_A9", {
+                "selected_arm": "B0_standard_A9",
+                "fallback_arm": "B0_standard_A9",
+                "status": "fallback_to_b0",
+                "mean_gain": 0.0,
+                "median_gain": 0.0,
+                "confidence_interval": (0.0, 0.0),
+                "positive_fold_fraction": 0.0,
+                "reason": "no_spectrally_eligible_bulk_spike_topology",
+                "eligible_candidate_arms": [],
+            }
         fold_indices = np.array_split(np.arange(len(y_val)), 5)
         scores = []
         for fold_id, indices in enumerate(fold_indices):
-            for arm in ("B0_standard_A9", "B1_bulk_single_spike", "B2_bulk_multi_spike"):
+            for arm in ("B0_standard_A9", *candidate_arms):
                 prediction = evaluations[arm]["val_prediction"][indices]
                 metrics = self._metrics(y_val[indices], prediction, problem_type, classes)
                 metric, value = self._primary(metrics, problem_type, classes)
@@ -1130,6 +1170,11 @@ class BulkSpikeTopologySyntheticOrchestrator:
                     )
                 )
         selection = CrossFittedBulkSpikeTopologySelector(
+            candidate_arms=tuple(candidate_arms),
+            noninferiority_margin=0.0,
+            min_positive_fold_fraction=0.8,
+            min_mean_gain=0.01,
+            min_median_gain=0.005,
             bootstrap_iterations=500,
             random_state=17,
         ).select(scores)
@@ -1142,6 +1187,7 @@ class BulkSpikeTopologySyntheticOrchestrator:
             "confidence_interval": selection.confidence_interval,
             "positive_fold_fraction": selection.positive_fold_fraction,
             "reason": selection.reason,
+            "eligible_candidate_arms": candidate_arms,
         }
 
     @staticmethod
@@ -1321,6 +1367,26 @@ class BulkSpikeTopologySyntheticOrchestrator:
             & paired["regime"].isin({"null", "false_spectral_outlier"})
         ]
         spurious_multi_expert_rate = float(np.mean(null_b2["n_experts"] > 2))
+        selected_specializations = b3[
+            b3["selected_topology_arm"] != "B0_standard_A9"
+        ]
+        specialization_win_rate = (
+            float(np.mean(selected_specializations["gain_vs_b0"] > 0.0))
+            if not selected_specializations.empty
+            else 0.0
+        )
+        specialization_median_gain = (
+            float(selected_specializations["gain_vs_b0"].median())
+            if not selected_specializations.empty
+            else 0.0
+        )
+        multi_spike_materialized = bool(
+            (
+                (paired["arm"] == "B2_bulk_multi_spike")
+                & (paired["realized_topology_mode"] == "multi_spike")
+                & (paired["n_experts"] >= 3)
+            ).any()
+        )
         checks = {
             "all_records_completed": bool(
                 len(raw) == self.config.expected_records
@@ -1330,6 +1396,13 @@ class BulkSpikeTopologySyntheticOrchestrator:
             "classification_probabilities_valid": bool(raw["probability_valid"].all()),
             "null_and_false_outlier_fallback_rate_at_least_80pct": null_fallback >= 0.80,
             "spurious_multi_expert_rate_at_most_20pct": spurious_multi_expert_rate <= 0.20,
+            "multi_spike_topology_materialized": multi_spike_materialized,
+            "selected_specialization_win_rate_at_least_80pct": (
+                not selected_specializations.empty and specialization_win_rate >= 0.80
+            ),
+            "selected_specialization_median_gain_positive": (
+                not selected_specializations.empty and specialization_median_gain > 0.0
+            ),
             "confirmatory_median_gain_nonnegative": bool(
                 not confirmatory.empty and float(confirmatory["gain_vs_b0"].median()) >= 0.0
             ),
@@ -1346,6 +1419,9 @@ class BulkSpikeTopologySyntheticOrchestrator:
             "checks": checks,
             "null_fallback_rate": null_fallback,
             "spurious_multi_expert_rate": spurious_multi_expert_rate,
+            "selected_specialization_count": int(len(selected_specializations)),
+            "selected_specialization_win_rate": specialization_win_rate,
+            "selected_specialization_median_gain": specialization_median_gain,
             "confirmatory_median_gain": float(confirmatory["gain_vs_b0"].median()),
             "confirmatory_worst_gain": float(confirmatory["gain_vs_b0"].min()),
             "expected_records": self.config.expected_records,

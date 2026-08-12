@@ -601,6 +601,8 @@ class CrossFittedBulkSpikeTopologySelector:
         candidate_arms: Sequence[str] = ("B1_bulk_single_spike", "B2_bulk_multi_spike"),
         noninferiority_margin: float = 0.005,
         min_positive_fold_fraction: float = 2.0 / 3.0,
+        min_mean_gain: float = 0.0,
+        min_median_gain: float = 0.0,
         bootstrap_iterations: int = 2_000,
         random_state: int = 42,
     ) -> None:
@@ -608,12 +610,18 @@ class CrossFittedBulkSpikeTopologySelector:
         self.candidate_arms = tuple(candidate_arms)
         self.noninferiority_margin = float(noninferiority_margin)
         self.min_positive_fold_fraction = float(min_positive_fold_fraction)
+        self.min_mean_gain = float(min_mean_gain)
+        self.min_median_gain = float(min_median_gain)
         self.bootstrap_iterations = int(bootstrap_iterations)
         self.random_state = int(random_state)
         if not self.fallback_arm or not self.candidate_arms:
             raise ValueError("fallback and candidate topology arms must be non-empty")
         if self.bootstrap_iterations < 100:
             raise ValueError("bootstrap_iterations must be at least 100")
+        if self.noninferiority_margin < 0.0:
+            raise ValueError("noninferiority_margin must be non-negative")
+        if not 0.0 < self.min_positive_fold_fraction <= 1.0:
+            raise ValueError("min_positive_fold_fraction must be in (0, 1]")
 
     def select(
         self,
@@ -644,7 +652,8 @@ class CrossFittedBulkSpikeTopologySelector:
             positive = float(np.mean(gains > 0.0))
             if (
                 interval[0] >= -self.noninferiority_margin
-                and median >= 0.0
+                and mean >= self.min_mean_gain
+                and median >= self.min_median_gain
                 and positive >= self.min_positive_fold_fraction
             ):
                 candidates.append((arm_name, mean, median, interval, positive))

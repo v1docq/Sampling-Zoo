@@ -1,0 +1,20 @@
+{
+  "status": "failed",
+  "checks": {
+    "all_records_completed": true,
+    "exact_unique_budget": true,
+    "classification_probabilities_valid": true,
+    "null_and_false_outlier_fallback_rate_at_least_80pct": false,
+    "spurious_multi_expert_rate_at_most_20pct": true,
+    "confirmatory_median_gain_nonnegative": true,
+    "worst_primary_harm_at_most_05pct": false,
+    "row_permutation_metric_invariant": true,
+    "expert_order_permutation_invariant": true
+  },
+  "null_fallback_rate": 0.7222222222222222,
+  "spurious_multi_expert_rate": 0.0,
+  "confirmatory_median_gain": 0.0,
+  "confirmatory_worst_gain": -0.2092560229050445,
+  "expected_records": 1260,
+  "observed_records": 1260
+}

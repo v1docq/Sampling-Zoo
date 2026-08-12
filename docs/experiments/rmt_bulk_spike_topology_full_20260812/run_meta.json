@@ -1,0 +1,66 @@
+{
+  "experiment": "rmt_bulk_spike_topology_synthetic",
+  "status": "completed",
+  "updated_at": "2026-08-12T12:01:38.056267",
+  "record_count": 1260,
+  "expected_records": 1260,
+  "config": {
+    "n_samples": 600,
+    "n_features": 20,
+    "regimes": [
+      "null",
+      "one_spike",
+      "multiple_spikes",
+      "student_t",
+      "heteroskedastic",
+      "rare_class_spike",
+      "false_spectral_outlier"
+    ],
+    "snr_values": [
+      0.5,
+      1.0,
+      2.0
+    ],
+    "budget_ratios": [
+      0.05,
+      0.1,
+      0.2
+    ],
+    "seeds": [
+      11,
+      29,
+      47,
+      71,
+      101
+    ],
+    "spectral_rank": 8,
+    "null_resamples": 8,
+    "validation_fraction": 0.2,
+    "test_fraction": 0.2,
+    "max_experts": 5,
+    "min_partition_size": 3,
+    "output_dir": "docs\\experiments\\rmt_bulk_spike_topology_full_20260812",
+    "show_progress": true
+  },
+  "gate": {
+    "status": "failed",
+    "checks": {
+      "all_records_completed": true,
+      "exact_unique_budget": true,
+      "classification_probabilities_valid": true,
+      "null_and_false_outlier_fallback_rate_at_least_80pct": false,
+      "spurious_multi_expert_rate_at_most_20pct": true,
+      "confirmatory_median_gain_nonnegative": true,
+      "worst_primary_harm_at_most_05pct": false,
+      "row_permutation_metric_invariant": true,
+      "expert_order_permutation_invariant": true
+    },
+    "null_fallback_rate": 0.7222222222222222,
+    "spurious_multi_expert_rate": 0.0,
+    "confirmatory_median_gain": 0.0,
+    "confirmatory_worst_gain": -0.2092560229050445,
+    "expected_records": 1260,
+    "observed_records": 1260
+  },
+  "error": null
+}

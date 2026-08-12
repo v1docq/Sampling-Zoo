@@ -104,6 +104,30 @@ def test_row_participation_separates_localized_spike_energy() -> None:
     )
 
 
+def test_row_participation_zeroes_numerically_negligible_spike_energy() -> None:
+    split = build_spectral_component_split(
+        np.asarray([9.0, 5.0, 1.0]),
+        _stable_split_result(),
+        min_selection_frequency=0.75,
+    )
+    basis = np.asarray(
+        [
+            [1e-12, 1e-12, 0.5],
+            [0.5, 0.25, 0.1],
+        ]
+    )
+
+    participation = compute_row_spectral_participation(
+        basis,
+        split,
+        epsilon=1e-12,
+    )
+
+    assert participation.spike_energy[0] == 0.0
+    assert np.all(participation.spike_signatures[0] == 0.0)
+    assert np.isclose(participation.spike_signatures[1].sum(), 1.0)
+
+
 def test_bulk_spike_plan_preserves_exact_unique_budget() -> None:
     split = build_spectral_component_split(
         np.asarray([9.0, 5.0, 1.0]),

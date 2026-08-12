@@ -51,10 +51,13 @@ def test_tiny_topology_smoke_persists_exact_budget_artifacts(tmp_path: Path) -> 
     )
 
     result = run_rmt_bulk_spike_topology_synthetic(config)
+    resumed = run_rmt_bulk_spike_topology_synthetic(config)
     metadata = json.loads((result / "run_meta.json").read_text(encoding="utf-8"))
 
     assert metadata["status"] == "completed"
     assert metadata["record_count"] == 8
+    assert resumed == result
+    assert len((result / "topology_runs.jsonl").read_text(encoding="utf-8").splitlines()) == 8
     assert (result / "topology_raw_runs.csv").exists()
     assert (result / "topology_paired.csv").exists()
     assert (result / "topology_gate.json").exists()

@@ -171,3 +171,33 @@ def test_cross_fitted_topology_selector_keeps_b0_or_selects_stable_b2() -> None:
     assert result.status == "selected"
     assert result.selected_arm == "B2_bulk_multi_spike"
     assert result.positive_fold_fraction == 1.0
+
+
+def test_cross_fitted_topology_selector_respects_gain_floors() -> None:
+    scores = []
+    for fold in range(5):
+        scores.extend(
+            (
+                BulkSpikeTopologyFoldScore("B0_standard_A9", str(fold), 10.0, "lower"),
+                BulkSpikeTopologyFoldScore(
+                    "B1_bulk_single_spike",
+                    str(fold),
+                    9.96,
+                    "lower",
+                ),
+            )
+        )
+    selector = CrossFittedBulkSpikeTopologySelector(
+        candidate_arms=("B1_bulk_single_spike",),
+        noninferiority_margin=0.0,
+        min_positive_fold_fraction=0.8,
+        min_mean_gain=0.01,
+        min_median_gain=0.005,
+        bootstrap_iterations=500,
+        random_state=17,
+    )
+
+    result = selector.select(scores)
+
+    assert result.status == "fallback_to_b0"
+    assert result.reason == "no_bulk_spike_candidate_passed_cross_fitted_gates"

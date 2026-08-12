@@ -1,0 +1,26 @@
+{
+  "status": "passed",
+  "checks": {
+    "all_records_completed": true,
+    "exact_unique_budget": true,
+    "classification_probabilities_valid": true,
+    "null_and_false_outlier_fallback_rate_at_least_80pct": true,
+    "spurious_multi_expert_rate_at_most_20pct": true,
+    "multi_spike_topology_materialized": true,
+    "selected_specialization_win_rate_at_least_80pct": true,
+    "selected_specialization_median_gain_positive": true,
+    "confirmatory_median_gain_nonnegative": true,
+    "worst_primary_harm_at_most_05pct": true,
+    "row_permutation_metric_invariant": true,
+    "expert_order_permutation_invariant": true
+  },
+  "null_fallback_rate": 0.9666666666666667,
+  "spurious_multi_expert_rate": 0.0,
+  "selected_specialization_count": 17,
+  "selected_specialization_win_rate": 0.9411764705882353,
+  "selected_specialization_median_gain": 0.19267745543603973,
+  "confirmatory_median_gain": 0.0,
+  "confirmatory_worst_gain": -0.0009042998167001139,
+  "expected_records": 1260,
+  "observed_records": 1260
+}
