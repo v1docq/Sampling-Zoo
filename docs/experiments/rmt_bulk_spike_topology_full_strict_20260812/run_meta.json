@@ -1,0 +1,72 @@
+{
+  "experiment": "rmt_bulk_spike_topology_synthetic",
+  "status": "completed",
+  "updated_at": "2026-08-12T12:07:32.769795",
+  "record_count": 1260,
+  "expected_records": 1260,
+  "config": {
+    "n_samples": 600,
+    "n_features": 20,
+    "regimes": [
+      "null",
+      "one_spike",
+      "multiple_spikes",
+      "student_t",
+      "heteroskedastic",
+      "rare_class_spike",
+      "false_spectral_outlier"
+    ],
+    "snr_values": [
+      0.5,
+      1.0,
+      2.0
+    ],
+    "budget_ratios": [
+      0.05,
+      0.1,
+      0.2
+    ],
+    "seeds": [
+      11,
+      29,
+      47,
+      71,
+      101
+    ],
+    "spectral_rank": 8,
+    "null_resamples": 8,
+    "validation_fraction": 0.2,
+    "test_fraction": 0.2,
+    "max_experts": 5,
+    "min_partition_size": 3,
+    "output_dir": "docs\\experiments\\rmt_bulk_spike_topology_full_strict_20260812",
+    "show_progress": false
+  },
+  "gate": {
+    "status": "passed",
+    "checks": {
+      "all_records_completed": true,
+      "exact_unique_budget": true,
+      "classification_probabilities_valid": true,
+      "null_and_false_outlier_fallback_rate_at_least_80pct": true,
+      "spurious_multi_expert_rate_at_most_20pct": true,
+      "multi_spike_topology_materialized": true,
+      "selected_specialization_win_rate_at_least_80pct": true,
+      "selected_specialization_median_gain_positive": true,
+      "confirmatory_median_gain_nonnegative": true,
+      "worst_primary_harm_at_most_05pct": true,
+      "row_permutation_metric_invariant": true,
+      "expert_order_permutation_invariant": true
+    },
+    "null_fallback_rate": 0.9666666666666667,
+    "spurious_multi_expert_rate": 0.0,
+    "selected_specialization_count": 17,
+    "selected_specialization_win_rate": 0.9411764705882353,
+    "selected_specialization_median_gain": 0.19267745543603973,
+    "confirmatory_median_gain": 0.0,
+    "confirmatory_worst_gain": -0.0009042998167001139,
+    "expected_records": 1260,
+    "observed_records": 1260
+  },
+  "error": null
+}

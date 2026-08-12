@@ -1,0 +1,119 @@
+﻿{
+    "status":  "completed",
+    "updated_at":  "2026-08-12T10:00:07Z",
+    "record_count":  24,
+    "config":  {
+                   "regression_suite":  null,
+                   "classification_suite":  null,
+                   "regression_tasks":  [
+                                            "synthetic_rmt_regression_smoke"
+                                        ],
+                   "classification_tasks":  [
+                                                "synthetic_multiclass_topology"
+                                            ],
+                   "models":  [
+                                  "ridge"
+                              ],
+                   "budget_ratios":  [
+                                         0.05,
+                                         0.1,
+                                         0.2
+                                     ],
+                   "seeds":  [
+                                 42
+                             ],
+                   "n_partitions":  3,
+                   "max_train_rows":  100000,
+                   "validation_fraction":  0.2,
+                   "sampler_extra_params":  {
+                                                "backend":  "numpy",
+                                                "n_views":  3,
+                                                "projection_dim":  3,
+                                                "min_sampled_rows_per_partition":  3
+                                            },
+                   "output_dir":  "docs\\experiments\\rmt_scaling_law_smoke_20260812\\source",
+                   "show_progress":  false,
+                   "selector_fraction":  0.5,
+                   "selection_folds":  3,
+                   "topology_min_mean_gain":  0.01,
+                   "topology_min_median_gain":  0.005,
+                   "topology_min_positive_fold_fraction":  0.8,
+                   "topology_worst_harm_margin":  0.005,
+                   "tail_harm_margin":  0.01,
+                   "null_resamples":  2,
+                   "topology_min_partition_size":  3
+               },
+    "arms":  [
+                 {
+                     "name":  "A2_median_scaled_euclidean",
+                     "spec":  {
+                                  "representation":  "source_centroid",
+                                  "metric":  "median_scaled_euclidean",
+                                  "kernel":  "softmax",
+                                  "temperature":  1.0,
+                                  "covariance_shrinkage":  0.1,
+                                  "uniform_shrinkage":  0.05,
+                                  "min_scale":  1E-08,
+                                  "min_prior":  1E-08
+                              },
+                     "temperature_candidates":  [
+                                                    0.05,
+                                                    0.1,
+                                                    0.25,
+                                                    0.5,
+                                                    1.0,
+                                                    2.0,
+                                                    5.0
+                                                ],
+                     "use_validation_priors":  true
+                 },
+                 {
+                     "name":  "A5_gmm_posterior",
+                     "spec":  {
+                                  "representation":  "source_centroid",
+                                  "metric":  "full_shrinkage_mahalanobis",
+                                  "kernel":  "gmm_posterior",
+                                  "temperature":  1.0,
+                                  "covariance_shrinkage":  0.1,
+                                  "uniform_shrinkage":  0.05,
+                                  "min_scale":  1E-08,
+                                  "min_prior":  1E-08
+                              },
+                     "temperature_candidates":  [
+                                                    0.05,
+                                                    0.1,
+                                                    0.25,
+                                                    0.5,
+                                                    1.0,
+                                                    2.0,
+                                                    5.0
+                                                ],
+                     "use_validation_priors":  true
+                 },
+                 {
+                     "name":  "A6_cosine_negative_control",
+                     "spec":  {
+                                  "representation":  "source_centroid",
+                                  "metric":  "cosine",
+                                  "kernel":  "softmax",
+                                  "temperature":  1.0,
+                                  "covariance_shrinkage":  0.1,
+                                  "uniform_shrinkage":  0.05,
+                                  "min_scale":  1E-08,
+                                  "min_prior":  1E-08
+                              },
+                     "temperature_candidates":  [
+                                                    0.05,
+                                                    0.1,
+                                                    0.25,
+                                                    0.5,
+                                                    1.0,
+                                                    2.0,
+                                                    5.0
+                                                ],
+                     "use_validation_priors":  true
+                 }
+             ],
+    "full_reference_record_count":  2,
+    "expected_full_reference_records":  2
+}

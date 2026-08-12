@@ -1,0 +1,39 @@
+{
+  "status": "completed",
+  "started_at": "2026-08-12T10:14:42.685759+00:00",
+  "completed_at": "2026-08-12T10:14:42.715418+00:00",
+  "output_root": "docs/experiments/rmt_research_program_real_smoke_20260812",
+  "stages": {
+    "classification_geometry_guard": {
+      "status": "passed",
+      "record_count": 8,
+      "output_dir": "docs/experiments/rmt_research_program_real_smoke_20260812/01_classification_geometry_guard"
+    },
+    "bulk_spike_topology": {
+      "status": "passed",
+      "record_count": 8,
+      "output_dir": "docs/experiments/rmt_research_program_real_smoke_20260812/02_bulk_spike_topology",
+      "scientific_gate_status": "failed"
+    }
+  },
+  "previous_attempt": {
+    "status": "failed",
+    "started_at": "2026-08-12T10:10:06.229878+00:00",
+    "completed_at": "2026-08-12T10:13:01.831982+00:00",
+    "output_root": "docs/experiments/rmt_research_program_real_smoke_20260812",
+    "stages": {
+      "classification_geometry_guard": {
+        "status": "passed",
+        "record_count": 8,
+        "output_dir": "docs/experiments/rmt_research_program_real_smoke_20260812/01_classification_geometry_guard"
+      },
+      "bulk_spike_topology": {
+        "status": "failed",
+        "record_count": 8,
+        "output_dir": "docs/experiments/rmt_research_program_real_smoke_20260812/02_bulk_spike_topology"
+      }
+    },
+    "error_type": "RuntimeError",
+    "error": "bulk/spike topology smoke gate failed"
+  }
+}

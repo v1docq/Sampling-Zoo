@@ -1,0 +1,98 @@
+[
+  {
+    "dataset": "synthetic_multiclass_topology",
+    "model": "ridge",
+    "arm_name": "B0_standard_A9",
+    "status": "fitted",
+    "primary_metric": "log_loss",
+    "asymptotic_loss": -9.652083551622635,
+    "scale": 9.947435553188631,
+    "exponent": 0.010000000000000002,
+    "exponent_at_boundary": true,
+    "evidence_status": "boundary_limited",
+    "exponent_confidence_interval": null,
+    "r_squared": 0.8285993222673445,
+    "mean_absolute_error": 0.033294491920453445,
+    "reference_primary_value": 0.2953520015659964,
+    "reference_loss": 0.2953520015659964,
+    "required_budget_by_degradation": {
+      "1pct": 0.9707494628622226,
+      "3pct": 0.9148143185400748,
+      "5pct": 0.8621325361621563
+    },
+    "n_budget_points": 4,
+    "n_observations": 4
+  },
+  {
+    "dataset": "synthetic_multiclass_topology",
+    "model": "ridge",
+    "arm_name": "B3_validation_selected",
+    "status": "fitted",
+    "primary_metric": "log_loss",
+    "asymptotic_loss": -9.652083551622635,
+    "scale": 9.947435553188631,
+    "exponent": 0.010000000000000002,
+    "exponent_at_boundary": true,
+    "evidence_status": "boundary_limited",
+    "exponent_confidence_interval": null,
+    "r_squared": 0.8285993222673445,
+    "mean_absolute_error": 0.033294491920453445,
+    "reference_primary_value": 0.2953520015659964,
+    "reference_loss": 0.2953520015659964,
+    "required_budget_by_degradation": {
+      "1pct": 0.9707494628622226,
+      "3pct": 0.9148143185400748,
+      "5pct": 0.8621325361621563
+    },
+    "n_budget_points": 4,
+    "n_observations": 4
+  },
+  {
+    "dataset": "synthetic_rmt_regression_smoke",
+    "model": "ridge",
+    "arm_name": "B0_standard_A9",
+    "status": "fitted",
+    "primary_metric": "rmse",
+    "asymptotic_loss": 13.359860406980776,
+    "scale": 0.010008092885282382,
+    "exponent": 2.9999999999999996,
+    "exponent_at_boundary": true,
+    "evidence_status": "boundary_limited",
+    "exponent_confidence_interval": null,
+    "r_squared": 0.9969844910309363,
+    "mean_absolute_error": 1.0501532400348292,
+    "reference_primary_value": 13.369868499866058,
+    "reference_loss": 13.369868499866058,
+    "required_budget_by_degradation": {
+      "1pct": 0.4114256448202471,
+      "3pct": 0.28982320598255884,
+      "5pct": 0.24524500344620415
+    },
+    "n_budget_points": 4,
+    "n_observations": 4
+  },
+  {
+    "dataset": "synthetic_rmt_regression_smoke",
+    "model": "ridge",
+    "arm_name": "B3_validation_selected",
+    "status": "fitted",
+    "primary_metric": "rmse",
+    "asymptotic_loss": 12.078518528901226,
+    "scale": 1.2913499709648317,
+    "exponent": 0.7057884687271743,
+    "exponent_at_boundary": false,
+    "evidence_status": "exploratory_sparse_grid",
+    "exponent_confidence_interval": null,
+    "r_squared": 0.9568323299057573,
+    "mean_absolute_error": 0.5832942109961383,
+    "reference_primary_value": 13.369868499866058,
+    "reference_loss": 13.369868499866058,
+    "required_budget_by_degradation": {
+      "1pct": 0.8697187070565693,
+      "3pct": 0.6816489920488469,
+      "5pct": 0.5537297490934417
+    },
+    "n_budget_points": 4,
+    "n_observations": 4
+  }
+]

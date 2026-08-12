@@ -1,0 +1,14 @@
+{
+  "status": "implementation_verified",
+  "stage": "phase_s1_conditional_row_policy",
+  "date": "2026-08-12",
+  "expected_official_records": 480,
+  "fitted_policies": ["U0_uniform", "C1_capped_leverage"],
+  "official_arms": ["U0_uniform", "C1_capped_leverage", "S1_conditional"],
+  "official_topology": "S1b_fixed_A9",
+  "counterfactual_topology": "S1a_fixed_A2",
+  "verification": {
+    "passed": 21,
+    "failed": 0
+  }
+}

@@ -1,6 +1,6 @@
 # RMT routing geometry и bulk/spike experts: актуальный план разработки
 
-Дата актуализации: 2026-08-11. Статус: `phase_a3_tail_guarded_selector_implemented`.
+Дата актуализации: 2026-08-12. Статус: `bulk_spike_program_implemented`.
 
 Формальная постановка проверки гипотез: [Эксперимент: routing geometry и bulk/spike experts](../rmt_contraction_algo/RMT%20routing%20geometry%20и%20bulk-spike%20experiment.md).
 
@@ -22,7 +22,8 @@
 | P3.4 | завершен, критерий пройден | Независимый holdout: 320 из 320 запусков без ошибок, 97% побед при небазовом решении, худшее изменение основной метрики `-0.005%`. |
 | P4 | завершен, перенос на реальные данные отвергнут | Контракты leverage-семплирования, точный бюджет, IPW и диагностика подпространства; полная Phase S не подтвердила преимущество над uniform. |
 | P5 | диагностический этап завершен | Component-aware bulk/spike diagnostics прошли синтетический критерий идентифицируемости. |
-| P6 | следующий этап | Проверка exact-budget bulk/spike topology на реальных данных с подтверждённым A9-селектором. |
+| P6 | реализован, ожидает серверного запуска | Пилот, независимое подтверждение и полная AMLB-сетка exact-budget bulk/spike-топологии. |
+| P7 | реализован, ожидает плотной сетки | Полнообъёмный эталон, кривые деградации и оценивание законов масштабирования по бюджету. |
 
 Целевые сценарии запуска: `examples/benchmark/rmt_routing_geometry_experiment.py` для первичного отбора, `examples/benchmark/rmt_validation_geometry_selector_experiment.py` для A7, `examples/benchmark/rmt_cross_fitted_geometry_selector_experiment.py` для A8/A9 и `examples/benchmark/rmt_tail_guard_holdout.py` для независимого подтверждения A9. Быстрая локальная проверка: `examples/benchmark/rmt_routing_geometry_smoke.py`.
 
@@ -241,7 +242,17 @@ k=\max\left(1,\left\lceil(1-q)n\right\rceil\right),
 
 ### P6. Full-grid gate
 
-Полная AMLB grid запускается только если лучший routing geometry улучшает downstream metric или oracle regret без неприемлемого worst-case degradation, а hierarchical topology проходит synthetic identifiability tests.
+Полная AMLB-сетка запускается только после двух последовательных проверок:
+пилота на четырёх задачах и независимого подтверждения на восьми новых задачах.
+Оба этапа используют один внешний тест, точный общий бюджет и отдельную
+полнообъёмную модель для оценки деградации. Выбор B3 выполняется только по
+внутренним фолдам.
+
+Управляющий сценарий
+`examples/benchmark/rmt_bulk_spike_research_program.py` фиксирует семь этапов,
+их зависимости, ожидаемое число записей и состояние возобновления. Полная
+сетка и плотная сетка законов масштабирования блокируются, если предыдущий
+критерий безопасности не пройден.
 
 ## 6. Обязательные invariants и tests
 

@@ -10,6 +10,148 @@ import numpy as np
 
 
 _METRIC_DIRECTIONS = {"lower", "higher"}
+_GAIN_SCALES = {"absolute", "relative"}
+
+
+@dataclass(frozen=True)
+class ClassificationMetricGuardSpec:
+    """One probability or class-balance metric used as a selection guard."""
+
+    metric: str
+    direction: str
+    gain_scale: str
+    noninferiority_margin: float
+
+    def __post_init__(self) -> None:
+        if not self.metric:
+            raise ValueError("classification guard metric must be non-empty")
+        if self.direction not in _METRIC_DIRECTIONS:
+            raise ValueError("classification guard direction must be lower or higher")
+        if self.gain_scale not in _GAIN_SCALES:
+            raise ValueError("classification guard gain_scale must be absolute or relative")
+        if float(self.noninferiority_margin) < 0.0:
+            raise ValueError("classification guard margin must be non-negative")
+        object.__setattr__(self, "metric", self.metric.strip().lower())
+        object.__setattr__(
+            self,
+            "noninferiority_margin",
+            float(self.noninferiority_margin),
+        )
+
+
+@dataclass(frozen=True)
+class ClassificationRoutingGuardSpec:
+    """AMLB-compatible primary and probability-quality routing guards."""
+
+    roc_auc_absolute_margin: float = 0.005
+    log_loss_relative_margin: float = 0.01
+    metric_guards: Tuple[ClassificationMetricGuardSpec, ...] = (
+        ClassificationMetricGuardSpec(
+            metric="brier_score",
+            direction="lower",
+            gain_scale="relative",
+            noninferiority_margin=0.01,
+        ),
+        ClassificationMetricGuardSpec(
+            metric="expected_calibration_error",
+            direction="lower",
+            gain_scale="absolute",
+            noninferiority_margin=0.01,
+        ),
+        ClassificationMetricGuardSpec(
+            metric="f1_macro",
+            direction="higher",
+            gain_scale="absolute",
+            noninferiority_margin=0.01,
+        ),
+        ClassificationMetricGuardSpec(
+            metric="worst_class_recall",
+            direction="higher",
+            gain_scale="absolute",
+            noninferiority_margin=0.01,
+        ),
+    )
+    require_all_metrics: bool = True
+
+    def __post_init__(self) -> None:
+        if float(self.roc_auc_absolute_margin) < 0.0:
+            raise ValueError("roc_auc_absolute_margin must be non-negative")
+        if float(self.log_loss_relative_margin) < 0.0:
+            raise ValueError("log_loss_relative_margin must be non-negative")
+        guards = tuple(self.metric_guards)
+        names = tuple(item.metric for item in guards)
+        if len(set(names)) != len(names):
+            raise ValueError("classification metric guards must be unique")
+        object.__setattr__(self, "metric_guards", guards)
+
+    def primary_guard(self, metric: str) -> ClassificationMetricGuardSpec:
+        normalized = str(metric).strip().lower()
+        if normalized == "roc_auc":
+            return ClassificationMetricGuardSpec(
+                metric="roc_auc",
+                direction="higher",
+                gain_scale="absolute",
+                noninferiority_margin=float(self.roc_auc_absolute_margin),
+            )
+        if normalized == "log_loss":
+            return ClassificationMetricGuardSpec(
+                metric="log_loss",
+                direction="lower",
+                gain_scale="relative",
+                noninferiority_margin=float(self.log_loss_relative_margin),
+            )
+        raise ValueError(
+            "Classification routing guard supports roc_auc or log_loss primary metrics"
+        )
+
+
+@dataclass(frozen=True)
+class RoutingGeometryGuardMetricScore:
+    """One held-out classification guard metric."""
+
+    metric: str
+    value: float
+    direction: str
+
+    def __post_init__(self) -> None:
+        if not self.metric:
+            raise ValueError("guard metric must be non-empty")
+        if self.direction not in _METRIC_DIRECTIONS:
+            raise ValueError("guard metric direction must be lower or higher")
+        if not np.isfinite(float(self.value)):
+            raise ValueError("guard metric value must be finite")
+        object.__setattr__(self, "metric", self.metric.strip().lower())
+        object.__setattr__(self, "value", float(self.value))
+
+
+@dataclass(frozen=True)
+class ClassificationRoutingGuardEvidence:
+    """Paired fold evidence for one classification non-inferiority guard."""
+
+    metric: str
+    direction: str
+    gain_scale: str
+    noninferiority_margin: float
+    paired_fold_count: int
+    mean_gain: Optional[float]
+    median_gain: Optional[float]
+    confidence_interval: Optional[Tuple[float, float]]
+    eligible: bool
+    rejection_reasons: Tuple[str, ...] = ()
+
+    def summary(self) -> dict[str, object]:
+        return {
+            "metric": self.metric,
+            "direction": self.direction,
+            "gain_scale": self.gain_scale,
+            "noninferiority_margin": self.noninferiority_margin,
+            "paired_fold_count": self.paired_fold_count,
+            "mean_gain": self.mean_gain,
+            "median_gain": self.median_gain,
+            "confidence_interval": self.confidence_interval,
+            "eligible": self.eligible,
+            "rejection_reasons": list(self.rejection_reasons),
+        }
 
 
 @dataclass(frozen=True)
@@ -49,6 +191,7 @@ class RoutingGeometryFoldScore:
     robust_value: Optional[float] = None
     robust_direction: Optional[str] = None
     tail_risk: Optional[RoutingGeometryTailRiskScore] = None
+    guard_metrics: Tuple[RoutingGeometryGuardMetricScore, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.arm_name:
@@ -79,8 +222,18 @@ class RoutingGeometryFoldScore:
             if not np.isfinite(float(self.robust_value)):
                 raise ValueError("robust_value must be finite")
 
+        guards = tuple(self.guard_metrics)
+        guard_names = tuple(item.metric for item in guards)
+        if len(set(guard_names)) != len(guard_names):
+            raise ValueError("guard metrics must be unique within a fold score")
+
         object.__setattr__(self, "evaluation_rows", int(self.evaluation_rows))
         object.__setattr__(self, "selected_temperature", float(self.selected_temperature))
+        object.__setattr__(self, "guard_metrics", guards)
+
+    @property
+    def guard_metric_map(self) -> dict[str, RoutingGeometryGuardMetricScore]:
+        return {item.metric: item for item in self.guard_metrics}
 
     def summary(self) -> dict[str, object]:
         return {
@@ -108,6 +261,7 @@ class RoutingGeometryFoldScore:
             ),
             "evaluation_rows": self.evaluation_rows,
             "selected_temperature": self.selected_temperature,
+            "guard_metrics": [item.__dict__ for item in self.guard_metrics],
         }
 
 
@@ -130,6 +284,7 @@ class CrossFittedRoutingGeometrySelectionSpec:
     require_robust_metric: bool = False
     tail_guard_primary_metrics: Tuple[str, ...] = ()
     tail_noninferiority_margin: Optional[float] = None
+    classification_guard: Optional[ClassificationRoutingGuardSpec] = None
     random_state: int = 42
 
     def __post_init__(self) -> None:
@@ -192,6 +347,9 @@ class RoutingGeometryCandidateEvidence:
     tail_positive_fold_fraction: Optional[float]
     eligible: bool
     rejection_reasons: Tuple[str, ...] = ()
+    classification_guard_evidence: Tuple[
+        ClassificationRoutingGuardEvidence, ...
+    ] = ()
 
     def summary(self) -> dict[str, object]:
         return {
@@ -215,6 +373,9 @@ class RoutingGeometryCandidateEvidence:
             "tail_positive_fold_fraction": self.tail_positive_fold_fraction,
             "eligible": self.eligible,
             "rejection_reasons": list(self.rejection_reasons),
+            "classification_guard_evidence": [
+                item.summary() for item in self.classification_guard_evidence
+            ],
         }
 
 
@@ -434,6 +595,19 @@ class CrossFittedRoutingGeometrySelector:
         elif tail_required:
             reasons.append("tail_metric_required")
 
+        classification_guard_evidence = self._classification_guard_evidence(
+            arm_name=arm_name,
+            paired_folds=paired_folds,
+            reference=reference,
+            candidate=candidate,
+            primary_metric=primary_metric,
+        )
+        for guard in classification_guard_evidence:
+            reasons.extend(
+                f"classification_guard:{guard.metric}:{reason}"
+                for reason in guard.rejection_reasons
+            )
+
         return RoutingGeometryCandidateEvidence(
             arm_name=arm_name,
             paired_fold_count=len(paired_folds),
@@ -455,7 +629,106 @@ class CrossFittedRoutingGeometrySelector:
             tail_positive_fold_fraction=tail_positive_fraction,
             eligible=not reasons,
             rejection_reasons=tuple(reasons),
+            classification_guard_evidence=classification_guard_evidence,
         )
+
+    def _classification_guard_evidence(
+        self,
+        *,
+        arm_name: str,
+        paired_folds: Sequence[str],
+        reference: dict[str, RoutingGeometryFoldScore],
+        candidate: dict[str, RoutingGeometryFoldScore],
+        primary_metric: Optional[str],
+    ) -> Tuple[ClassificationRoutingGuardEvidence, ...]:
+        spec = self.spec.classification_guard
+        if spec is None or primary_metric not in {"roc_auc", "log_loss"}:
+            return ()
+
+        metric_specs = (spec.primary_guard(primary_metric), *spec.metric_guards)
+        evidence = []
+        for offset, metric_spec in enumerate(metric_specs, start=100):
+            gains = []
+            missing = False
+            for fold_id in paired_folds:
+                reference_score = reference[fold_id]
+                candidate_score = candidate[fold_id]
+                if metric_spec.metric == primary_metric:
+                    reference_value = reference_score.primary_value
+                    candidate_value = candidate_score.primary_value
+                else:
+                    reference_metric = reference_score.guard_metric_map.get(
+                        metric_spec.metric
+                    )
+                    candidate_metric = candidate_score.guard_metric_map.get(
+                        metric_spec.metric
+                    )
+                    if reference_metric is None or candidate_metric is None:
+                        missing = True
+                        continue
+                    reference_value = reference_metric.value
+                    candidate_value = candidate_metric.value
+                gains.append(
+                    self._scaled_gain(
+                        reference_value,
+                        candidate_value,
+                        metric_spec.direction,
+                        metric_spec.gain_scale,
+                    )
+                )
+
+            rejection_reasons = []
+            if missing and spec.require_all_metrics:
+                rejection_reasons.append("required_metric_missing")
+            if len(gains) != len(paired_folds):
+                rejection_reasons.append("incomplete_fold_pairs")
+            if not gains:
+                evidence.append(
+                    ClassificationRoutingGuardEvidence(
+                        metric=metric_spec.metric,
+                        direction=metric_spec.direction,
+                        gain_scale=metric_spec.gain_scale,
+                        noninferiority_margin=metric_spec.noninferiority_margin,
+                        paired_fold_count=0,
+                        mean_gain=None,
+                        median_gain=None,
+                        confidence_interval=None,
+                        eligible=False,
+                        rejection_reasons=tuple(dict.fromkeys(rejection_reasons)),
+                    )
+                )
+                continue
+
+            gain_array = np.asarray(gains, dtype=float)
+            mean_gain = float(np.mean(gain_array))
+            median_gain = float(np.median(gain_array))
+            confidence_interval = self._bootstrap_interval(
+                gain_array,
+                arm_name,
+                offset=offset,
+            )
+            margin = float(metric_spec.noninferiority_margin)
+            if mean_gain < -margin:
+                rejection_reasons.append("mean_exceeds_harm_margin")
+            if median_gain < -margin:
+                rejection_reasons.append("median_exceeds_harm_margin")
+            if confidence_interval[0] < -margin:
+                rejection_reasons.append("confidence_interval_exceeds_harm_margin")
+            evidence.append(
+                ClassificationRoutingGuardEvidence(
+                    metric=metric_spec.metric,
+                    direction=metric_spec.direction,
+                    gain_scale=metric_spec.gain_scale,
+                    noninferiority_margin=margin,
+                    paired_fold_count=len(gains),
+                    mean_gain=mean_gain,
+                    median_gain=median_gain,
+                    confidence_interval=confidence_interval,
+                    eligible=not rejection_reasons,
+                    rejection_reasons=tuple(dict.fromkeys(rejection_reasons)),
+                )
+            )
+        return tuple(evidence)
 
     @staticmethod
     def _empty_evidence(
@@ -519,6 +792,13 @@ class CrossFittedRoutingGeometrySelector:
             raise ValueError(
                 "Paired tail risk metrics, directions, and quantiles must match"
             )
+        reference_guards = reference.guard_metric_map
+        candidate_guards = candidate.guard_metric_map
+        if set(reference_guards) != set(candidate_guards):
+            raise ValueError("Paired scores must agree on guard metric availability")
+        for metric, reference_guard in reference_guards.items():
+            if reference_guard.direction != candidate_guards[metric].direction:
+                raise ValueError("Paired guard metric directions must match")
 
     @staticmethod
     def _relative_gain(reference: float, candidate: float, direction: str) -> float:
@@ -529,6 +809,23 @@ class CrossFittedRoutingGeometrySelector:
             else float(candidate) - float(reference)
         )
         return difference / scale
+
+    @staticmethod
+    def _scaled_gain(
+        reference: float,
+        candidate: float,
+        direction: str,
+        scale: str,
+    ) -> float:
+        difference = (
+            float(reference) - float(candidate)
+            if direction == "lower"
+            else float(candidate) - float(reference)
+        )
+        if scale == "absolute":
+            return difference
+        denominator = max(abs(float(reference)), np.finfo(float).eps)
+        return difference / denominator
 
     def _bootstrap_interval(
         self,

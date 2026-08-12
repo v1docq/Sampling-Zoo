@@ -386,6 +386,8 @@ def compute_row_spectral_participation(
         split.spike_mask
     ]
     spike_energy = np.sum(spike_contributions, axis=1)
+    active_spike_rows = spike_energy > float(epsilon)
+    spike_energy = np.where(active_spike_rows, spike_energy, 0.0)
     bulk_energy = squared_basis @ bulk_weights
     total = spike_energy + bulk_energy
     signalness = np.divide(
@@ -394,11 +396,10 @@ def compute_row_spectral_participation(
         out=np.zeros_like(spike_energy),
         where=total > 0.0,
     )
-    signatures = np.divide(
-        spike_contributions,
-        spike_energy.reshape(-1, 1) + float(epsilon),
-        out=np.zeros_like(spike_contributions),
-        where=spike_energy.reshape(-1, 1) > 0.0,
+    signatures = np.zeros_like(spike_contributions)
+    signatures[active_spike_rows] = (
+        spike_contributions[active_spike_rows]
+        / spike_energy[active_spike_rows, None]
     )
     return RowSpectralParticipationContract(
         leverage=np.sum(squared_basis, axis=1),

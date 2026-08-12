@@ -1,0 +1,14 @@
+{
+  "cross_fitted_selection": {
+    "minimum_folds": 3,
+    "confidence_level": 0.95,
+    "primary_noninferiority_margin": 0.005,
+    "minimum_positive_fold_fraction": 0.6666666666666666,
+    "tail_noninferiority_margin": 0.01,
+    "require_class_coverage": true
+  },
+  "real_pilot": {
+    "minimum_capped_selection_rate": 0.1,
+    "minimum_capped_win_rate_when_selected": 0.7
+  }
+}

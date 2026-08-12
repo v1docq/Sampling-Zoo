@@ -33,6 +33,7 @@ from routing_geometry_replay import (  # noqa: E402
     default_validation_selector_arms,
 )
 from sampling_zoo.core.experiment.routing_geometry_selection import (  # noqa: E402
+    ClassificationRoutingGuardSpec,
     CrossFittedRoutingGeometrySelectionSpec,
     CrossFittedRoutingGeometrySelector,
 )
@@ -53,6 +54,9 @@ DEFAULT_CROSS_FITTED_CLASSIFICATION_TASKS: tuple[str, ...] = (
 )
 DEFAULT_CROSS_FITTED_SELECTOR_ARM_NAME = "A8_cross_fitted_selected"
 DEFAULT_TAIL_GUARDED_SELECTOR_ARM_NAME = "A9_tail_guarded_cross_fitted_selected"
+DEFAULT_CLASSIFICATION_GUARDED_SELECTOR_ARM_NAME = (
+    "A10_classification_guarded_cross_fitted_selected"
+)
 DEFAULT_TAIL_GUARD_REGRESSION_TASKS: tuple[str, ...] = (
     "diamonds",
     "OnlineNewsPopularity",
@@ -60,6 +64,16 @@ DEFAULT_TAIL_GUARD_REGRESSION_TASKS: tuple[str, ...] = (
 DEFAULT_TAIL_GUARD_CLASSIFICATION_TASKS: tuple[str, ...] = (
     "bank-marketing",
     "covertype",
+)
+DEFAULT_CLASSIFICATION_GUARD_BINARY_TASKS: tuple[str, ...] = (
+    "adult",
+    "bank-marketing",
+    "PhishingWebsites",
+)
+DEFAULT_CLASSIFICATION_GUARD_MULTICLASS_TASKS: tuple[str, ...] = (
+    "car",
+    "segment",
+    "vehicle",
 )
 
 
@@ -79,6 +93,9 @@ class CrossFittedRoutingGeometryExperimentConfig(RoutingGeometryExperimentConfig
     tail_risk_quantile: float = 0.90
     tail_noninferiority_margin: float = 0.005
     regression_stratification_bins: Optional[int] = None
+    classification_routing_guard: bool = False
+    roc_auc_absolute_margin: float = 0.005
+    log_loss_relative_margin: float = 0.01
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -108,6 +125,10 @@ class CrossFittedRoutingGeometryExperimentConfig(RoutingGeometryExperimentConfig
                 "regression_stratification_bins is required when "
                 "regression_tail_guard is enabled"
             )
+        if float(self.roc_auc_absolute_margin) < 0.0:
+            raise ValueError("roc_auc_absolute_margin must be non-negative")
+        if float(self.log_loss_relative_margin) < 0.0:
+            raise ValueError("log_loss_relative_margin must be non-negative")
 
 
 class CrossFittedRoutingGeometryExperimentOrchestrator(
@@ -149,6 +170,18 @@ class CrossFittedRoutingGeometryExperimentOrchestrator(
                 ("rmse",) if config.regression_tail_guard else ()
             ),
             tail_noninferiority_margin=float(config.tail_noninferiority_margin),
+            classification_guard=(
+                ClassificationRoutingGuardSpec(
+                    roc_auc_absolute_margin=float(
+                        config.roc_auc_absolute_margin
+                    ),
+                    log_loss_relative_margin=float(
+                        config.log_loss_relative_margin
+                    ),
+                )
+                if config.classification_routing_guard
+                else None
+            ),
             random_state=int(config.seeds[0]),
         )
         self.selector = selector or CrossFittedRoutingGeometrySelector(spec)
@@ -207,12 +240,24 @@ class CrossFittedRoutingGeometryExperimentOrchestrator(
                 if self.config.regression_stratification_bins is None
                 else int(self.config.regression_stratification_bins)
             ),
+            "classification_routing_guard": bool(
+                self.config.classification_routing_guard
+            ),
+            "roc_auc_absolute_margin": float(
+                self.config.roc_auc_absolute_margin
+            ),
+            "log_loss_relative_margin": float(
+                self.config.log_loss_relative_margin
+            ),
         }
         defaults = {
             "regression_tail_guard": False,
             "tail_risk_quantile": 0.90,
             "tail_noninferiority_margin": 0.005,
             "regression_stratification_bins": None,
+            "classification_routing_guard": False,
+            "roc_auc_absolute_margin": 0.005,
+            "log_loss_relative_margin": 0.01,
         }
         mismatches = {
             name: {
@@ -578,6 +623,9 @@ def run_rmt_cross_fitted_geometry_selector_experiment(
     tail_risk_quantile: float = 0.90,
     tail_noninferiority_margin: float = 0.005,
     regression_stratification_bins: Optional[int] = None,
+    classification_routing_guard: bool = False,
+    roc_auc_absolute_margin: float = 0.005,
+    log_loss_relative_margin: float = 0.01,
     selector_arm_name: Optional[str] = None,
     output_dir: Optional[str | Path] = None,
     show_progress: bool = True,
@@ -610,10 +658,57 @@ def run_rmt_cross_fitted_geometry_selector_experiment(
         tail_risk_quantile=tail_risk_quantile,
         tail_noninferiority_margin=tail_noninferiority_margin,
         regression_stratification_bins=regression_stratification_bins,
+        classification_routing_guard=classification_routing_guard,
+        roc_auc_absolute_margin=roc_auc_absolute_margin,
+        log_loss_relative_margin=log_loss_relative_margin,
         output_dir=None if output_dir is None else Path(output_dir),
         show_progress=show_progress,
     )
     return CrossFittedRoutingGeometryExperimentOrchestrator(config).run()
+
+
+def run_rmt_classification_guarded_geometry_selector_experiment(
+    *,
+    classification_tasks: Optional[Sequence[str]] = None,
+    models: Sequence[str] = ("lightgbm",),
+    budget_ratios: Sequence[float] = DEFAULT_ROUTING_BUDGETS,
+    seeds: Sequence[int] = DEFAULT_ROUTING_SEEDS,
+    n_partitions: int = 5,
+    max_train_rows: Optional[int] = 100_000,
+    sampler_extra_params: Optional[Mapping[str, Any]] = None,
+    selection_folds: int = 5,
+    roc_auc_absolute_margin: float = 0.005,
+    log_loss_relative_margin: float = 0.01,
+    output_dir: Optional[str | Path] = None,
+    show_progress: bool = True,
+) -> pd.DataFrame:
+    """Run the AMLB-compatible guarded geometry selector on six tasks."""
+
+    default_tasks = (
+        *DEFAULT_CLASSIFICATION_GUARD_BINARY_TASKS,
+        *DEFAULT_CLASSIFICATION_GUARD_MULTICLASS_TASKS,
+    )
+    return run_rmt_cross_fitted_geometry_selector_experiment(
+        regression_tasks=(),
+        classification_tasks=(
+            default_tasks
+            if classification_tasks is None
+            else tuple(classification_tasks)
+        ),
+        models=models,
+        budget_ratios=budget_ratios,
+        seeds=seeds,
+        n_partitions=n_partitions,
+        max_train_rows=max_train_rows,
+        sampler_extra_params=sampler_extra_params,
+        selection_folds=selection_folds,
+        classification_routing_guard=True,
+        roc_auc_absolute_margin=roc_auc_absolute_margin,
+        log_loss_relative_margin=log_loss_relative_margin,
+        selector_arm_name=DEFAULT_CLASSIFICATION_GUARDED_SELECTOR_ARM_NAME,
+        output_dir=output_dir,
+        show_progress=show_progress,
+    )
 
 
 def run_rmt_tail_guarded_geometry_selector_experiment(

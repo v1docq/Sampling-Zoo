@@ -70,11 +70,24 @@ from .resume import (
     scientific_experiment_config,
 )
 from .resume_runtime import ResumeSession, load_resume_session
+from .row_policy_selection import (
+    CrossFittedRowPolicySelectionSpec,
+    CrossFittedRowPolicySelector,
+    RowPolicyFoldScore,
+    RowSamplingPolicyEvidence,
+    RowSamplingPolicyRequest,
+    RowSamplingPolicyResult,
+    RowSamplingPolicySpec,
+)
 from .routing_geometry_selection import (
+    ClassificationMetricGuardSpec,
+    ClassificationRoutingGuardEvidence,
+    ClassificationRoutingGuardSpec,
     CrossFittedRoutingGeometrySelectionSpec,
     CrossFittedRoutingGeometrySelector,
     RoutingGeometryCandidateEvidence,
     RoutingGeometryFoldScore,
+    RoutingGeometryGuardMetricScore,
     RoutingGeometrySelectionDecision,
     RoutingGeometryTailRiskScore,
 )
@@ -89,6 +102,14 @@ from .routing_replay import (
     upper_tail_mean_absolute_error,
 )
 from .stages import ExperimentPlan, ExperimentStageId, StageRegistry, StageRequest, StageResult
+from .research_program import (
+    ResearchProgramPlan,
+    ResearchStageResult,
+    ResearchStageSpec,
+    ResearchStageStatus,
+    deserialize_stage_result,
+    selected_stage_closure,
+)
 
 __all__ = [
     "ARTIFACT_MANIFEST_FILENAME",
@@ -99,8 +120,13 @@ __all__ = [
     "ArtifactManifestParseFailure",
     "ArtifactManifestViolation",
     "ChunkModelContract",
+    "ClassificationMetricGuardSpec",
+    "ClassificationRoutingGuardEvidence",
+    "ClassificationRoutingGuardSpec",
     "CrossFittedRoutingGeometrySelectionSpec",
     "CrossFittedRoutingGeometrySelector",
+    "CrossFittedRowPolicySelectionSpec",
+    "CrossFittedRowPolicySelector",
     "DatasetContract",
     "DatasetRunRef",
     "EvaluationContract",
@@ -108,6 +134,10 @@ __all__ = [
     "ExperimentContractError",
     "ExperimentConfigRef",
     "ExperimentPlan",
+    "ResearchProgramPlan",
+    "ResearchStageResult",
+    "ResearchStageSpec",
+    "ResearchStageStatus",
     "ExperimentStageId",
     "FoldContract",
     "InvalidExperimentConfigError",
@@ -125,8 +155,14 @@ __all__ = [
     "PartitionTrainingResult",
     "PackageVersion",
     "RoutingContract",
+    "RowPolicyFoldScore",
+    "RowSamplingPolicyEvidence",
+    "RowSamplingPolicyRequest",
+    "RowSamplingPolicyResult",
+    "RowSamplingPolicySpec",
     "RoutingGeometryCandidateEvidence",
     "RoutingGeometryFoldScore",
+    "RoutingGeometryGuardMetricScore",
     "RoutingGeometrySelection",
     "RoutingGeometrySelectionDecision",
     "RoutingGeometryTailRiskScore",
@@ -148,6 +184,8 @@ __all__ = [
     "ResumeRecordError",
     "ResumeSession",
     "StageRegistry",
+    "deserialize_stage_result",
+    "selected_stage_closure",
     "StageRequest",
     "StageResult",
     "StrategyGridContract",

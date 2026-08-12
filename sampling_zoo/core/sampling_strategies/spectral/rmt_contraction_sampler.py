@@ -19,6 +19,13 @@ from .bulk_spike import (
     build_spectral_component_split,
     compute_row_spectral_participation,
 )
+from .bulk_spike_topology import (
+    BulkSpikeExpertTopologySpec,
+    BulkSpikeHierarchicalRouter,
+    BulkSpikePartitionContract,
+    BulkSpikeTopologyBuilder,
+    BulkSpikeTopologyMode,
+)
 from .cluster_selection import ClusterSelectionResult, SpectralClusterSelector
 from .classification_sampling import (
     ClassCoverageSelectionPlan,
@@ -48,6 +55,7 @@ from .routing_contracts import (
     PartitionGeometryContract,
     PartitionGeometrySpec,
     RoutingDistanceContract,
+    RoutingValueKind,
     RoutingWeightContract,
 )
 from .routing_geometry import PartitionGeometryBuilder, route_partition_geometry
@@ -134,6 +142,16 @@ class RMTContractionConfig:
     null_min_selection_frequency: float = 0.80
     null_primary_policy: str = "feature_permutation"
     component_diagnostic_enabled: bool = False
+    expert_topology: str = "standard"
+    topology_max_experts: int = 5
+    topology_min_partition_size: int = 32
+    topology_budget_policy: str = "excess_energy"
+    topology_fixed_spike_share: float = 0.25
+    topology_min_spike_share: float = 0.10
+    topology_max_spike_share: float = 0.50
+    topology_signal_threshold: float = 0.50
+    topology_spike_router: str = "gmm_posterior"
+    topology_covariance_shrinkage: float = 0.10
     subspace_diagnostic_enabled: bool = False
     subspace_resamples: int = 16
     subspace_quantile: float = 0.90
@@ -484,6 +502,37 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
                 "component_diagnostic_enabled=True requires "
                 "null_diagnostic_enabled=True"
             )
+        self.expert_topology = self._validate_choice(
+            "expert_topology",
+            cfg.expert_topology,
+            ("standard", "bulk_single_spike", "bulk_multi_spike"),
+        )
+        self.topology_spec_ = BulkSpikeExpertTopologySpec(
+            name=self.expert_topology,
+            mode={
+                "standard": "standard",
+                "bulk_single_spike": "single_spike",
+                "bulk_multi_spike": "multi_spike",
+            }[self.expert_topology],
+            max_experts=cfg.topology_max_experts,
+            min_partition_size=cfg.topology_min_partition_size,
+            budget_policy=cfg.topology_budget_policy,
+            fixed_spike_share=cfg.topology_fixed_spike_share,
+            min_spike_share=cfg.topology_min_spike_share,
+            max_spike_share=cfg.topology_max_spike_share,
+            signal_threshold=cfg.topology_signal_threshold,
+            spike_router=cfg.topology_spike_router,
+            covariance_shrinkage=cfg.topology_covariance_shrinkage,
+        )
+        if self.expert_topology != "standard" and not self.component_diagnostic_enabled:
+            raise ValueError(
+                "bulk/spike expert_topology requires component_diagnostic_enabled=True"
+            )
+        self.topology_builder_ = BulkSpikeTopologyBuilder()
+        self.hierarchical_router_ = BulkSpikeHierarchicalRouter()
+        self.bulk_spike_topology_: Optional[BulkSpikePartitionContract] = None
+        self.spike_partition_geometry_: Optional[PartitionGeometryContract] = None
+        self.initial_right_basis_: Optional[np.ndarray] = None
         subspace_config = SpectralSubspaceDiagnosticConfig.from_values(
             enabled=cfg.subspace_diagnostic_enabled,
             n_resamples=cfg.subspace_resamples,
@@ -763,6 +812,7 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             stage.update(1)
             started = perf_counter()
             self._fit_clusters_and_partitions(X_num, scores, target)
+            self._fit_bulk_spike_topology(target)
             stage_seconds["partition_selection_and_sampling"] = perf_counter() - started
             stage.update(1)
             started = perf_counter()
@@ -789,6 +839,7 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self.view_specs_ = []
         self.initial_singular_values_ = None
         self.initial_left_basis_ = None
+        self.initial_right_basis_ = None
         self.left_basis_ = None
         self.spectral_null_diagnostic_result_ = SpectralNullDiagnosticResult.disabled(
             self.spectral_null_diagnostic.config.primary_policy
@@ -809,6 +860,8 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self.class_coverage_guaranteed_ = False
         self.cluster_centers_ = None
         self.partition_geometry_ = None
+        self.bulk_spike_topology_ = None
+        self.spike_partition_geometry_ = None
         self.last_routing_distances_ = None
         self.last_routing_weights_ = None
         self.spectral_component_split_ = (
@@ -862,6 +915,7 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         initial_rank = self._resolve_initial_rank(n_samples, n_features)
         basis = self._get_rmt_backend().compute_spectral_basis(M, rank=initial_rank)
         self.initial_left_basis_ = np.asarray(basis.U, dtype=np.float64).copy()
+        self.initial_right_basis_ = np.asarray(basis.Vt, dtype=np.float64).copy()
         self.initial_singular_values_ = np.asarray(
             basis.singular_values,
             dtype=np.float64,
@@ -1058,6 +1112,171 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self.cluster_labels_ = labels
         self._build_partitions_from_labels(labels, scores, target)
 
+    def _fit_bulk_spike_topology(
+        self,
+        target: Optional[Union[np.ndarray, pd.Series]],
+    ) -> None:
+        if self.expert_topology == "standard":
+            return
+        if self.row_spectral_participation_ is None:
+            raise RuntimeError("Bulk/spike topology requires row spectral participation")
+        total_budget = int(sum(len(rows) for rows in self.partitions.values()))
+        topology = self.topology_builder_.build(
+            self.topology_spec_,
+            self.row_spectral_participation_,
+            total_budget=total_budget,
+            random_state=self.random_state,
+        )
+        topology = self._repair_topology_class_coverage(topology, target)
+        self.bulk_spike_topology_ = topology
+        self.partitions = {
+            name: rows.copy()
+            for name, rows in zip(topology.partition_names, topology.row_indices)
+        }
+        self.partition_names_ = list(topology.partition_names)
+        self.partition_to_cluster_ = {
+            name: index for index, name in enumerate(topology.partition_names)
+        }
+        self.cluster_labels_ = self._bulk_spike_source_labels(topology)
+        self.partition_sketch_plans_ = {}
+        self.partition_training_weights_ = {}
+        self.partition_inclusion_probabilities_ = {}
+        self.partition_subspace_preservation_ = {}
+
+    def _repair_topology_class_coverage(
+        self,
+        topology: BulkSpikePartitionContract,
+        target: Optional[Union[np.ndarray, pd.Series]],
+    ) -> BulkSpikePartitionContract:
+        if target is None or infer_target_type(target, self.cluster_target_type) != "classification":
+            self.class_coverage_guaranteed_ = False
+            return topology
+        values = np.asarray(target).reshape(-1)
+        rows = [np.asarray(indices, dtype=int).copy() for indices in topology.row_indices]
+        selected = set(np.concatenate(rows).tolist())
+        all_indices = np.arange(values.size, dtype=int)
+        global_classes = np.unique(values)
+        scores = np.asarray(self.leverage_scores_, dtype=float)
+        repairs = {}
+        for partition_index, (name, indices) in enumerate(
+            zip(topology.partition_names, rows)
+        ):
+            before = np.unique(values[indices])
+            removed_rows = []
+            added_rows = []
+            if indices.size >= global_classes.size:
+                missing_classes = [
+                    label for label in global_classes if label not in before
+                ]
+                for missing_class in missing_classes:
+                    candidates = np.asarray(
+                        [
+                            index
+                            for index in all_indices
+                            if index not in selected
+                            and values[index] == missing_class
+                        ],
+                        dtype=int,
+                    )
+                    if candidates.size == 0:
+                        continue
+                    current_values, current_counts = np.unique(
+                        values[indices],
+                        return_counts=True,
+                    )
+                    removable_classes = set(
+                        current_values[current_counts > 1].tolist()
+                    )
+                    victim_positions = np.asarray(
+                        [
+                            position
+                            for position, row in enumerate(indices)
+                            if values[row] in removable_classes
+                        ],
+                        dtype=int,
+                    )
+                    if victim_positions.size == 0:
+                        continue
+                    replacement = int(candidates[np.argmax(scores[candidates])])
+                    victim_position = int(
+                        victim_positions[
+                            np.argmin(scores[indices[victim_positions]])
+                        ]
+                    )
+                    victim = int(indices[victim_position])
+                    indices[victim_position] = replacement
+                    selected.remove(victim)
+                    selected.add(replacement)
+                    removed_rows.append(victim)
+                    added_rows.append(replacement)
+            rows[partition_index] = np.sort(indices)
+            after = np.unique(values[rows[partition_index]])
+            if removed_rows or after.size != before.size:
+                repairs[name] = {
+                    "removed_rows": removed_rows,
+                    "added_rows": added_rows,
+                    "classes_before": before.tolist(),
+                    "classes_after": after.tolist(),
+                    "missing_classes_after": [
+                        label for label in global_classes if label not in after
+                    ],
+                }
+        self.class_coverage_guaranteed_ = bool(
+            rows
+            and all(
+                np.unique(values[indices]).size == global_classes.size
+                for indices in rows
+            )
+        )
+        return BulkSpikePartitionContract(
+            topology_name=topology.topology_name,
+            mode=topology.mode,
+            partition_names=topology.partition_names,
+            regimes=topology.regimes,
+            row_indices=tuple(rows),
+            total_budget=topology.total_budget,
+            max_experts=topology.max_experts,
+            metadata={
+                **dict(topology.metadata),
+                "classification_exact_budget_repairs": repairs,
+                "global_classes": global_classes.tolist(),
+                "class_coverage_guaranteed": self.class_coverage_guaranteed_,
+            },
+        )
+
+    def _bulk_spike_source_labels(
+        self,
+        topology: BulkSpikePartitionContract,
+    ) -> np.ndarray:
+        participation = self.row_spectral_participation_
+        if participation is None:
+            raise RuntimeError("Row spectral participation is not fitted")
+        labels = np.full(participation.n_rows, -1, dtype=int)
+        bulk_columns = [
+            index for index, regime in enumerate(topology.regimes) if regime == "bulk"
+        ]
+        spike_columns = [
+            index
+            for index, regime in enumerate(topology.regimes)
+            if regime.startswith("spike")
+        ]
+        active = participation.signalness >= self.topology_spec_.signal_threshold
+        if bulk_columns:
+            labels[~active] = bulk_columns[0]
+        if len(spike_columns) == 1:
+            labels[active] = spike_columns[0]
+        elif spike_columns:
+            components = [
+                int(topology.regimes[index].split(":", 1)[1])
+                for index in spike_columns
+            ]
+            assignments = np.argmax(
+                participation.spike_signatures[:, components],
+                axis=1,
+            )
+            labels[active] = np.asarray(spike_columns)[assignments[active]]
+        return labels
+
     def _fit_cluster_labels(
         self,
         embedding: np.ndarray,
@@ -1248,6 +1467,12 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             raise RuntimeError("Sampler not fitted. Call fit() first.")
         if not self.partition_names_:
             raise RuntimeError("No partitions available. Call fit() first.")
+        if self.bulk_spike_topology_ is not None:
+            if geometry_spec is not None:
+                raise ValueError(
+                    "Bulk/spike topology uses its fitted hierarchical routing geometry"
+                )
+            return self._predict_bulk_spike_routing(X, temperature=temperature)
         geometry = (
             self.partition_geometry_
             if geometry_spec is None
@@ -1259,6 +1484,76 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             self.transform_embedding(X),
             geometry=geometry,
             temperature=temperature,
+        )
+
+    def _predict_bulk_spike_routing(
+        self,
+        X: ArrayLike,
+        *,
+        temperature: Optional[float],
+    ) -> Tuple[RoutingDistanceContract, RoutingWeightContract]:
+        topology = self.bulk_spike_topology_
+        if topology is None:
+            raise RuntimeError("Bulk/spike topology is not fitted")
+        participation = self.transform_spectral_participation(X)
+        spike_columns = [
+            index
+            for index, regime in enumerate(topology.regimes)
+            if regime.startswith("spike")
+        ]
+        conditional = None
+        if len(spike_columns) > 1:
+            if self.spike_partition_geometry_ is None:
+                raise RuntimeError("Conditional spike geometry is not fitted")
+            components = [
+                int(topology.regimes[index].split(":", 1)[1])
+                for index in spike_columns
+            ]
+            _, conditional_contract = route_partition_geometry(
+                backend=self._get_rmt_backend(),
+                embedding=participation.spike_signatures[:, components],
+                geometry=self.spike_partition_geometry_,
+                temperature=(
+                    self.routing_temperature if temperature is None else temperature
+                ),
+            )
+            conditional = conditional_contract.weights
+        weights = self.hierarchical_router_.route(
+            topology,
+            spike_probability=participation.signalness,
+            conditional_spike_weights=conditional,
+        )
+        distance = RoutingDistanceContract(
+            partition_names=weights.partition_names,
+            values=-np.log(np.maximum(weights.weights, 1e-12)),
+            kind=RoutingValueKind.DISTANCE,
+            diagnostics={"source": "bulk_spike_hierarchical_weights"},
+        )
+        self.last_routing_distances_ = distance
+        self.last_routing_weights_ = weights
+        return distance, weights
+
+    def transform_spectral_participation(
+        self,
+        X: ArrayLike,
+    ) -> RowSpectralParticipationContract:
+        """Project new rows into the initial spectrum used by bulk/spike diagnostics."""
+
+        if (
+            self.initial_right_basis_ is None
+            or self.initial_singular_values_ is None
+        ):
+            raise RuntimeError("Initial spectral basis is not fitted")
+        X_num = self._transform_features(X)
+        unfolding = self._build_mode0_unfolding(X_num, fit=False, rng=None)
+        left_coordinates = self._get_rmt_backend().project_new_unfolding(
+            unfolding,
+            self.initial_right_basis_,
+            self.initial_singular_values_,
+        )
+        return compute_row_spectral_participation(
+            left_coordinates,
+            self.spectral_component_split_,
         )
 
     def route_embedding(
@@ -1311,8 +1606,59 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         )
 
     def _fit_partition_geometry(self) -> None:
+        if self.bulk_spike_topology_ is not None:
+            self.partition_geometry_ = None
+            self._fit_spike_partition_geometry()
+            return
         self.partition_geometry_ = self.build_partition_geometry(
             self.routing_geometry_spec
+        )
+
+    def _fit_spike_partition_geometry(self) -> None:
+        topology = self.bulk_spike_topology_
+        participation = self.row_spectral_participation_
+        if topology is None or participation is None:
+            self.spike_partition_geometry_ = None
+            return
+        spike_columns = [
+            index
+            for index, regime in enumerate(topology.regimes)
+            if regime.startswith("spike")
+        ]
+        if len(spike_columns) <= 1:
+            self.spike_partition_geometry_ = None
+            return
+        components = [
+            int(topology.regimes[index].split(":", 1)[1])
+            for index in spike_columns
+        ]
+        signatures = participation.spike_signatures[:, components]
+        partitions = {
+            topology.partition_names[index]: topology.row_indices[index]
+            for index in spike_columns
+        }
+        mapping = {
+            topology.partition_names[index]: index for index in spike_columns
+        }
+        router = self.topology_spec_.spike_router
+        metric = (
+            "diag_shrinkage_mahalanobis"
+            if router == "diag_shrinkage_mahalanobis"
+            else "full_shrinkage_mahalanobis"
+        )
+        kernel = "gmm_posterior" if router == "gmm_posterior" else "softmax"
+        self.spike_partition_geometry_ = self.geometry_builder_.build(
+            embedding=signatures,
+            cluster_labels=self.cluster_labels_,
+            partitions=partitions,
+            partition_to_cluster=mapping,
+            spec=PartitionGeometrySpec(
+                metric=metric,
+                kernel=kernel,
+                covariance_shrinkage=self.topology_spec_.covariance_shrinkage,
+                uniform_shrinkage=self.routing_geometry_spec.uniform_shrinkage,
+                temperature=self.routing_geometry_spec.temperature,
+            ),
         )
 
     def transform_embedding(self, X: ArrayLike) -> np.ndarray:
@@ -1663,6 +2009,8 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         )
 
     def _resolve_class_coverage_policy(self, resolved_target_type: str) -> str:
+        if self.expert_topology != "standard":
+            return "off"
         if self.class_coverage_policy == "auto":
             return (
                 "preserve_local_classes"
@@ -1892,6 +2240,17 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
                 if self.row_spectral_participation_ is not None
                 else None
             ),
+            "expert_topology": self.expert_topology,
+            "bulk_spike_topology": (
+                self.bulk_spike_topology_.to_dict()
+                if self.bulk_spike_topology_ is not None
+                else None
+            ),
+            "spike_partition_geometry": (
+                self.spike_partition_geometry_.to_dict()
+                if self.spike_partition_geometry_ is not None
+                else None
+            ),
             "subspace_stability_status": subspace_result.status.value,
             "subspace_comparison_rank": subspace_result.comparison_rank,
             "subspace_rank_source": subspace_result.rank_source,
@@ -1941,7 +2300,15 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
                 else None
             ),
             "n_partitions_requested": int(self.n_partitions),
-            "selected_n_partitions": int(partition_info.selected_n_partitions) if partition_info else int(len(self.partitions)),
+            "selected_n_partitions": (
+                int(len(self.partitions))
+                if self.bulk_spike_topology_ is not None
+                else (
+                    int(partition_info.selected_n_partitions)
+                    if partition_info
+                    else int(len(self.partitions))
+                )
+            ),
             "partition_selection_method": partition_info.partition_selection_method if partition_info else "fixed",
             "selected_cluster_algorithm": partition_info.selected_algorithm if partition_info else None,
             "cluster_algorithms": list(partition_info.cluster_algorithms) if partition_info else [],

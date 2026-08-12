@@ -431,6 +431,106 @@ def test_null_diagnostic_is_opt_in_and_does_not_change_selected_rank() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "expert_topology",
+    ("bulk_single_spike", "bulk_multi_spike"),
+)
+def test_bulk_spike_topology_preserves_budget_and_routes_rows(
+    expert_topology: str,
+) -> None:
+    rng = np.random.default_rng(439)
+    X = pd.DataFrame(rng.normal(size=(120, 8)))
+    X.iloc[:24, :2] += 7.0
+    sampler = RMTContractionTensorSampler(
+        n_partitions=3,
+        n_views=3,
+        projection_dim=3,
+        sampling_budget_ratio=0.25,
+        budget_feasibility_mode="hard",
+        min_sampled_rows_per_partition=2,
+        null_diagnostic_enabled=True,
+        null_model_policies=("feature_permutation", "view_resampling"),
+        null_resamples=2,
+        component_diagnostic_enabled=True,
+        expert_topology=expert_topology,
+        topology_min_partition_size=2,
+        backend="numpy",
+        random_state=43,
+        show_progress=False,
+    ).fit(X)
+
+    probabilities = sampler.predict_partition_proba(X.iloc[:9])
+
+    assert sum(len(rows) for rows in sampler.partitions.values()) == 30
+    assert np.unique(np.concatenate(tuple(sampler.partitions.values()))).size == 30
+    assert probabilities.shape == (9, len(sampler.partition_names_))
+    assert np.allclose(probabilities.sum(axis=1), 1.0)
+    assert sampler.diagnostics_["expert_topology"] == expert_topology
+    assert sampler.diagnostics_["bulk_spike_topology"]["exact_budget"] is True
+
+
+def test_bulk_spike_topology_repairs_binary_class_coverage_without_budget_drift() -> None:
+    rng = np.random.default_rng(443)
+    X = pd.DataFrame(rng.normal(size=(120, 8)))
+    X.iloc[:24, :2] += 7.0
+    y = pd.Series(np.where(np.arange(len(X)) < 24, 1, 0))
+    sampler = RMTContractionTensorSampler(
+        n_partitions=3,
+        n_views=3,
+        projection_dim=3,
+        sampling_budget_ratio=0.25,
+        budget_feasibility_mode="hard",
+        min_sampled_rows_per_partition=2,
+        null_diagnostic_enabled=True,
+        null_model_policies=("feature_permutation", "view_resampling"),
+        null_resamples=2,
+        component_diagnostic_enabled=True,
+        expert_topology="bulk_single_spike",
+        topology_min_partition_size=2,
+        backend="numpy",
+        random_state=47,
+        show_progress=False,
+    ).fit(X, y)
+
+    assert sum(len(rows) for rows in sampler.partitions.values()) == 30
+    assert all(np.unique(y.iloc[rows]).size >= 2 for rows in sampler.partitions.values())
+    assert sampler.class_coverage_guaranteed_ is True
+
+
+def test_bulk_spike_topology_repairs_all_multiclass_labels_without_budget_drift() -> None:
+    rng = np.random.default_rng(449)
+    X = pd.DataFrame(rng.normal(size=(180, 8)))
+    X.iloc[:30, :2] += 7.0
+    y = pd.Series(np.resize(np.asarray([0, 1, 2]), len(X)))
+    sampler = RMTContractionTensorSampler(
+        n_partitions=3,
+        n_views=3,
+        projection_dim=3,
+        sampling_budget_ratio=0.30,
+        budget_feasibility_mode="hard",
+        min_sampled_rows_per_partition=3,
+        null_diagnostic_enabled=True,
+        null_model_policies=("feature_permutation", "view_resampling"),
+        null_resamples=2,
+        component_diagnostic_enabled=True,
+        expert_topology="bulk_multi_spike",
+        topology_min_partition_size=3,
+        backend="numpy",
+        random_state=53,
+        show_progress=False,
+    ).fit(X, y)
+
+    selected = np.concatenate(tuple(sampler.partitions.values()))
+
+    assert selected.size == 54
+    assert np.unique(selected).size == 54
+    assert all(
+        set(np.unique(y.iloc[rows])) == {0, 1, 2}
+        for rows in sampler.partitions.values()
+    )
+    assert sampler.class_coverage_guaranteed_ is True
+
+
 def test_invalid_null_diagnostic_config_is_rejected() -> None:
     with pytest.raises(ValueError, match="null_primary_policy must be included"):
         RMTContractionTensorSampler(
