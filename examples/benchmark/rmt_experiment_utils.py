@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import pandas as pd
@@ -37,6 +37,44 @@ def task_key(dataset_name: str) -> str:
 
 def budget_ratio_tag(budget_ratio: float) -> str:
     return f"{int(round(float(budget_ratio) * 100)):02d}"
+
+
+def markdown_table(
+    frame: pd.DataFrame,
+    columns: Sequence[str] | None = None,
+    *,
+    float_digits: int = 6,
+) -> str:
+    """Render a DataFrame without the optional pandas ``tabulate`` dependency."""
+
+    selected = list(frame.columns if columns is None else columns)
+    selected = [column for column in selected if column in frame.columns]
+    if frame.empty or not selected:
+        return "Нет доступных записей."
+    lines = [
+        "| " + " | ".join(selected) + " |",
+        "|" + "|".join("---" for _ in selected) + "|",
+    ]
+    for _, row in frame.loc[:, selected].iterrows():
+        lines.append(
+            "| "
+            + " | ".join(
+                _format_markdown_value(row[column], float_digits)
+                for column in selected
+            )
+            + " |"
+        )
+    return "\n".join(lines)
+
+
+def _format_markdown_value(value: Any, float_digits: int) -> str:
+    if value is None or (
+        isinstance(value, (float, np.floating)) and np.isnan(value)
+    ):
+        return "-"
+    if isinstance(value, (float, np.floating)):
+        return f"{float(value):.{int(float_digits)}f}"
+    return str(value).replace("|", "\\|").replace("\n", " ")
 
 
 def default_rmt_reference_metrics_path() -> Path:

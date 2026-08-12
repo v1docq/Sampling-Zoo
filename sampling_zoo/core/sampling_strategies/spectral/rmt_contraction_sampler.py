@@ -12,6 +12,13 @@ from sklearn.cluster import KMeans
 from .backend.matrix_backend import MatrixRMTBackend
 from .backend.tensor_backend import TensorRMTBackend
 from .base_sampler import SpectralSamplerBase
+from .bulk_spike import (
+    ComponentSplitStatus,
+    RowSpectralParticipationContract,
+    SpectralComponentSplitContract,
+    build_spectral_component_split,
+    compute_row_spectral_participation,
+)
 from .cluster_selection import ClusterSelectionResult, SpectralClusterSelector
 from .classification_sampling import (
     ClassCoverageSelectionPlan,
@@ -19,8 +26,13 @@ from .classification_sampling import (
     select_class_aware_partition_indices,
 )
 from .partition_sampling import (
+    build_partition_sketch_plan,
     partition_membership_fingerprint,
-    select_partition_indices,
+)
+from .leverage_sketch import evaluate_subspace_preservation
+from .sketch_contracts import (
+    ExactBudgetSketchPlan,
+    SubspacePreservationContract,
 )
 from .null_diagnostics import (
     SpectralNullDiagnostic,
@@ -121,6 +133,7 @@ class RMTContractionConfig:
     null_quantile: float = 0.95
     null_min_selection_frequency: float = 0.80
     null_primary_policy: str = "feature_permutation"
+    component_diagnostic_enabled: bool = False
     subspace_diagnostic_enabled: bool = False
     subspace_resamples: int = 16
     subspace_quantile: float = 0.90
@@ -134,6 +147,10 @@ class RMTContractionConfig:
     max_chunk_size: Optional[int] = None
     selection_method: str = "hybrid"
     leverage_cap_quantile: float = 0.95
+    leverage_mixture_alpha: float = 0.25
+    leverage_uniform_floor: float = 1e-12
+    ridge_leverage_lambda: Union[float, str] = "auto"
+    training_reweighting: str = "none"
     routing_representation: str = "source_centroid"
     routing_metric: str = "squared_euclidean"
     routing_kernel: str = "softmax"
@@ -255,6 +272,10 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             max_chunk_size=cfg.max_chunk_size,
             selection_method=cfg.selection_method,
             leverage_cap_quantile=cfg.leverage_cap_quantile,
+            leverage_mixture_alpha=cfg.leverage_mixture_alpha,
+            leverage_uniform_floor=cfg.leverage_uniform_floor,
+            ridge_leverage_lambda=cfg.ridge_leverage_lambda,
+            training_reweighting=cfg.training_reweighting,
             routing_temperature=cfg.routing_temperature,
             routing_shrinkage=cfg.routing_shrinkage,
             backend=cfg.backend,
@@ -426,6 +447,9 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             cfg.embedding_mode,
             ("sv_scaled", "whitened"),
         )
+        self.ridge_leverage_lambda = self._normalize_ridge_leverage_lambda(
+            cfg.ridge_leverage_lambda
+        )
         if self.n_views_requested != "auto":
             self.n_views = int(self.n_views_requested)
         self.view_size = cfg.view_size
@@ -454,6 +478,12 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             random_state=cfg.random_state,
         )
         self.spectral_null_diagnostic = SpectralNullDiagnostic(null_config)
+        self.component_diagnostic_enabled = bool(cfg.component_diagnostic_enabled)
+        if self.component_diagnostic_enabled and not null_config.enabled:
+            raise ValueError(
+                "component_diagnostic_enabled=True requires "
+                "null_diagnostic_enabled=True"
+            )
         subspace_config = SpectralSubspaceDiagnosticConfig.from_values(
             enabled=cfg.subspace_diagnostic_enabled,
             n_resamples=cfg.subspace_resamples,
@@ -488,6 +518,7 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self.cluster_selector_ = self._make_cluster_selector()
         self.cluster_centers_: Optional[np.ndarray] = None
         self.initial_singular_values_: Optional[np.ndarray] = None
+        self.initial_left_basis_: Optional[np.ndarray] = None
         self.left_basis_: Optional[np.ndarray] = None
         self.spectral_null_diagnostic_result_ = SpectralNullDiagnosticResult.disabled(
             null_config.primary_policy
@@ -507,6 +538,36 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self.partition_geometry_: Optional[PartitionGeometryContract] = None
         self.last_routing_distances_: Optional[RoutingDistanceContract] = None
         self.last_routing_weights_: Optional[RoutingWeightContract] = None
+        self.partition_subspace_preservation_: Dict[
+            str, SubspacePreservationContract
+        ] = {}
+        self.spectral_component_split_ = (
+            SpectralComponentSplitContract.unavailable(
+                (),
+                status=ComponentSplitStatus.DISABLED,
+                min_selection_frequency=null_config.min_selection_frequency,
+                reason="component diagnostics are disabled",
+            )
+        )
+        self.row_spectral_participation_: Optional[
+            RowSpectralParticipationContract
+        ] = None
+
+    @staticmethod
+    def _normalize_ridge_leverage_lambda(value: Union[float, str]) -> Union[float, str]:
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized != "auto":
+                raise ValueError(
+                    "ridge_leverage_lambda must be a non-negative float or 'auto'"
+                )
+            return normalized
+        normalized = float(value)
+        if not np.isfinite(normalized) or normalized < 0.0:
+            raise ValueError(
+                "ridge_leverage_lambda must be a non-negative float or 'auto'"
+            )
+        return normalized
 
     @staticmethod
     def _normalize_config_inputs(
@@ -670,7 +731,7 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         with progress_bar(
             enabled=self.show_progress,
             desc="RMT sampler fit",
-            total=8,
+            total=9,
         ) as stage:
             started = perf_counter()
             rng = self._start_fit()
@@ -691,6 +752,10 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             started = perf_counter()
             self._fit_spectral_null_diagnostic(X_num)
             stage_seconds["null_diagnostics"] = perf_counter() - started
+            stage.update(1)
+            started = perf_counter()
+            self._fit_component_diagnostics()
+            stage_seconds["component_diagnostics"] = perf_counter() - started
             stage.update(1)
             started = perf_counter()
             self._fit_spectral_subspace_diagnostic(X_num)
@@ -723,6 +788,7 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self._rmt_backend = self._make_rmt_backend()
         self.view_specs_ = []
         self.initial_singular_values_ = None
+        self.initial_left_basis_ = None
         self.left_basis_ = None
         self.spectral_null_diagnostic_result_ = SpectralNullDiagnosticResult.disabled(
             self.spectral_null_diagnostic.config.primary_policy
@@ -735,12 +801,27 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self.partition_selection_info_ = None
         self.partition_budget_plan_ = None
         self.class_coverage_selection_plans_ = {}
+        self.partition_training_weights_ = {}
+        self.partition_inclusion_probabilities_ = {}
+        self.partition_sketch_plans_ = {}
+        self.partition_subspace_preservation_ = {}
         self.resolved_class_coverage_policy_ = "off"
         self.class_coverage_guaranteed_ = False
         self.cluster_centers_ = None
         self.partition_geometry_ = None
         self.last_routing_distances_ = None
         self.last_routing_weights_ = None
+        self.spectral_component_split_ = (
+            SpectralComponentSplitContract.unavailable(
+                (),
+                status=ComponentSplitStatus.DISABLED,
+                min_selection_frequency=(
+                    self.spectral_null_diagnostic.config.min_selection_frequency
+                ),
+                reason="component diagnostics are disabled",
+            )
+        )
+        self.row_spectral_participation_ = None
         if self.n_views_requested == "auto":
             self.n_views = self.min_views
         return np.random.default_rng(self.random_state)
@@ -780,6 +861,7 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         n_samples, n_features = self._matrix_shape(M)
         initial_rank = self._resolve_initial_rank(n_samples, n_features)
         basis = self._get_rmt_backend().compute_spectral_basis(M, rank=initial_rank)
+        self.initial_left_basis_ = np.asarray(basis.U, dtype=np.float64).copy()
         self.initial_singular_values_ = np.asarray(
             basis.singular_values,
             dtype=np.float64,
@@ -844,6 +926,39 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
                 spectrum_evaluator=evaluate_spectrum,
                 on_progress=lambda: progress.update(1),
             )
+
+    def _fit_component_diagnostics(self) -> None:
+        singular = (
+            np.asarray(self.initial_singular_values_, dtype=float)
+            if self.initial_singular_values_ is not None
+            else np.asarray([], dtype=float)
+        )
+        threshold = (
+            self.spectral_null_diagnostic.config.min_selection_frequency
+        )
+        if not self.component_diagnostic_enabled:
+            self.spectral_component_split_ = (
+                SpectralComponentSplitContract.unavailable(
+                    singular,
+                    status=ComponentSplitStatus.DISABLED,
+                    min_selection_frequency=threshold,
+                    reason="component diagnostics are disabled",
+                )
+            )
+            self.row_spectral_participation_ = None
+            return
+        if self.initial_left_basis_ is None:
+            raise RuntimeError("Initial left spectral basis is not available")
+        split = build_spectral_component_split(
+            singular,
+            self.spectral_null_diagnostic_result_,
+            min_selection_frequency=threshold,
+        )
+        self.spectral_component_split_ = split
+        self.row_spectral_participation_ = compute_row_spectral_participation(
+            self.initial_left_basis_,
+            split,
+        )
 
     def _fit_spectral_subspace_diagnostic(self, X: np.ndarray) -> None:
         if self.left_basis_ is None:
@@ -1057,12 +1172,28 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         if data is None:
             return self.partitions
         return {
-            name: {
-                "feature": safe_index(data, indices),
-                **({"target": safe_index(target, indices)} if target is not None else {}),
-            }
+            name: self._build_partition_payload(name, indices, data, target)
             for name, indices in self.partitions.items()
         }
+
+    def _build_partition_payload(
+        self,
+        name: str,
+        indices: np.ndarray,
+        data: ArrayLike,
+        target: Optional[Union[np.ndarray, pd.Series]],
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"feature": safe_index(data, indices)}
+        if target is not None:
+            payload["target"] = safe_index(target, indices)
+        if self.training_reweighting == "inverse_probability":
+            weights = self.partition_training_weights_.get(name)
+            if weights is None or len(weights) != len(indices):
+                raise RuntimeError(
+                    f"Training weights do not align with partition {name!r}"
+                )
+            payload["sample_weight"] = np.asarray(weights, dtype=float).copy()
+        return payload
 
     def sample_indices(self, replace: bool = False) -> List[int]:
         if self.leverage_scores_ is None:
@@ -1469,13 +1600,21 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
                         f"class coverage ({name}): {coverage_plan.to_dict()}"
                     )
                 selected = coverage_plan.selected_indices
+                if coverage_plan.combined_sketch_plan is None:
+                    raise RuntimeError("Class-aware selection did not build a sketch plan")
+                self._record_partition_sketch(
+                    name,
+                    coverage_plan.combined_sketch_plan,
+                )
             else:
-                selected = self._select_from_cluster(
+                sketch_plan = self._build_sketch_from_cluster(
                     cluster_idx,
                     scores,
                     target_size=allocation[name],
                     random_state=row_selection_rng,
                 )
+                self._record_partition_sketch(name, sketch_plan)
+                selected = sketch_plan.selected_indices
             if selected.size == 0:
                 continue
             partitions[name] = selected
@@ -1490,6 +1629,27 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
 
         self.partitions = partitions
         self.partition_names_ = list(partitions.keys())
+        active_names = set(self.partition_names_)
+        self.partition_sketch_plans_ = {
+            name: value
+            for name, value in self.partition_sketch_plans_.items()
+            if name in active_names
+        }
+        self.partition_training_weights_ = {
+            name: value
+            for name, value in self.partition_training_weights_.items()
+            if name in active_names
+        }
+        self.partition_inclusion_probabilities_ = {
+            name: value
+            for name, value in self.partition_inclusion_probabilities_.items()
+            if name in active_names
+        }
+        self.partition_subspace_preservation_ = {
+            name: value
+            for name, value in self.partition_subspace_preservation_.items()
+            if name in active_names
+        }
         self.partition_to_cluster_ = {name: int(name.split("_")[-1]) for name in self.partition_names_}
         self.class_coverage_guaranteed_ = bool(
             self.resolved_class_coverage_policy_ == "preserve_local_classes"
@@ -1543,14 +1703,70 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             if target_size is None
             else int(target_size)
         )
-        return select_partition_indices(
+        return self._build_sketch_from_cluster(
             cluster_idx,
+            scores,
             target_size=resolved_target_size,
+            random_state=random_state,
+        ).selected_indices.copy()
+
+    def _build_sketch_from_cluster(
+        self,
+        cluster_idx: np.ndarray,
+        scores: np.ndarray,
+        *,
+        target_size: int,
+        random_state: int | np.random.Generator | None,
+    ) -> ExactBudgetSketchPlan:
+        if self.sample_embedding_ is None:
+            raise RuntimeError("Sample embedding is not available")
+        ridge_scores = None
+        ridge_lambda = None
+        if self.selection_method == "saturated_ridge_leverage":
+            ridge_result = self._get_rmt_backend().compute_ridge_leverage_scores(
+                self.sample_embedding_[cluster_idx],
+                self.ridge_leverage_lambda,
+            )
+            ridge_scores = np.zeros_like(np.asarray(scores, dtype=float))
+            ridge_scores[cluster_idx] = ridge_result.scores
+            ridge_lambda = ridge_result.ridge_lambda
+        return build_partition_sketch_plan(
+            cluster_idx,
+            target_size=int(target_size),
             selection_method=self.selection_method,
             scores=scores,
             embedding=self.sample_embedding_,
             random_state=random_state,
             leverage_cap_quantile=self.leverage_cap_quantile,
+            leverage_mixture_alpha=self.leverage_mixture_alpha,
+            leverage_uniform_floor=self.leverage_uniform_floor,
+            ridge_scores=ridge_scores,
+            ridge_lambda=ridge_lambda,
+            training_reweighting=self.training_reweighting,
+        )
+
+    def _record_partition_sketch(
+        self,
+        name: str,
+        plan: ExactBudgetSketchPlan,
+    ) -> None:
+        if self.sample_embedding_ is None:
+            raise RuntimeError("Sample embedding is not available")
+        self.partition_sketch_plans_[name] = plan
+        self.partition_training_weights_[name] = plan.training_weights.copy()
+        self.partition_inclusion_probabilities_[name] = (
+            plan.selected_probabilities.copy()
+        )
+        rank = min(
+            int(self.sample_embedding_.shape[1]),
+            max(1, int(plan.selected_indices.size)),
+        )
+        self.partition_subspace_preservation_[name] = (
+            evaluate_subspace_preservation(
+                self.sample_embedding_[plan.candidate_indices],
+                plan,
+                rank=rank,
+            )
         )
 
     def _select_class_aware_from_cluster(
@@ -1564,6 +1780,16 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
     ) -> ClassCoverageSelectionPlan:
         if self.sample_embedding_ is None:
             raise RuntimeError("Sample embedding is not available")
+        ridge_scores = None
+        ridge_lambda = None
+        if self.selection_method == "saturated_ridge_leverage":
+            ridge_result = self._get_rmt_backend().compute_ridge_leverage_scores(
+                self.sample_embedding_[cluster_idx],
+                self.ridge_leverage_lambda,
+            )
+            ridge_scores = np.zeros_like(np.asarray(scores, dtype=float))
+            ridge_scores[cluster_idx] = ridge_result.scores
+            ridge_lambda = ridge_result.ridge_lambda
         return select_class_aware_partition_indices(
             cluster_idx,
             target=target,
@@ -1575,6 +1801,11 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             embedding=self.sample_embedding_,
             random_state=random_state,
             leverage_cap_quantile=self.leverage_cap_quantile,
+            leverage_mixture_alpha=self.leverage_mixture_alpha,
+            leverage_uniform_floor=self.leverage_uniform_floor,
+            ridge_scores=ridge_scores,
+            ridge_lambda=ridge_lambda,
+            training_reweighting=self.training_reweighting,
         )
 
     def _project_new_unfolding(self, M_new: np.ndarray) -> np.ndarray:
@@ -1653,6 +1884,14 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             "null_max_outlier_excess": null_result.max_outlier_excess,
             "null_successful_resamples": null_result.successful_resamples,
             "spectral_null_diagnostic": null_diagnostic,
+            "spectral_component_split": (
+                self.spectral_component_split_.to_dict(include_arrays=True)
+            ),
+            "row_spectral_participation": (
+                self.row_spectral_participation_.to_dict()
+                if self.row_spectral_participation_ is not None
+                else None
+            ),
             "subspace_stability_status": subspace_result.status.value,
             "subspace_comparison_rank": subspace_result.comparison_rank,
             "subspace_rank_source": subspace_result.rank_source,
@@ -1679,6 +1918,18 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             "effective_sample_count": eff_n,
             "row_selection_method": self.selection_method,
             "leverage_cap_quantile": float(self.leverage_cap_quantile),
+            "leverage_mixture_alpha": float(self.leverage_mixture_alpha),
+            "leverage_uniform_floor": float(self.leverage_uniform_floor),
+            "ridge_leverage_lambda": self.ridge_leverage_lambda,
+            "training_reweighting": self.training_reweighting,
+            "partition_sketch_plans": {
+                name: plan.to_dict()
+                for name, plan in self.partition_sketch_plans_.items()
+            },
+            "partition_subspace_preservation": {
+                name: diagnostic.to_dict()
+                for name, diagnostic in self.partition_subspace_preservation_.items()
+            },
             "routing_geometry": (
                 self.partition_geometry_.to_dict()
                 if self.partition_geometry_ is not None

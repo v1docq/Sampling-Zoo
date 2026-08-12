@@ -67,6 +67,45 @@ def test_capped_leverage_sampler_records_row_selection_diagnostics() -> None:
     assert sum(len(indices) for indices in sampler.partitions.values()) < len(X)
 
 
+@pytest.mark.parametrize(
+    "selection_method",
+    [
+        "uniform",
+        "saturated_leverage",
+        "robust_leverage_mixture",
+        "saturated_ridge_leverage",
+    ],
+)
+def test_exact_sketch_policies_expose_aligned_training_weights(
+    selection_method: str,
+) -> None:
+    X = _frame(72)
+    y = pd.Series(np.linspace(-1.0, 1.0, len(X)))
+    sampler = RMTContractionTensorSampler(
+        n_partitions=3,
+        n_views=3,
+        projection_dim=2,
+        chunk_fraction=0.5,
+        selection_method=selection_method,
+        training_reweighting="inverse_probability",
+        backend="numpy",
+        random_state=13,
+        show_progress=False,
+    ).fit(X, target=y)
+    partitions = sampler.get_partitions(X, y)
+
+    assert sampler.diagnostics_["row_selection_method"] == selection_method
+    assert sampler.diagnostics_["training_reweighting"] == "inverse_probability"
+    assert set(partitions) == set(sampler.partitions)
+    for name, partition in partitions.items():
+        assert len(partition["feature"]) == len(partition["sample_weight"])
+        assert np.all(np.asarray(partition["sample_weight"]) > 0.0)
+        assert np.mean(partition["sample_weight"]) == pytest.approx(1.0)
+        assert sampler.partition_inclusion_probabilities_[name].size == len(
+            partition["feature"]
+        )
+
+
 def test_auto_n_views_subsample_uses_feature_coverage_policy() -> None:
     rng = np.random.default_rng(123)
     X = pd.DataFrame(rng.normal(size=(50, 20)), columns=[f"x_{idx}" for idx in range(20)])

@@ -257,7 +257,17 @@ class SpectralClusterSelector:
         self.selection_method = self._validate_choice(
             "selection_method",
             selection_method,
-            ("all", "leverage", "capped_leverage", "maxvol", "hybrid"),
+            (
+                "all",
+                "uniform",
+                "leverage",
+                "capped_leverage",
+                "saturated_leverage",
+                "robust_leverage_mixture",
+                "saturated_ridge_leverage",
+                "maxvol",
+                "hybrid",
+            ),
         )
         self.leverage_cap_quantile = self._validate_unit_fraction(
             "leverage_cap_quantile",

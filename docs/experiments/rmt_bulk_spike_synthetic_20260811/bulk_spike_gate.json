@@ -1,0 +1,10 @@
+{
+  "passed": true,
+  "checks": {
+    "all_records_completed": true,
+    "exact_budget_everywhere": true,
+    "stable_spike_rate_at_least_75pct": true,
+    "median_auc_at_least_075": true,
+    "median_enrichment_at_least_15x": true
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "status": "failed",
+  "candidate_arm": "R3_robust_mixture_ipw",
+  "dataset_nonnegative_fraction": 0.0,
+  "required_dataset_nonnegative_fraction": 0.75,
+  "median_primary_gain": -0.06617119116795125,
+  "minimum_median_primary_gain": -0.005,
+  "by_dataset": [
+    {
+      "dataset": "diamonds__task_233211",
+      "mean_gain": -0.06617119116795125,
+      "median_gain": -0.06617119116795125,
+      "worst_gain": -0.06617119116795125,
+      "mean_tail_gain": NaN
+    }
+  ]
+}

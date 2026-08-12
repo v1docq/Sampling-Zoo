@@ -42,16 +42,19 @@ def build_model_training_partitions(
         raise ValueError(
             "Concatenated partition training requires feature/target mappings"
         )
-    return {
-        "concatenated_budget": {
+    concatenated = {
             "feature": _concatenate_values(
                 tuple(partition["feature"] for partition in partition_values)
             ),
             "target": _concatenate_values(
                 tuple(partition["target"] for partition in partition_values)
             ),
-        }
     }
+    if all("sample_weight" in partition for partition in partition_values):
+        concatenated["sample_weight"] = _concatenate_values(
+            tuple(partition["sample_weight"] for partition in partition_values)
+        )
+    return {"concatenated_budget": concatenated}
 
 
 def _concatenate_values(values: tuple[Any, ...]) -> Any:

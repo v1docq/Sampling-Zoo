@@ -1,0 +1,15 @@
+{
+  "row_sampling_axis": [
+    "full",
+    "uniform",
+    "robust_leverage_mixture_with_ipw"
+  ],
+  "coalition_sampling_axis": [
+    "kernel_weight",
+    "leverage"
+  ],
+  "reference": "exact Shapley enumeration",
+  "primary_source": "https://arxiv.org/abs/2410.01917",
+  "official_implementation": "https://github.com/rtealwitter/leverageshap",
+  "distinction": "Sampling Zoo leverage selects training rows; Leverage SHAP leverage selects feature coalitions for a projected explanation regression."
+}

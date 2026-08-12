@@ -6,6 +6,7 @@ from typing import Any, Iterable, Optional
 import numpy as np
 
 from .matrix_backend import (
+    RMTRidgeLeverageResult,
     RMTSpectralBasis,
     RMTSubspaceComparison,
     compute_leverage_scores,
@@ -130,6 +131,65 @@ class TensorRMTBackend:
             singular_values=singular_values.detach().cpu().numpy(),
             Vt=Vt.detach().cpu().numpy(),
             leverage_scores=compute_leverage_scores(U_np),
+        )
+
+    def compute_ridge_leverage_scores(
+        self,
+        matrix: np.ndarray,
+        ridge_lambda: float | str | None = "auto",
+    ) -> RMTRidgeLeverageResult:
+        """Torch implementation of regularized row leverage scores."""
+
+        values = self._to_tensor(matrix)
+        if values.ndim != 2:
+            raise ValueError("matrix must be two-dimensional")
+        if not bool(torch.all(torch.isfinite(values))):
+            raise ValueError("matrix must contain only finite values")
+        gram = values.T @ values
+        eigenvalues = torch.linalg.eigvalsh(gram)
+        if ridge_lambda is None or (
+            isinstance(ridge_lambda, str)
+            and ridge_lambda.strip().lower() == "auto"
+        ):
+            positive = eigenvalues[eigenvalues > torch.finfo(values.dtype).eps]
+            scale = (
+                torch.median(positive)
+                if int(positive.numel())
+                else torch.ones((), dtype=values.dtype, device=values.device)
+            )
+            resolved_lambda = max(
+                float((scale * 1e-3).detach().cpu().item()),
+                float(torch.finfo(values.dtype).eps),
+            )
+        else:
+            if isinstance(ridge_lambda, str):
+                raise ValueError(
+                    "ridge_leverage_lambda must be a non-negative float or 'auto'"
+                )
+            resolved_lambda = float(ridge_lambda)
+            if not np.isfinite(resolved_lambda) or resolved_lambda < 0.0:
+                raise ValueError(
+                    "ridge_leverage_lambda must be a non-negative float or 'auto'"
+                )
+            resolved_lambda = max(
+                resolved_lambda,
+                float(torch.finfo(values.dtype).eps),
+            )
+        identity = torch.eye(
+            int(gram.shape[0]),
+            dtype=values.dtype,
+            device=values.device,
+        )
+        solved = torch.linalg.solve(
+            gram + resolved_lambda * identity,
+            values.T,
+        ).T
+        scores = torch.clamp(torch.sum(values * solved, dim=1), min=0.0)
+        scores_np = scores.detach().cpu().numpy()
+        return RMTRidgeLeverageResult(
+            scores=scores_np,
+            ridge_lambda=resolved_lambda,
+            effective_dimension=float(np.sum(scores_np)),
         )
 
     def compare_subspace_prefixes(

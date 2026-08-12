@@ -1,0 +1,38 @@
+{
+  "status": "failed",
+  "candidate_arm": "R3_robust_mixture_ipw",
+  "dataset_nonnegative_fraction": 0.0,
+  "required_dataset_nonnegative_fraction": 0.75,
+  "median_primary_gain": -0.007437929052314263,
+  "minimum_median_primary_gain": -0.005,
+  "by_dataset": [
+    {
+      "dataset": "OnlineNewsPopularity__task_359941",
+      "mean_gain": -0.008124734887737777,
+      "median_gain": -0.013050942514872446,
+      "worst_gain": -0.028603889589896746,
+      "mean_tail_gain": -0.05588568524227265
+    },
+    {
+      "dataset": "bank-marketing__task_359982",
+      "mean_gain": -0.0021079211661785774,
+      "median_gain": -0.0021838784981469406,
+      "worst_gain": -0.009745315171114544,
+      "mean_tail_gain": NaN
+    },
+    {
+      "dataset": "covertype__task_7593",
+      "mean_gain": -0.014652961331967196,
+      "median_gain": -0.01214901705406801,
+      "worst_gain": -0.031746558531298305,
+      "mean_tail_gain": NaN
+    },
+    {
+      "dataset": "diamonds__task_233211",
+      "mean_gain": -0.007356151481225087,
+      "median_gain": -0.006572558171241651,
+      "worst_gain": -0.05453050370039169,
+      "mean_tail_gain": -0.004793412541918753
+    }
+  ]
+}

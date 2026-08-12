@@ -1,0 +1,119 @@
+{
+  "status": "completed",
+  "updated_at": "2026-08-11T23:32:33Z",
+  "record_count": 320,
+  "config": {
+    "regression_suite": 269,
+    "classification_suite": 271,
+    "regression_tasks": [
+      "house_16H",
+      "house_sales",
+      "pol",
+      "topo_2_1"
+    ],
+    "classification_tasks": [],
+    "models": [
+      "lightgbm"
+    ],
+    "budget_ratios": [
+      0.01,
+      0.05,
+      0.1,
+      0.2
+    ],
+    "seeds": [
+      42,
+      43,
+      44,
+      45,
+      46
+    ],
+    "n_partitions": 5,
+    "max_train_rows": 100000,
+    "validation_fraction": 0.2,
+    "sampler_extra_params": {},
+    "output_dir": "/home/revin_new/rmt_results/run_rmt_tail_guard_holdout_20260812",
+    "show_progress": false,
+    "selection_folds": 5,
+    "selector_arm_name": "A9_tail_guarded_cross_fitted_selected",
+    "confidence_level": 0.95,
+    "bootstrap_iterations": 2000,
+    "min_positive_fold_fraction": 0.6666666666666666,
+    "noninferiority_margin": 0.005,
+    "regression_tail_guard": true,
+    "tail_risk_quantile": 0.9,
+    "tail_noninferiority_margin": 0.005,
+    "regression_stratification_bins": 10
+  },
+  "arms": [
+    {
+      "name": "A2_median_scaled_euclidean",
+      "spec": {
+        "representation": "source_centroid",
+        "metric": "median_scaled_euclidean",
+        "kernel": "softmax",
+        "temperature": 1.0,
+        "covariance_shrinkage": 0.1,
+        "uniform_shrinkage": 0.05,
+        "min_scale": 1e-08,
+        "min_prior": 1e-08
+      },
+      "temperature_candidates": [
+        0.05,
+        0.1,
+        0.25,
+        0.5,
+        1.0,
+        2.0,
+        5.0
+      ],
+      "use_validation_priors": true
+    },
+    {
+      "name": "A5_gmm_posterior",
+      "spec": {
+        "representation": "source_centroid",
+        "metric": "full_shrinkage_mahalanobis",
+        "kernel": "gmm_posterior",
+        "temperature": 1.0,
+        "covariance_shrinkage": 0.1,
+        "uniform_shrinkage": 0.05,
+        "min_scale": 1e-08,
+        "min_prior": 1e-08
+      },
+      "temperature_candidates": [
+        0.05,
+        0.1,
+        0.25,
+        0.5,
+        1.0,
+        2.0,
+        5.0
+      ],
+      "use_validation_priors": true
+    },
+    {
+      "name": "A6_cosine_negative_control",
+      "spec": {
+        "representation": "source_centroid",
+        "metric": "cosine",
+        "kernel": "softmax",
+        "temperature": 1.0,
+        "covariance_shrinkage": 0.1,
+        "uniform_shrinkage": 0.05,
+        "min_scale": 1e-08,
+        "min_prior": 1e-08
+      },
+      "temperature_candidates": [
+        0.05,
+        0.1,
+        0.25,
+        0.5,
+        1.0,
+        2.0,
+        5.0
+      ],
+      "use_validation_priors": true
+    }
+  ]
+}

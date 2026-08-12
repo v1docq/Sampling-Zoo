@@ -26,6 +26,16 @@ from .spiked_models import (
     evaluate_subspace_recovery,
     generate_spiked_dataset,
 )
+from .leverage_shap import (
+    CoalitionSamplingPlan,
+    CoalitionSamplingPolicy,
+    ShapleyRegressionEstimate,
+    build_coalition_sampling_plan,
+    estimate_projected_shapley,
+    exact_shapley_values,
+    full_kernel_regression_loss,
+    make_masked_model_game,
+)
 
 __all__ = [
     "ClusterRecoveryMetrics",
@@ -43,10 +53,18 @@ __all__ = [
     "SubspaceRecoveryMetrics",
     "build_multi_regime_validation_grid",
     "build_spiked_validation_grid",
+    "build_coalition_sampling_plan",
+    "CoalitionSamplingPlan",
+    "CoalitionSamplingPolicy",
     "evaluate_cluster_recovery",
     "evaluate_rank_recovery",
     "evaluate_spiked_recovery",
+    "estimate_projected_shapley",
+    "exact_shapley_values",
+    "full_kernel_regression_loss",
     "evaluate_subspace_recovery",
     "generate_multi_regime_dataset",
     "generate_spiked_dataset",
+    "make_masked_model_game",
+    "ShapleyRegressionEstimate",
 ]

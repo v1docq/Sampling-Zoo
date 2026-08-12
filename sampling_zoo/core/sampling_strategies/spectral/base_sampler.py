@@ -25,6 +25,10 @@ class SpectralSamplerBase(BaseSampler):
         max_chunk_size: Optional[int] = None,
         selection_method: str = "all",
         leverage_cap_quantile: float = 0.95,
+        leverage_mixture_alpha: float = 0.25,
+        leverage_uniform_floor: float = 1e-12,
+        ridge_leverage_lambda: Union[float, str] = "auto",
+        training_reweighting: str = "none",
         routing_temperature: float = 1.0,
         routing_shrinkage: float = 0.0,
         backend: str = "auto",
@@ -55,11 +59,33 @@ class SpectralSamplerBase(BaseSampler):
         self.selection_method = self._validate_choice(
             "selection_method",
             selection_method,
-            ("all", "leverage", "capped_leverage", "maxvol", "hybrid"),
+            (
+                "all",
+                "uniform",
+                "leverage",
+                "capped_leverage",
+                "saturated_leverage",
+                "robust_leverage_mixture",
+                "saturated_ridge_leverage",
+                "maxvol",
+                "hybrid",
+            ),
         )
         self.leverage_cap_quantile = self._validate_fraction(
             "leverage_cap_quantile",
             leverage_cap_quantile,
+        )
+        self.leverage_mixture_alpha = float(leverage_mixture_alpha)
+        if not 0.0 <= self.leverage_mixture_alpha <= 1.0:
+            raise ValueError("leverage_mixture_alpha must be in [0, 1]")
+        self.leverage_uniform_floor = float(leverage_uniform_floor)
+        if not np.isfinite(self.leverage_uniform_floor) or self.leverage_uniform_floor < 0.0:
+            raise ValueError("leverage_uniform_floor must be non-negative and finite")
+        self.ridge_leverage_lambda = ridge_leverage_lambda
+        self.training_reweighting = self._validate_choice(
+            "training_reweighting",
+            training_reweighting,
+            ("none", "inverse_probability"),
         )
         self.routing_temperature = float(routing_temperature)
         self.routing_shrinkage = float(routing_shrinkage)
@@ -86,6 +112,9 @@ class SpectralSamplerBase(BaseSampler):
         self.partition_names_: List[str] = []
         self.partition_to_cluster_: Dict[str, int] = {}
         self.partitions: Dict[str, np.ndarray] = {}
+        self.partition_training_weights_: Dict[str, np.ndarray] = {}
+        self.partition_inclusion_probabilities_: Dict[str, np.ndarray] = {}
+        self.partition_sketch_plans_: Dict[str, Any] = {}
         self.diagnostics_: Dict[str, Any] = {}
 
     @abstractmethod
