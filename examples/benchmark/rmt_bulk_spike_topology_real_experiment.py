@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 import json
 from pathlib import Path
@@ -76,6 +76,34 @@ REAL_TOPOLOGY_ARMS: tuple[str, ...] = (
 
 
 @dataclass(frozen=True)
+class FullDatasetReferenceContract:
+    dataset: str
+    problem_type: str
+    seed: int
+    model: str
+    n_train: int
+    n_test: int
+    test: Mapping[str, Any]
+    runtime: Mapping[str, float]
+    complexity: Mapping[str, Any] = field(default_factory=dict)
+    status: str = "completed"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "dataset": self.dataset,
+            "problem_type": self.problem_type,
+            "seed": int(self.seed),
+            "model": self.model,
+            "n_train": int(self.n_train),
+            "n_test": int(self.n_test),
+            "test": dict(self.test),
+            "runtime": dict(self.runtime),
+            "complexity": dict(self.complexity),
+            "status": self.status,
+        }
+
+
+@dataclass(frozen=True)
 class BulkSpikeRealExperimentConfig(RoutingGeometryExperimentConfig):
     regression_tasks: Sequence[str] = DEFAULT_REAL_TOPOLOGY_REGRESSION_TASKS
     classification_tasks: Sequence[str] = DEFAULT_REAL_TOPOLOGY_CLASSIFICATION_TASKS
@@ -110,6 +138,14 @@ class BulkSpikeRealExperimentConfig(RoutingGeometryExperimentConfig):
             * len(REAL_TOPOLOGY_ARMS)
         )
 
+    @property
+    def expected_reference_records(self) -> int:
+        return (
+            (len(self.regression_tasks) + len(self.classification_tasks))
+            * len(self.models)
+            * len(self.seeds)
+        )
+
 
 @dataclass(frozen=True)
 class PreparedBulkSpikeDataset(PreparedRoutingDataset):
@@ -135,6 +171,9 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
             config = replace(config, output_dir=BENCHMARK_DIR / "results" / run_id)
         super().__init__(config, arms=default_validation_selector_arms())
         self._provided_datasets = None if datasets is None else tuple(datasets)
+        self.reference_records_: dict[
+            tuple[str, int, str], dict[str, Any]
+        ] = {}
         self.geometry_selector = CrossFittedRoutingGeometrySelector(
             CrossFittedRoutingGeometrySelectionSpec(
                 reference_arm=self.arms[0].name,
@@ -154,6 +193,34 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
         if self._provided_datasets is not None:
             return list(self._provided_datasets)
         return super()._load_datasets()
+
+    def _write_metadata(self, *, status: str) -> None:
+        super()._write_metadata(status=status)
+        if self.output_dir_ is None:
+            return
+        path = self.output_dir_ / "run_meta.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["full_reference_record_count"] = len(self.reference_records_)
+        payload["expected_full_reference_records"] = (
+            self.config.expected_reference_records
+        )
+        path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    def _initialize_artifacts(self) -> None:
+        super()._initialize_artifacts()
+        if self.output_dir_ is None:
+            raise RuntimeError("Artifacts are not initialized")
+        path = self.output_dir_ / "bulk_spike_full_references.jsonl"
+        records = self._load_jsonl_records(path)
+        self.reference_records_ = {
+            self._reference_key(record): record
+            for record in records
+            if record.get("status") == "completed"
+        }
+        self._write_metadata(status="running")
 
     def _prepare_dataset(
         self,
@@ -201,6 +268,11 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
         model_factory: Any,
     ) -> None:
         identity = self._leaf_identity(prepared, budget, model_name)
+        self._ensure_full_dataset_reference(
+            prepared=prepared,
+            model_name=model_name,
+            model_factory=model_factory,
+        )
         pending = {
             arm
             for arm in REAL_TOPOLOGY_ARMS
@@ -263,6 +335,158 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
                         "error": str(exc),
                     }
                 )
+
+    def _ensure_full_dataset_reference(
+        self,
+        *,
+        prepared: PreparedBulkSpikeDataset,
+        model_name: str,
+        model_factory: Any,
+    ) -> dict[str, Any]:
+        key = (prepared.dataset.name, int(prepared.seed), str(model_name))
+        existing = self.reference_records_.get(key)
+        if existing is not None:
+            return existing
+        fit_started = perf_counter()
+        model = model_factory()
+        model.fit(prepared.X_train, prepared.y_train)
+        fit_seconds = float(perf_counter() - fit_started)
+        inference_started = perf_counter()
+        if prepared.dataset.problem_type == "classification":
+            probabilities = self._aligned_model_probabilities(
+                model,
+                prepared.X_test,
+                np.unique(prepared.y_train),
+            )
+            classes = np.unique(prepared.y_train)
+            prediction = classes[np.argmax(probabilities, axis=1)]
+        else:
+            probabilities = None
+            prediction = np.asarray(model.predict(prepared.X_test))
+        inference_seconds = float(perf_counter() - inference_started)
+        metrics = calculate_metrics(
+            prepared.y_test,
+            prediction,
+            probabilities,
+            prepared.dataset.problem_type,
+            classes=(
+                np.unique(prepared.y_train)
+                if prepared.dataset.problem_type == "classification"
+                else None
+            ),
+        )
+        if prepared.dataset.problem_type == "regression":
+            metrics["mae"] = float(
+                np.mean(
+                    np.abs(
+                        np.asarray(prepared.y_test, dtype=float)
+                        - np.asarray(prediction, dtype=float)
+                    )
+                )
+            )
+            metrics["tail_mean_absolute_error"] = (
+                upper_tail_mean_absolute_error(
+                    prepared.y_test,
+                    prediction,
+                    quantile=0.90,
+                )
+            )
+        primary = self._primary_metric(
+            prepared.dataset.problem_type,
+            prepared.y_train,
+        )
+        contract = FullDatasetReferenceContract(
+            dataset=prepared.dataset.name,
+            problem_type=prepared.dataset.problem_type,
+            seed=prepared.seed,
+            model=model_name,
+            n_train=len(prepared.X_train),
+            n_test=len(prepared.X_test),
+            test={
+                "primary_metric": primary,
+                "primary_value": float(metrics[primary]),
+                "metrics": {
+                    name: float(value) for name, value in metrics.items()
+                },
+            },
+            runtime={
+                "fit_seconds": fit_seconds,
+                "inference_seconds": inference_seconds,
+            },
+            complexity=self._models_complexity((model,), prepared.X_test),
+        )
+        payload = json_ready(contract.to_dict())
+        self.reference_records_[key] = payload
+        self._append_reference_record(payload)
+        return payload
+
+    @staticmethod
+    def _aligned_model_probabilities(
+        model: Any,
+        features: pd.DataFrame,
+        global_classes: np.ndarray,
+    ) -> np.ndarray:
+        if not hasattr(model, "predict_proba"):
+            raise RuntimeError("classification_probabilities_required")
+        raw = np.asarray(model.predict_proba(features), dtype=float)
+        model_classes = np.asarray(getattr(model, "classes_", ()))
+        if raw.ndim != 2 or raw.shape[1] != model_classes.size:
+            raise ValueError("Model probabilities do not align with model classes")
+        aligned = np.zeros((len(features), len(global_classes)), dtype=float)
+        positions = {label: index for index, label in enumerate(global_classes)}
+        for source, label in enumerate(model_classes):
+            if label in positions:
+                aligned[:, positions[label]] = raw[:, source]
+        row_sums = np.sum(aligned, axis=1, keepdims=True)
+        if np.any(row_sums <= 0.0):
+            raise ValueError("Aligned model probabilities have zero total mass")
+        return aligned / row_sums
+
+    def _append_reference_record(self, record: Mapping[str, Any]) -> None:
+        if self.output_dir_ is None:
+            raise RuntimeError("Artifacts are not initialized")
+        with (self.output_dir_ / "bulk_spike_full_references.jsonl").open(
+            "a",
+            encoding="utf-8",
+        ) as handle:
+            handle.write(json.dumps(json_ready(dict(record)), ensure_ascii=False) + "\n")
+        pd.DataFrame(self.reference_records_.values()).to_json(
+            self.output_dir_ / "bulk_spike_full_references.json",
+            orient="records",
+            indent=2,
+            force_ascii=False,
+        )
+        self._write_metadata(status="running")
+
+    @staticmethod
+    def _load_jsonl_records(path: Path) -> list[dict[str, Any]]:
+        if not path.exists():
+            return []
+        records = []
+        for line_number, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(),
+            start=1,
+        ):
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Invalid full-data reference at line {line_number}"
+                ) from exc
+            if not isinstance(value, dict):
+                raise ValueError("Full-data reference record must be an object")
+            records.append(value)
+        return records
+
+    @staticmethod
+    def _reference_key(record: Mapping[str, Any]) -> tuple[str, int, str]:
+        return (
+            str(record.get("dataset")),
+            int(record.get("seed", -1)),
+            str(record.get("model")),
+        )
 
     def _fit_and_evaluate_topologies(
         self,
@@ -716,14 +940,23 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
         ensemble: SamplingEnsemble,
         features: pd.DataFrame,
     ) -> dict[str, Any]:
+        return BulkSpikeRealExperimentOrchestrator._models_complexity(
+            tuple(model_info["model"] for model_info in ensemble.models),
+            features,
+        )
+
+    @staticmethod
+    def _models_complexity(
+        models: Sequence[Any],
+        features: pd.DataFrame,
+    ) -> dict[str, Any]:
         trees = []
         leaves = []
         splits = []
         depths = []
         importances = []
         shap_profiles = []
-        for model_info in ensemble.models:
-            model = model_info["model"]
+        for model in models:
             booster = getattr(model, "booster_", None)
             if booster is None:
                 continue
@@ -844,6 +1077,14 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
         if result.empty:
             return result
         for index, record in enumerate(self.records_):
+            reference = self.reference_records_.get(
+                (
+                    str(record.get("dataset")),
+                    int(record.get("seed", -1)),
+                    str(record.get("model")),
+                ),
+                {},
+            )
             for group in ("runtime", "complexity"):
                 for name, value in (record.get(group, {}) or {}).items():
                     result.loc[index, f"{group}_{name}"] = value
@@ -875,6 +1116,30 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
                     "class_coverage_guaranteed"
                 )
             )
+            reference_test = reference.get("test", {}) or {}
+            result.loc[index, "full_reference_primary_metric"] = (
+                reference_test.get("primary_metric")
+            )
+            result.loc[index, "full_reference_primary_value"] = (
+                reference_test.get("primary_value")
+            )
+            for name, value in (reference_test.get("metrics", {}) or {}).items():
+                result.loc[index, f"full_reference_{name}"] = value
+            for name, value in (reference.get("runtime", {}) or {}).items():
+                result.loc[index, f"full_reference_{name}"] = value
+            for name, value in (reference.get("complexity", {}) or {}).items():
+                result.loc[index, f"full_reference_complexity_{name}"] = value
+        lower = result["test_primary_metric"].isin({"rmse", "log_loss"})
+        result["degradation_vs_full"] = np.where(
+            lower,
+            (
+                result["test_primary_value"]
+                - result["full_reference_primary_value"]
+            )
+            / result["full_reference_primary_value"].abs().clip(lower=1e-12),
+            result["full_reference_primary_value"]
+            - result["test_primary_value"],
+        )
         return result
 
     def _finalize_artifacts(self, result: pd.DataFrame) -> None:
@@ -960,6 +1225,10 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
                 lambda values: float((values > 0.0).mean()),
             ),
             "mean_primary_value": ("test_primary_value", "mean"),
+            "mean_degradation_vs_full": (
+                "degradation_vs_full",
+                "mean",
+            ),
             "mean_fit_seconds": ("runtime_fit_seconds", "mean"),
             "mean_inference_seconds": ("runtime_inference_seconds", "mean"),
             "mean_tree_count": ("complexity_tree_count", "mean"),
@@ -1018,6 +1287,14 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
             "all_records_completed": bool(
                 len(result) == self.config.expected_records
                 and (result["status"] == "completed").all()
+            ),
+            "full_dataset_references_completed": bool(
+                len(self.reference_records_)
+                == self.config.expected_reference_records
+                and all(
+                    record.get("status") == "completed"
+                    for record in self.reference_records_.values()
+                )
             ),
             "specialized_topologies_preserve_exact_budget": bool(
                 not specialized.empty

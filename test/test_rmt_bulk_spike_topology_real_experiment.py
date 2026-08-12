@@ -64,6 +64,8 @@ def test_real_topology_runner_selects_away_from_test_and_resumes(tmp_path) -> No
     assert selected["n_calibration"] > 0
     assert selected["n_selection"] > 0
     assert selected["test_primary_metric"] == "rmse"
+    assert selected["full_reference_primary_metric"] == "rmse"
+    assert pd.notna(selected["degradation_vs_full"])
     assert result.loc[
         result["arm_name"].isin(
             ["B1_bulk_single_spike", "B2_bulk_multi_spike"]
@@ -83,6 +85,9 @@ def test_real_topology_runner_selects_away_from_test_and_resumes(tmp_path) -> No
     assert resumed.shape[0] == 4
     assert len(lines) == 4
     assert metadata["status"] == "completed"
+    assert metadata["full_reference_record_count"] == 1
+    assert (tmp_path / "bulk_spike_full_references.jsonl").exists()
+    assert (tmp_path / "bulk_spike_full_references.json").exists()
     assert (tmp_path / "bulk_spike_paired.csv").exists()
     assert (tmp_path / "bulk_spike_summary.csv").exists()
     assert (tmp_path / "bulk_spike_gate.json").exists()
@@ -150,6 +155,8 @@ def test_real_topology_runner_preserves_multiclass_probability_contract(tmp_path
     assert result.shape[0] == 4
     assert set(result["status"]) == {"completed"}
     assert result["test_primary_metric"].eq("log_loss").all()
+    assert result["full_reference_primary_metric"].eq("log_loss").all()
+    assert result["degradation_vs_full"].notna().all()
     assert result["test_brier_score"].notna().all()
     assert result["test_expected_calibration_error"].notna().all()
     specialized = result[

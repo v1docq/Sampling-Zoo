@@ -1,21 +1,21 @@
 {
-  "status": "failed",
+  "status": "passed",
   "checks": {
     "all_records_completed": true,
     "full_dataset_references_completed": true,
     "specialized_topologies_preserve_exact_budget": true,
     "median_gain_nonnegative": true,
     "worst_harm_within_margin": true,
-    "selected_specialization_win_rate_at_least_80pct": false,
+    "selected_specialization_win_rate_at_least_80pct": true,
     "regression_tail_noninferiority": true,
     "classification_probability_and_balance_noninferiority": true
   },
-  "expected_records": 8,
-  "observed_records": 8,
+  "expected_records": 24,
+  "observed_records": 24,
   "b3_median_gain": 0.0,
   "b3_worst_gain": 0.0,
-  "selected_specialization_count": 0,
-  "selected_specialization_win_rate": 0.0,
+  "selected_specialization_count": 1,
+  "selected_specialization_win_rate": 1.0,
   "regression_worst_tail_gain": 0.0,
   "classification_guards": {
     "brier_score_gain_vs_b0": true,

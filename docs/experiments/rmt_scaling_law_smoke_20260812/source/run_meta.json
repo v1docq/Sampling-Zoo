@@ -1,7 +1,7 @@
 {
   "status": "completed",
-  "updated_at": "2026-08-12T09:38:29Z",
-  "record_count": 8,
+  "updated_at": "2026-08-12T09:42:29Z",
+  "record_count": 24,
   "config": {
     "regression_suite": null,
     "classification_suite": null,
@@ -15,6 +15,8 @@
       "ridge"
     ],
     "budget_ratios": [
+      0.05,
+      0.1,
       0.2
     ],
     "seeds": [
@@ -29,7 +31,7 @@
       "projection_dim": 3,
       "min_sampled_rows_per_partition": 3
     },
-    "output_dir": "docs\\experiments\\rmt_bulk_spike_topology_real_smoke_20260812",
+    "output_dir": "docs\\experiments\\rmt_scaling_law_smoke_20260812\\source",
     "show_progress": false,
     "selector_fraction": 0.5,
     "selection_folds": 3,

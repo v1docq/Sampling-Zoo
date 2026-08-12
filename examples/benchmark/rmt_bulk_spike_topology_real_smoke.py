@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import sys
+from typing import Sequence
 
 import pandas as pd
 from sklearn.datasets import make_classification
@@ -58,7 +59,12 @@ def make_synthetic_multiclass_topology_dataset(seed: int) -> RawDatasetBundle:
     )
 
 
-def run_smoke(output_dir: Path, *, show_progress: bool = True) -> pd.DataFrame:
+def run_smoke(
+    output_dir: Path,
+    *,
+    budget_ratios: Sequence[float] = (0.20,),
+    show_progress: bool = True,
+) -> pd.DataFrame:
     regression = make_synthetic_regression_smoke_dataset(42)
     classification = make_synthetic_multiclass_topology_dataset(42)
     config = BulkSpikeRealExperimentConfig(
@@ -67,7 +73,7 @@ def run_smoke(output_dir: Path, *, show_progress: bool = True) -> pd.DataFrame:
         regression_tasks=(regression.name,),
         classification_tasks=(classification.name,),
         models=("ridge",),
-        budget_ratios=(0.20,),
+        budget_ratios=tuple(float(value) for value in budget_ratios),
         seeds=(42,),
         n_partitions=3,
         selection_folds=3,
@@ -91,9 +97,19 @@ def run_smoke(output_dir: Path, *, show_progress: bool = True) -> pd.DataFrame:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--budgets",
+        type=float,
+        nargs="+",
+        default=[0.20],
+    )
     parser.add_argument("--no-progress", action="store_true")
     args = parser.parse_args()
-    result = run_smoke(args.output_dir, show_progress=not args.no_progress)
+    result = run_smoke(
+        args.output_dir,
+        budget_ratios=tuple(args.budgets),
+        show_progress=not args.no_progress,
+    )
     print(result[["dataset", "arm_name", "status", "test_primary_value"]])
 
 
