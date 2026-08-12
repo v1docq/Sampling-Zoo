@@ -1,0 +1,54 @@
+{
+  "experiment": "rmt_bulk_spike_topology_synthetic",
+  "status": "completed",
+  "updated_at": "2026-08-12T11:58:53.781136",
+  "record_count": 12,
+  "expected_records": 12,
+  "config": {
+    "n_samples": 360,
+    "n_features": 20,
+    "regimes": [
+      "null",
+      "one_spike",
+      "rare_class_spike"
+    ],
+    "snr_values": [
+      1.0
+    ],
+    "budget_ratios": [
+      0.1
+    ],
+    "seeds": [
+      11
+    ],
+    "spectral_rank": 8,
+    "null_resamples": 5,
+    "validation_fraction": 0.2,
+    "test_fraction": 0.2,
+    "max_experts": 5,
+    "min_partition_size": 3,
+    "output_dir": "docs\\experiments\\rmt_bulk_spike_topology_smoke_v2_20260812",
+    "show_progress": false
+  },
+  "gate": {
+    "status": "passed",
+    "checks": {
+      "all_records_completed": true,
+      "exact_unique_budget": true,
+      "classification_probabilities_valid": true,
+      "null_and_false_outlier_fallback_rate_at_least_80pct": true,
+      "spurious_multi_expert_rate_at_most_20pct": true,
+      "confirmatory_median_gain_nonnegative": true,
+      "worst_primary_harm_at_most_05pct": true,
+      "row_permutation_metric_invariant": true,
+      "expert_order_permutation_invariant": true
+    },
+    "null_fallback_rate": 1.0,
+    "spurious_multi_expert_rate": 0.0,
+    "confirmatory_median_gain": 0.0,
+    "confirmatory_worst_gain": 0.0,
+    "expected_records": 12,
+    "observed_records": 12
+  },
+  "error": null
+}
