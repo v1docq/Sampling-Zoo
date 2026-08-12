@@ -70,6 +70,15 @@ from .resume import (
     scientific_experiment_config,
 )
 from .resume_runtime import ResumeSession, load_resume_session
+from .row_policy_selection import (
+    CrossFittedRowPolicySelectionSpec,
+    CrossFittedRowPolicySelector,
+    RowPolicyFoldScore,
+    RowSamplingPolicyEvidence,
+    RowSamplingPolicyRequest,
+    RowSamplingPolicyResult,
+    RowSamplingPolicySpec,
+)
 from .routing_geometry_selection import (
     ClassificationMetricGuardSpec,
     ClassificationRoutingGuardEvidence,
@@ -108,6 +117,8 @@ __all__ = [
     "ClassificationRoutingGuardSpec",
     "CrossFittedRoutingGeometrySelectionSpec",
     "CrossFittedRoutingGeometrySelector",
+    "CrossFittedRowPolicySelectionSpec",
+    "CrossFittedRowPolicySelector",
     "DatasetContract",
     "DatasetRunRef",
     "EvaluationContract",
@@ -132,6 +143,11 @@ __all__ = [
     "PartitionTrainingResult",
     "PackageVersion",
     "RoutingContract",
+    "RowPolicyFoldScore",
+    "RowSamplingPolicyEvidence",
+    "RowSamplingPolicyRequest",
+    "RowSamplingPolicyResult",
+    "RowSamplingPolicySpec",
     "RoutingGeometryCandidateEvidence",
     "RoutingGeometryFoldScore",
     "RoutingGeometryGuardMetricScore",
