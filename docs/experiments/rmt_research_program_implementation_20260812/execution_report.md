@@ -85,3 +85,7 @@
 `classification_geometry_guard`. Затем выполняется
 `conditional_row_policy`; только после завершения обоих этапов и прохождения
 классификационного критерия запускается `bulk_spike_pilot`.
+
+Результат первого серверного запуска и согласованная коррекция протокола
+зафиксированы в `classification_gate_protocol_correction_20260814.md` и
+`classification_gate_protocol_correction_20260814.json`.

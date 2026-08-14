@@ -1,0 +1,27 @@
+{
+  "source_run": "/home/revin_new/rmt_results/run_rmt_bulk_spike_research_program_20260812",
+  "observed": {
+    "classification_records": 480,
+    "classification_failed_leaf_runs": 20,
+    "failed_dataset": "vehicle",
+    "failed_budget_ratio": 0.01,
+    "outer_test_violation_count": 1,
+    "outer_test_worst_relative_harm": 0.0162,
+    "conditional_row_policy_records": 480,
+    "conditional_row_policy_gate": "passed"
+  },
+  "approved_protocol": {
+    "dynamic_classification_partition_budget": true,
+    "single_partition_candidate": true,
+    "classification_primary_selection_margin": 0.0,
+    "retry_stage": "classification_geometry_guard",
+    "preserve_stage": "conditional_row_policy"
+  },
+  "strict_margin_counterfactual": {
+    "nonbaseline_selections": 33,
+    "fallbacks_added": 5,
+    "win_rate": 0.9394,
+    "mean_gain": 0.00488,
+    "worst_gain": -0.00136
+  }
+}
