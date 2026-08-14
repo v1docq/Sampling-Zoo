@@ -96,6 +96,7 @@ class CrossFittedRoutingGeometryExperimentConfig(RoutingGeometryExperimentConfig
     classification_routing_guard: bool = False
     roc_auc_absolute_margin: float = 0.005
     log_loss_relative_margin: float = 0.01
+    classification_primary_selection_margin: Optional[float] = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -129,6 +130,13 @@ class CrossFittedRoutingGeometryExperimentConfig(RoutingGeometryExperimentConfig
             raise ValueError("roc_auc_absolute_margin must be non-negative")
         if float(self.log_loss_relative_margin) < 0.0:
             raise ValueError("log_loss_relative_margin must be non-negative")
+        if (
+            self.classification_primary_selection_margin is not None
+            and float(self.classification_primary_selection_margin) < 0.0
+        ):
+            raise ValueError(
+                "classification_primary_selection_margin must be non-negative"
+            )
 
 
 class CrossFittedRoutingGeometryExperimentOrchestrator(
@@ -177,6 +185,13 @@ class CrossFittedRoutingGeometryExperimentOrchestrator(
                     ),
                     log_loss_relative_margin=float(
                         config.log_loss_relative_margin
+                    ),
+                    primary_selection_margin=(
+                        None
+                        if config.classification_primary_selection_margin is None
+                        else float(
+                            config.classification_primary_selection_margin
+                        )
                     ),
                 )
                 if config.classification_routing_guard
@@ -249,6 +264,13 @@ class CrossFittedRoutingGeometryExperimentOrchestrator(
             "log_loss_relative_margin": float(
                 self.config.log_loss_relative_margin
             ),
+            "classification_primary_selection_margin": (
+                None
+                if self.config.classification_primary_selection_margin is None
+                else float(
+                    self.config.classification_primary_selection_margin
+                )
+            ),
         }
         defaults = {
             "regression_tail_guard": False,
@@ -258,6 +280,7 @@ class CrossFittedRoutingGeometryExperimentOrchestrator(
             "classification_routing_guard": False,
             "roc_auc_absolute_margin": 0.005,
             "log_loss_relative_margin": 0.01,
+            "classification_primary_selection_margin": None,
         }
         mismatches = {
             name: {
@@ -626,6 +649,7 @@ def run_rmt_cross_fitted_geometry_selector_experiment(
     classification_routing_guard: bool = False,
     roc_auc_absolute_margin: float = 0.005,
     log_loss_relative_margin: float = 0.01,
+    classification_primary_selection_margin: Optional[float] = None,
     selector_arm_name: Optional[str] = None,
     output_dir: Optional[str | Path] = None,
     show_progress: bool = True,
@@ -661,6 +685,9 @@ def run_rmt_cross_fitted_geometry_selector_experiment(
         classification_routing_guard=classification_routing_guard,
         roc_auc_absolute_margin=roc_auc_absolute_margin,
         log_loss_relative_margin=log_loss_relative_margin,
+        classification_primary_selection_margin=(
+            classification_primary_selection_margin
+        ),
         output_dir=None if output_dir is None else Path(output_dir),
         show_progress=show_progress,
     )
@@ -679,6 +706,7 @@ def run_rmt_classification_guarded_geometry_selector_experiment(
     selection_folds: int = 5,
     roc_auc_absolute_margin: float = 0.005,
     log_loss_relative_margin: float = 0.01,
+    classification_primary_selection_margin: float = 0.0,
     output_dir: Optional[str | Path] = None,
     show_progress: bool = True,
 ) -> pd.DataFrame:
@@ -705,6 +733,9 @@ def run_rmt_classification_guarded_geometry_selector_experiment(
         classification_routing_guard=True,
         roc_auc_absolute_margin=roc_auc_absolute_margin,
         log_loss_relative_margin=log_loss_relative_margin,
+        classification_primary_selection_margin=(
+            classification_primary_selection_margin
+        ),
         selector_arm_name=DEFAULT_CLASSIFICATION_GUARDED_SELECTOR_ARM_NAME,
         output_dir=output_dir,
         show_progress=show_progress,

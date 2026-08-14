@@ -105,8 +105,10 @@ from .stages import ExperimentPlan, ExperimentStageId, StageRegistry, StageReque
 from .research_program import (
     ResearchProgramPlan,
     ResearchStageResult,
+    ResearchStageRetryPlan,
     ResearchStageSpec,
     ResearchStageStatus,
+    build_stage_retry_plan,
     deserialize_stage_result,
     selected_stage_closure,
 )
@@ -136,6 +138,7 @@ __all__ = [
     "ExperimentPlan",
     "ResearchProgramPlan",
     "ResearchStageResult",
+    "ResearchStageRetryPlan",
     "ResearchStageSpec",
     "ResearchStageStatus",
     "ExperimentStageId",
@@ -186,6 +189,7 @@ __all__ = [
     "StageRegistry",
     "deserialize_stage_result",
     "selected_stage_closure",
+    "build_stage_retry_plan",
     "StageRequest",
     "StageResult",
     "StrategyGridContract",

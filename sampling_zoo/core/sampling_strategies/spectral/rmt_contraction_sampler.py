@@ -29,6 +29,8 @@ from .bulk_spike_topology import (
 from .cluster_selection import ClusterSelectionResult, SpectralClusterSelector
 from .classification_sampling import (
     ClassCoverageSelectionPlan,
+    ClassificationPartitionBudgetPlan,
+    build_classification_partition_budget_plan,
     infer_target_type,
     select_class_aware_partition_indices,
 )
@@ -564,6 +566,9 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self.power_iterations = int(cfg.power_iterations)
         self.max_unfolding_elements = cfg.max_unfolding_elements
         self._rmt_backend: Optional[Union[MatrixRMTBackend, TensorRMTBackend]] = None
+        self.classification_partition_budget_plan_: Optional[
+            ClassificationPartitionBudgetPlan
+        ] = None
         self.cluster_selector_ = self._make_cluster_selector()
         self.cluster_centers_: Optional[np.ndarray] = None
         self.initial_singular_values_: Optional[np.ndarray] = None
@@ -715,12 +720,24 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         return normalized
 
     def _make_cluster_selector(self) -> SpectralClusterSelector:
+        classification_plan = self.classification_partition_budget_plan_
+        classification_constraints = bool(
+            classification_plan is not None and classification_plan.applied
+        )
         return SpectralClusterSelector(
             algorithms=self.cluster_algorithms,
             selection_metric=self.cluster_selection_metric,
             ensemble_method=self.cluster_ensemble_method,
-            min_partitions=self.min_partitions,
-            max_partitions=self.max_partitions,
+            min_partitions=(
+                classification_plan.effective_min_partitions
+                if classification_constraints
+                else self.min_partitions
+            ),
+            max_partitions=(
+                classification_plan.effective_max_partitions
+                if classification_constraints
+                else self.max_partitions
+            ),
             min_auto_partition_size=self.min_auto_partition_size,
             selection_sample_size=self.partition_selection_sample_size,
             max_cluster_imbalance_ratio=self.max_cluster_imbalance_ratio,
@@ -740,16 +757,24 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             ),
             validation_proxy_smoothing=self.validation_proxy_smoothing,
             sampling_budget_ratio=self.sampling_budget_ratio,
-            budget_feasibility_mode=self.budget_feasibility_mode,
+            budget_feasibility_mode=(
+                "hard"
+                if classification_constraints
+                else self.budget_feasibility_mode
+            ),
             min_sampled_rows_per_partition=(
-                self.min_sampled_rows_per_partition
+                classification_plan.min_rows_per_partition
+                if classification_constraints
+                else self.min_sampled_rows_per_partition
             ),
             budget_max_imbalance_ratio=self.budget_max_imbalance_ratio,
             budget_min_partition_fraction=(
                 self.budget_min_partition_fraction
             ),
             include_single_partition_candidate=(
-                self.include_single_partition_candidate
+                classification_plan.include_single_partition_candidate
+                if classification_constraints
+                else self.include_single_partition_candidate
             ),
             downstream_proxy_model_factory=(
                 self.downstream_proxy_model_factory
@@ -851,6 +876,8 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self.n_views_selection_info_ = None
         self.partition_selection_info_ = None
         self.partition_budget_plan_ = None
+        self.classification_partition_budget_plan_ = None
+        self.cluster_selector_ = self._make_cluster_selector()
         self.class_coverage_selection_plans_ = {}
         self.partition_training_weights_ = {}
         self.partition_inclusion_probabilities_ = {}
@@ -1103,6 +1130,10 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
     ) -> None:
         if self.sample_embedding_ is None:
             raise RuntimeError("Sample embedding is not available")
+        self._prepare_classification_partition_budget(
+            target,
+            n_rows=int(self.sample_embedding_.shape[0]),
+        )
         labels = self._fit_cluster_labels(
             self.sample_embedding_,
             target,
@@ -1111,6 +1142,33 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         )
         self.cluster_labels_ = labels
         self._build_partitions_from_labels(labels, scores, target)
+
+    def _prepare_classification_partition_budget(
+        self,
+        target: Optional[Union[np.ndarray, pd.Series]],
+        *,
+        n_rows: int,
+    ) -> None:
+        plan = build_classification_partition_budget_plan(
+            target,
+            n_rows=n_rows,
+            sampling_budget_ratio=self.sampling_budget_ratio,
+            min_samples_per_class=self.min_samples_per_class,
+            requested_n_partitions=self.n_partitions,
+            requested_min_partitions=self.min_partitions,
+            requested_max_partitions=self.max_partitions,
+            configured_min_rows_per_partition=(
+                self.min_sampled_rows_per_partition
+            ),
+            configured_budget_feasibility_mode=self.budget_feasibility_mode,
+        )
+        self.classification_partition_budget_plan_ = plan
+        if plan.applied and not plan.feasible:
+            raise ValueError(
+                "Classification sampling budget cannot preserve every class: "
+                f"{plan.to_dict()}"
+            )
+        self.cluster_selector_ = self._make_cluster_selector()
 
     def _fit_bulk_spike_topology(
         self,
@@ -1292,7 +1350,13 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
                 downstream_features=downstream_features,
                 sample_scores=sample_scores,
             )
-        n_clusters = min(self.n_partitions, embedding.shape[0])
+        classification_plan = self.classification_partition_budget_plan_
+        requested_clusters = (
+            classification_plan.effective_n_partitions
+            if classification_plan is not None and classification_plan.applied
+            else self.n_partitions
+        )
+        n_clusters = min(requested_clusters, embedding.shape[0])
         self.clusterer_ = self._make_kmeans(n_clusters=n_clusters)
         labels = self.clusterer_.fit_predict(embedding)
         self.cluster_centers_ = self.clusterer_.cluster_centers_
@@ -1894,13 +1958,25 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             f"chunk_{cluster_id}": self._cluster_selection_capacity(indices.size)
             for cluster_id, indices in cluster_indices.items()
         }
-        hard_budget = self.budget_feasibility_mode == "hard"
+        classification_plan = self.classification_partition_budget_plan_
+        classification_constraints = bool(
+            classification_plan is not None and classification_plan.applied
+        )
+        hard_budget = (
+            self.budget_feasibility_mode == "hard"
+            or classification_constraints
+        )
+        min_rows_per_partition = (
+            classification_plan.min_rows_per_partition
+            if classification_constraints
+            else self.min_sampled_rows_per_partition
+        )
         self.partition_budget_plan_ = build_partition_budget_plan(
             capacities,
             total_rows=int(labels.size),
             budget_ratio=self.sampling_budget_ratio,
             min_rows_per_partition=(
-                self.min_sampled_rows_per_partition if hard_budget else 1
+                min_rows_per_partition if hard_budget else 1
             ),
             max_imbalance_ratio=(
                 self.budget_max_imbalance_ratio if hard_budget else None
@@ -2357,8 +2433,25 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             ),
             "sampling_budget_ratio": float(self.sampling_budget_ratio),
             "budget_feasibility_mode": self.budget_feasibility_mode,
+            "effective_budget_feasibility_mode": (
+                "hard"
+                if self.classification_partition_budget_plan_ is not None
+                and self.classification_partition_budget_plan_.applied
+                else self.budget_feasibility_mode
+            ),
             "min_sampled_rows_per_partition": int(
                 self.min_sampled_rows_per_partition
+            ),
+            "effective_min_sampled_rows_per_partition": int(
+                self.classification_partition_budget_plan_.min_rows_per_partition
+                if self.classification_partition_budget_plan_ is not None
+                and self.classification_partition_budget_plan_.applied
+                else self.min_sampled_rows_per_partition
+            ),
+            "classification_partition_budget_plan": (
+                self.classification_partition_budget_plan_.to_dict()
+                if self.classification_partition_budget_plan_ is not None
+                else {}
             ),
             "budget_max_imbalance_ratio": self.budget_max_imbalance_ratio,
             "budget_min_partition_fraction": float(

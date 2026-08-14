@@ -75,6 +75,155 @@ class ClassCoverageSelectionPlan:
         }
 
 
+@dataclass(frozen=True)
+class ClassificationPartitionBudgetPlan:
+    """Runtime partition limits required by an exact classification budget."""
+
+    applied: bool
+    feasible: bool
+    n_rows: int
+    n_classes: int
+    total_budget: int
+    min_samples_per_class: int
+    min_rows_per_partition: int
+    requested_n_partitions: int
+    requested_min_partitions: int
+    requested_max_partitions: int
+    effective_n_partitions: int
+    effective_min_partitions: int
+    effective_max_partitions: int
+    include_single_partition_candidate: bool
+    reason: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "applied": bool(self.applied),
+            "feasible": bool(self.feasible),
+            "n_rows": int(self.n_rows),
+            "n_classes": int(self.n_classes),
+            "total_budget": int(self.total_budget),
+            "min_samples_per_class": int(self.min_samples_per_class),
+            "min_rows_per_partition": int(self.min_rows_per_partition),
+            "requested_n_partitions": int(self.requested_n_partitions),
+            "requested_min_partitions": int(self.requested_min_partitions),
+            "requested_max_partitions": int(self.requested_max_partitions),
+            "effective_n_partitions": int(self.effective_n_partitions),
+            "effective_min_partitions": int(self.effective_min_partitions),
+            "effective_max_partitions": int(self.effective_max_partitions),
+            "include_single_partition_candidate": bool(
+                self.include_single_partition_candidate
+            ),
+            "reason": self.reason,
+        }
+
+
+def build_classification_partition_budget_plan(
+    target: Sequence[Any] | np.ndarray | None,
+    *,
+    n_rows: int,
+    sampling_budget_ratio: float,
+    min_samples_per_class: int,
+    requested_n_partitions: int,
+    requested_min_partitions: int,
+    requested_max_partitions: int | None,
+    configured_min_rows_per_partition: int = 1,
+    configured_budget_feasibility_mode: str = "off",
+) -> ClassificationPartitionBudgetPlan:
+    """Cap partition counts so every sampled classification chunk is feasible."""
+
+    rows = int(n_rows)
+    if rows < 1:
+        raise ValueError("n_rows must be positive")
+    ratio = float(sampling_budget_ratio)
+    if not np.isfinite(ratio) or not 0.0 < ratio <= 1.0:
+        raise ValueError("sampling_budget_ratio must be in (0, 1]")
+    minimum = int(min_samples_per_class)
+    if minimum < 1:
+        raise ValueError("min_samples_per_class must be positive")
+    requested_n = int(requested_n_partitions)
+    requested_min = int(requested_min_partitions)
+    requested_max = (
+        max(requested_n, requested_min)
+        if requested_max_partitions is None
+        else int(requested_max_partitions)
+    )
+    configured_min_rows = int(configured_min_rows_per_partition)
+    configured_mode = str(configured_budget_feasibility_mode).strip().lower()
+    if requested_n < 1 or requested_min < 1 or requested_max < requested_min:
+        raise ValueError("requested partition bounds are invalid")
+    if configured_min_rows < 1:
+        raise ValueError("configured_min_rows_per_partition must be positive")
+
+    target_type = infer_target_type(target, "auto")
+    total_budget = max(1, min(rows, int(round(rows * ratio))))
+    if target_type != "classification":
+        return ClassificationPartitionBudgetPlan(
+            applied=False,
+            feasible=True,
+            n_rows=rows,
+            n_classes=0,
+            total_budget=total_budget,
+            min_samples_per_class=minimum,
+            min_rows_per_partition=(
+                configured_min_rows
+                if configured_mode == "hard"
+                else 1
+            ),
+            requested_n_partitions=requested_n,
+            requested_min_partitions=requested_min,
+            requested_max_partitions=requested_max,
+            effective_n_partitions=requested_n,
+            effective_min_partitions=requested_min,
+            effective_max_partitions=requested_max,
+            include_single_partition_candidate=False,
+            reason="target_is_not_classification",
+        )
+
+    target_values = np.asarray(target).reshape(-1)
+    if target_values.size != rows:
+        raise ValueError("target must align with n_rows")
+    n_classes = int(np.unique(target_values).size)
+    class_minimum = max(1, n_classes * minimum)
+    configured_hard_minimum = (
+        configured_min_rows
+        if configured_mode == "hard"
+        else 1
+    )
+    min_rows_per_partition = max(class_minimum, configured_hard_minimum)
+    max_feasible_partitions = total_budget // min_rows_per_partition
+    feasible = max_feasible_partitions >= 1
+    effective_max = max(
+        1,
+        min(requested_max, max_feasible_partitions),
+    )
+    effective_min = min(requested_min, effective_max)
+    if effective_max == 1:
+        effective_min = 1
+    effective_n = min(requested_n, effective_max)
+
+    return ClassificationPartitionBudgetPlan(
+        applied=True,
+        feasible=feasible,
+        n_rows=rows,
+        n_classes=n_classes,
+        total_budget=total_budget,
+        min_samples_per_class=minimum,
+        min_rows_per_partition=min_rows_per_partition,
+        requested_n_partitions=requested_n,
+        requested_min_partitions=requested_min,
+        requested_max_partitions=requested_max,
+        effective_n_partitions=effective_n,
+        effective_min_partitions=effective_min,
+        effective_max_partitions=effective_max,
+        include_single_partition_candidate=True,
+        reason=(
+            "classification_budget_is_feasible"
+            if feasible
+            else "budget_below_global_class_coverage_minimum"
+        ),
+    )
+
+
 def infer_target_type(target: Any, configured: str = "auto") -> str:
     """Resolve a target kind without coupling the sampler to cluster selection."""
 
