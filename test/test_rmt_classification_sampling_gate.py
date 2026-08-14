@@ -19,6 +19,7 @@ from sampling_zoo.core.metrics.eval_metrics import (
     primary_classification_metric,
 )
 from sampling_zoo.core.sampling_strategies.spectral.classification_sampling import (
+    build_classification_partition_budget_plan,
     select_class_aware_partition_indices,
 )
 from sampling_zoo.core.sampling_strategies.spectral.rmt_contraction_sampler import (
@@ -119,6 +120,102 @@ def test_class_aware_selection_reports_infeasible_budget() -> None:
     assert not plan.feasible
     assert plan.selected_indices.size == 0
     assert "budget_below_class_coverage_minimum" in plan.violations
+
+
+def test_classification_budget_plan_reduces_partitions_to_preserve_classes() -> None:
+    target = np.resize(np.asarray([0, 1, 2, 3]), 400)
+
+    plan = build_classification_partition_budget_plan(
+        target,
+        n_rows=400,
+        sampling_budget_ratio=0.01,
+        min_samples_per_class=1,
+        requested_n_partitions=5,
+        requested_min_partitions=2,
+        requested_max_partitions=8,
+    )
+
+    assert plan.feasible
+    assert plan.total_budget == 4
+    assert plan.min_rows_per_partition == 4
+    assert plan.effective_n_partitions == 1
+    assert plan.effective_min_partitions == 1
+    assert plan.effective_max_partitions == 1
+    assert plan.include_single_partition_candidate
+
+
+def test_classification_budget_plan_respects_explicit_regression_type() -> None:
+    target = np.arange(400, dtype=np.int64)
+
+    plan = build_classification_partition_budget_plan(
+        target,
+        configured_target_type="regression",
+        n_rows=400,
+        sampling_budget_ratio=0.01,
+        min_samples_per_class=1,
+        requested_n_partitions=2,
+        requested_min_partitions=2,
+        requested_max_partitions=2,
+    )
+
+    assert not plan.applied
+    assert plan.feasible
+    assert plan.n_classes == 0
+    assert plan.total_budget == 4
+    assert plan.reason == "target_is_not_classification"
+
+
+def test_rmt_sampler_uses_single_partition_when_class_budget_requires_it() -> None:
+    rng = np.random.default_rng(29)
+    features = pd.DataFrame(rng.normal(size=(400, 6)))
+    target = pd.Series(np.resize(np.asarray([0, 1, 2, 3]), len(features)))
+    sampler = RMTContractionTensorSampler(
+        n_partitions=5,
+        partition_selection_method="fixed",
+        min_partitions=2,
+        max_partitions=8,
+        cluster_target_type="classification",
+        class_coverage_policy="preserve_local_classes",
+        sampling_budget_ratio=0.01,
+        n_views=2,
+        projection_dim=2,
+        backend="numpy",
+        show_progress=False,
+        random_state=13,
+    ).fit(features, target=target)
+
+    assert len(sampler.partitions) == 1
+    selected = next(iter(sampler.partitions.values()))
+    assert selected.size == 4
+    assert set(target.iloc[selected]) == {0, 1, 2, 3}
+    diagnostics = sampler.diagnostics_["classification_partition_budget_plan"]
+    assert diagnostics["effective_n_partitions"] == 1
+    assert sampler.diagnostics_["effective_budget_feasibility_mode"] == "hard"
+
+
+def test_rmt_sampler_does_not_treat_integer_regression_as_classes() -> None:
+    rng = np.random.default_rng(31)
+    features = pd.DataFrame(rng.normal(size=(400, 6)))
+    target = pd.Series(np.arange(len(features), dtype=np.int64))
+    sampler = RMTContractionTensorSampler(
+        n_partitions=2,
+        partition_selection_method="fixed",
+        min_partitions=2,
+        max_partitions=2,
+        cluster_target_type="regression",
+        class_coverage_policy="auto",
+        sampling_budget_ratio=0.01,
+        n_views=2,
+        projection_dim=2,
+        backend="numpy",
+        show_progress=False,
+        random_state=17,
+    ).fit(features, target=target)
+
+    diagnostics = sampler.diagnostics_["classification_partition_budget_plan"]
+    assert diagnostics["applied"] is False
+    assert diagnostics["reason"] == "target_is_not_classification"
+    assert sum(len(rows) for rows in sampler.partitions.values()) == 4
 
 
 def test_stratified_cap_is_exact_deterministic_and_preserves_classes() -> None:

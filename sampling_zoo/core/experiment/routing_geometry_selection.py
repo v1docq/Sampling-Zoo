@@ -45,6 +45,7 @@ class ClassificationRoutingGuardSpec:
 
     roc_auc_absolute_margin: float = 0.005
     log_loss_relative_margin: float = 0.01
+    primary_selection_margin: Optional[float] = None
     metric_guards: Tuple[ClassificationMetricGuardSpec, ...] = (
         ClassificationMetricGuardSpec(
             metric="brier_score",
@@ -78,6 +79,17 @@ class ClassificationRoutingGuardSpec:
             raise ValueError("roc_auc_absolute_margin must be non-negative")
         if float(self.log_loss_relative_margin) < 0.0:
             raise ValueError("log_loss_relative_margin must be non-negative")
+        if (
+            self.primary_selection_margin is not None
+            and float(self.primary_selection_margin) < 0.0
+        ):
+            raise ValueError("primary_selection_margin must be non-negative")
+        if self.primary_selection_margin is not None:
+            object.__setattr__(
+                self,
+                "primary_selection_margin",
+                float(self.primary_selection_margin),
+            )
         guards = tuple(self.metric_guards)
         names = tuple(item.metric for item in guards)
         if len(set(names)) != len(names):
@@ -86,19 +98,28 @@ class ClassificationRoutingGuardSpec:
 
     def primary_guard(self, metric: str) -> ClassificationMetricGuardSpec:
         normalized = str(metric).strip().lower()
+        strict_margin = self.primary_selection_margin
         if normalized == "roc_auc":
             return ClassificationMetricGuardSpec(
                 metric="roc_auc",
                 direction="higher",
                 gain_scale="absolute",
-                noninferiority_margin=float(self.roc_auc_absolute_margin),
+                noninferiority_margin=float(
+                    self.roc_auc_absolute_margin
+                    if strict_margin is None
+                    else strict_margin
+                ),
             )
         if normalized == "log_loss":
             return ClassificationMetricGuardSpec(
                 metric="log_loss",
                 direction="lower",
                 gain_scale="relative",
-                noninferiority_margin=float(self.log_loss_relative_margin),
+                noninferiority_margin=float(
+                    self.log_loss_relative_margin
+                    if strict_margin is None
+                    else strict_margin
+                ),
             )
         raise ValueError(
             "Classification routing guard supports roc_auc or log_loss primary metrics"

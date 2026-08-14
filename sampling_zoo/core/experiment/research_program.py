@@ -153,6 +153,20 @@ class ResearchProgramPlan:
         return {"stages": [stage.to_dict() for stage in self.stages]}
 
 
+@dataclass(frozen=True)
+class ResearchStageRetryPlan:
+    """Stages invalidated by an explicit retry and their dependent closure."""
+
+    requested_stage_ids: Tuple[str, ...]
+    invalidated_stage_ids: Tuple[str, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "requested_stage_ids": list(self.requested_stage_ids),
+            "invalidated_stage_ids": list(self.invalidated_stage_ids),
+        }
+
+
 def deserialize_stage_result(payload: Mapping[str, object]) -> ResearchStageResult:
     return ResearchStageResult(
         stage_id=str(payload["stage_id"]),
@@ -183,3 +197,33 @@ def selected_stage_closure(
                 closure.update(dependencies)
                 changed = True
     return tuple(stage_id for stage_id in plan.stage_ids() if stage_id in closure)
+
+
+def build_stage_retry_plan(
+    plan: ResearchProgramPlan,
+    retry_stage_ids: Sequence[str],
+) -> ResearchStageRetryPlan:
+    """Invalidate requested stages and every downstream dependent stage."""
+
+    requested = tuple(dict.fromkeys(str(value) for value in retry_stage_ids))
+    unknown = set(requested) - set(plan.stage_ids())
+    if unknown:
+        raise ValueError(f"unknown research stages: {sorted(unknown)}")
+    invalidated = set(requested)
+    changed = True
+    while changed:
+        changed = False
+        for stage in plan.stages:
+            if stage.stage_id in invalidated:
+                continue
+            if set(stage.dependencies) & invalidated:
+                invalidated.add(stage.stage_id)
+                changed = True
+    return ResearchStageRetryPlan(
+        requested_stage_ids=requested,
+        invalidated_stage_ids=tuple(
+            stage_id
+            for stage_id in plan.stage_ids()
+            if stage_id in invalidated
+        ),
+    )

@@ -380,6 +380,30 @@ def test_tail_guarded_config_keeps_classification_and_validates_tail_policy() ->
         CrossFittedRoutingGeometryExperimentConfig(regression_tail_guard=True)
 
 
+def test_classification_guard_can_require_nonnegative_primary_confidence() -> None:
+    config = CrossFittedRoutingGeometryExperimentConfig(
+        regression_tasks=(),
+        classification_tasks=("classification",),
+        classification_routing_guard=True,
+        classification_primary_selection_margin=0.0,
+        show_progress=False,
+    )
+    orchestrator = CrossFittedRoutingGeometryExperimentOrchestrator(config)
+
+    assert (
+        orchestrator.selector.spec.classification_guard.primary_selection_margin
+        == 0.0
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="classification_primary_selection_margin",
+    ):
+        CrossFittedRoutingGeometryExperimentConfig(
+            classification_primary_selection_margin=-0.01,
+        )
+
+
 def test_classification_replay_uses_probability_metrics() -> None:
     distances = RoutingDistanceContract(
         partition_names=("chunk_0", "chunk_1"),

@@ -362,6 +362,46 @@ def test_multiclass_primary_guard_uses_relative_log_loss() -> None:
     assert primary_guard.mean_gain == pytest.approx(0.10)
 
 
+def test_strict_classification_primary_margin_rejects_uncertain_gain() -> None:
+    candidate_auc = (0.81, 0.81, 0.81, 0.81, 0.77)
+    scores = []
+    for fold, auc in enumerate(candidate_auc):
+        scores.extend(
+            (
+                _classification_score(REFERENCE, fold),
+                _classification_score(CANDIDATE, fold, primary_value=auc),
+            )
+        )
+
+    legacy = _selector(
+        require_robust_metric=False,
+        noninferiority_margin=0.05,
+        classification_guard=ClassificationRoutingGuardSpec(
+            roc_auc_absolute_margin=0.05,
+        ),
+    ).select(scores)
+    strict = _selector(
+        require_robust_metric=False,
+        noninferiority_margin=0.05,
+        classification_guard=ClassificationRoutingGuardSpec(
+            primary_selection_margin=0.0,
+        ),
+    ).select(scores)
+
+    assert legacy.status == "selected"
+    assert strict.status == "fallback_to_a2"
+    primary_guard = strict.evidence[0].classification_guard_evidence[0]
+    assert primary_guard.confidence_interval[0] < 0.0
+    assert "confidence_interval_exceeds_harm_margin" in (
+        primary_guard.rejection_reasons
+    )
+
+
+def test_classification_primary_margin_must_be_nonnegative() -> None:
+    with pytest.raises(ValueError, match="primary_selection_margin"):
+        ClassificationRoutingGuardSpec(primary_selection_margin=-0.01)
+
+
 def test_selection_is_invariant_to_score_order() -> None:
     scores = []
     for fold in range(5):

@@ -1,0 +1,37 @@
+{
+  "date": "2026-08-15",
+  "stage": "bulk_spike_pilot",
+  "failed_run": {
+    "expected_records": 320,
+    "completed_records": 220,
+    "failed_records": 100,
+    "failed_by_dataset": {
+      "diamonds__task_233211": 80,
+      "OnlineNewsPopularity__task_359941": 20
+    },
+    "gate_status": "failed",
+    "invalidating_check": "all_records_completed"
+  },
+  "root_cause": "explicit regression target type was ignored by classification budget planning",
+  "correction": {
+    "budget_plan_parameter": "configured_target_type",
+    "sampler_source": "cluster_target_type",
+    "auto_inference_policy": "used only when configured_target_type is auto"
+  },
+  "verification": {
+    "reproduction_tests_passed": 4,
+    "rmt_contract_tests_passed": 61,
+    "applicable_full_suite_passed": 393,
+    "py_compile": "passed",
+    "diff_check": "passed"
+  },
+  "retry": {
+    "preserve_stages": [
+      "classification_geometry_guard",
+      "conditional_row_policy"
+    ],
+    "retry_stage": "bulk_spike_pilot",
+    "archive_previous_attempt": true,
+    "change_scientific_thresholds": false
+  }
+}

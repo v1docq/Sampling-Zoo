@@ -43,6 +43,7 @@ from sampling_zoo.core.experiment.research_program import (  # noqa: E402
     ResearchStageResult,
     ResearchStageSpec,
     ResearchStageStatus,
+    build_stage_retry_plan,
     deserialize_stage_result,
     selected_stage_closure,
 )
@@ -324,10 +325,13 @@ class RMTBulkSpikeResearchProgramOrchestrator:
         self,
         *,
         selected_stages: Optional[Sequence[str]] = None,
+        retry_stages: Optional[Sequence[str]] = None,
     ) -> Path:
         self.output_root.mkdir(parents=True, exist_ok=True)
         self._write_plan()
         self.results = self._load_state()
+        if retry_stages:
+            self._prepare_stage_retry(retry_stages)
         selected = (
             self.plan.stage_ids()
             if selected_stages is None
@@ -358,6 +362,49 @@ class RMTBulkSpikeResearchProgramOrchestrator:
             self._execute_stage(stage)
         self._write_state()
         return self.output_root
+
+    def _prepare_stage_retry(self, retry_stages: Sequence[str]) -> None:
+        retry_plan = build_stage_retry_plan(self.plan, retry_stages)
+        retry_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        archive_root = self.output_root / "retry_archive" / retry_id
+        archived = []
+        for stage_id in retry_plan.invalidated_stage_ids:
+            stage = self.plan.stage(stage_id)
+            source = self._stage_dir(stage)
+            if source.exists():
+                destination = archive_root / stage.artifact_directory
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                source.replace(destination)
+                archived.append(
+                    {
+                        "stage_id": stage_id,
+                        "source": str(source),
+                        "destination": str(destination),
+                    }
+                )
+            self.results.pop(stage_id, None)
+
+        manifest_path = self.output_root / f"research_program_retry_{retry_id}.json"
+        self._atomic_write_json(
+            manifest_path,
+            {
+                "retry_id": retry_id,
+                "created_at": self._timestamp(),
+                **retry_plan.to_dict(),
+                "archived_artifacts": archived,
+                "preserved_stage_ids": [
+                    stage_id
+                    for stage_id in self.plan.stage_ids()
+                    if stage_id in self.results
+                ],
+            },
+        )
+        self._append_event(
+            ",".join(retry_plan.requested_stage_ids),
+            "retry_prepared",
+            str(manifest_path),
+        )
+        self._write_state()
 
     def _execute_stage(self, stage: ResearchStageSpec) -> None:
         handler = self._handlers.get(stage.stage_id)
@@ -804,16 +851,21 @@ def run_rmt_bulk_spike_research_program(
     config: Optional[RMTBulkSpikeResearchProgramConfig] = None,
     *,
     selected_stages: Optional[Sequence[str]] = None,
+    retry_stages: Optional[Sequence[str]] = None,
 ) -> Path:
     return RMTBulkSpikeResearchProgramOrchestrator(
         config or RMTBulkSpikeResearchProgramConfig()
-    ).run(selected_stages=selected_stages)
+    ).run(
+        selected_stages=selected_stages,
+        retry_stages=retry_stages,
+    )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-root", type=Path)
     parser.add_argument("--stages", nargs="+")
+    parser.add_argument("--retry-stages", nargs="+")
     parser.add_argument("--max-train-rows", type=int, default=100_000)
     parser.add_argument("--no-progress", action="store_true")
     parser.add_argument("--plan-only", action="store_true")
@@ -829,7 +881,12 @@ def main() -> None:
         orchestrator._write_plan()
         print(orchestrator.output_root / "research_program_plan.json")
         return
-    print(orchestrator.run(selected_stages=args.stages))
+    print(
+        orchestrator.run(
+            selected_stages=args.stages,
+            retry_stages=args.retry_stages,
+        )
+    )
 
 
 if __name__ == "__main__":

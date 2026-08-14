@@ -1,13 +1,27 @@
 {
-  "date": "2026-08-12",
+  "date": "2026-08-15",
   "python_environment": ".venv_rmt_cuda39",
   "targeted_tests": {
     "status": "passed",
     "passed": 137
   },
+  "classification_protocol_correction_tests": {
+    "status": "passed",
+    "passed": 75
+  },
+  "target_type_contract_tests": {
+    "status": "passed",
+    "passed": 61,
+    "scope": [
+      "classification sampling budget",
+      "integer-valued regression",
+      "routing geometry",
+      "research-stage retry"
+    ]
+  },
   "applicable_full_suite": {
     "status": "passed",
-    "passed": 383,
+    "passed": 393,
     "ignored": [
       "test/test_feature_based.py",
       "test/test_temporal.py"
