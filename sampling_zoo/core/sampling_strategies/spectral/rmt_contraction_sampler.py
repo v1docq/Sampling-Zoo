@@ -1151,6 +1151,7 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
     ) -> None:
         plan = build_classification_partition_budget_plan(
             target,
+            configured_target_type=self.cluster_target_type,
             n_rows=n_rows,
             sampling_budget_ratio=self.sampling_budget_ratio,
             min_samples_per_class=self.min_samples_per_class,

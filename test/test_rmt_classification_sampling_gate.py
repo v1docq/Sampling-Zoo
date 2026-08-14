@@ -144,6 +144,27 @@ def test_classification_budget_plan_reduces_partitions_to_preserve_classes() -> 
     assert plan.include_single_partition_candidate
 
 
+def test_classification_budget_plan_respects_explicit_regression_type() -> None:
+    target = np.arange(400, dtype=np.int64)
+
+    plan = build_classification_partition_budget_plan(
+        target,
+        configured_target_type="regression",
+        n_rows=400,
+        sampling_budget_ratio=0.01,
+        min_samples_per_class=1,
+        requested_n_partitions=2,
+        requested_min_partitions=2,
+        requested_max_partitions=2,
+    )
+
+    assert not plan.applied
+    assert plan.feasible
+    assert plan.n_classes == 0
+    assert plan.total_budget == 4
+    assert plan.reason == "target_is_not_classification"
+
+
 def test_rmt_sampler_uses_single_partition_when_class_budget_requires_it() -> None:
     rng = np.random.default_rng(29)
     features = pd.DataFrame(rng.normal(size=(400, 6)))
@@ -170,6 +191,31 @@ def test_rmt_sampler_uses_single_partition_when_class_budget_requires_it() -> No
     diagnostics = sampler.diagnostics_["classification_partition_budget_plan"]
     assert diagnostics["effective_n_partitions"] == 1
     assert sampler.diagnostics_["effective_budget_feasibility_mode"] == "hard"
+
+
+def test_rmt_sampler_does_not_treat_integer_regression_as_classes() -> None:
+    rng = np.random.default_rng(31)
+    features = pd.DataFrame(rng.normal(size=(400, 6)))
+    target = pd.Series(np.arange(len(features), dtype=np.int64))
+    sampler = RMTContractionTensorSampler(
+        n_partitions=2,
+        partition_selection_method="fixed",
+        min_partitions=2,
+        max_partitions=2,
+        cluster_target_type="regression",
+        class_coverage_policy="auto",
+        sampling_budget_ratio=0.01,
+        n_views=2,
+        projection_dim=2,
+        backend="numpy",
+        show_progress=False,
+        random_state=17,
+    ).fit(features, target=target)
+
+    diagnostics = sampler.diagnostics_["classification_partition_budget_plan"]
+    assert diagnostics["applied"] is False
+    assert diagnostics["reason"] == "target_is_not_classification"
+    assert sum(len(rows) for rows in sampler.partitions.values()) == 4
 
 
 def test_stratified_cap_is_exact_deterministic_and_preserves_classes() -> None:

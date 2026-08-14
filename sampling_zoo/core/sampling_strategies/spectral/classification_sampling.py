@@ -120,6 +120,7 @@ class ClassificationPartitionBudgetPlan:
 def build_classification_partition_budget_plan(
     target: Sequence[Any] | np.ndarray | None,
     *,
+    configured_target_type: str = "auto",
     n_rows: int,
     sampling_budget_ratio: float,
     min_samples_per_class: int,
@@ -154,7 +155,7 @@ def build_classification_partition_budget_plan(
     if configured_min_rows < 1:
         raise ValueError("configured_min_rows_per_partition must be positive")
 
-    target_type = infer_target_type(target, "auto")
+    target_type = infer_target_type(target, configured_target_type)
     total_budget = max(1, min(rows, int(round(rows * ratio))))
     if target_type != "classification":
         return ClassificationPartitionBudgetPlan(
