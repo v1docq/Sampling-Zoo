@@ -1,0 +1,521 @@
+from __future__ import annotations
+
+import json
+import os
+import sys
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable, Mapping, Sequence
+
+from tqdm.auto import tqdm
+
+ROOT_DIR = Path(__file__).resolve().parents[2]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+BENCHMARK_DIR = Path(__file__).resolve().parent
+if str(BENCHMARK_DIR) not in sys.path:
+    sys.path.insert(0, str(BENCHMARK_DIR))
+
+from benchmark_dataset_interfaces import cap_openml_dataset, make_synthetic_regression_smoke_dataset  # noqa: E402
+from benchmark_datasets import OpenMLRawDatasetBundle, RawDatasetBundle, load_suite_raw_datasets  # noqa: E402
+from benchmark_incremental import IncrementalExperimentSaver, load_jsonl_records  # noqa: E402
+from benchmark_logging import BenchmarkLogger  # noqa: E402
+from benchmark_models import make_model_pool  # noqa: E402
+from benchmark_repo import OPENML_REGRESSION_SUITE  # noqa: E402
+from benchmark_runner import EnsembleChunkBenchmarkRunner  # noqa: E402
+from benchmark_sampling_strategies import make_chunking_strategy_configs  # noqa: E402
+from rmt_experiment_utils import json_ready, load_reference_metrics  # noqa: E402
+from rmt_report_tables import EFFICIENCY_DELTAS, RMTReportTableBuilder, build_rmt_report_tables  # noqa: E402
+from run_big_datasets_ensemble import EnsembleReportBuilder  # noqa: E402
+from sampling_zoo.core.experiment.contracts import StrategyGridContract  # noqa: E402
+from sampling_zoo.core.experiment.morphisms import (  # noqa: E402
+    build_standard_rmt_experiment_plan,
+    normalize_strategy_grid,
+)
+from sampling_zoo.core.experiment.stages import ExperimentPlan, ExperimentStageId  # noqa: E402
+
+DEFAULT_RMT_REGRESSION_TASKS: tuple[str, ...] = (
+    "Allstate_Claims_Severity",
+    "black_friday",
+    "Yolanda",
+    "Buzzinsocialmedia_Twitter",
+    "nyc-taxi-green-dec-2016",
+    "Airlines_DepDelay_10M",
+)
+DEFAULT_BUDGET_RATIOS: tuple[float, ...] = (0.01, 0.05, 0.1)  #, 0.75, 0.9)
+DEFAULT_ENSEMBLE_METHODS: tuple[str, ...] = ("voting", "routed_weighted")
+DEFAULT_VIEW_STRATEGY: tuple[str, ...] = (
+    #"subsample",
+    "gaussian",
+)
+DEFAULT_VIEW_STRATEGIES: tuple[str, ...] = DEFAULT_VIEW_STRATEGY
+DEFAULT_ROUTER_MODES: tuple[str, ...] = ("spectral", "constrained_gating")
+DEFAULT_BUDGET_APPLICATION = "after_partitioning" # after_partitioning | before_partitioning
+DEFAULT_CLUSTER_ENSEMBLE_METHOD = "weighted_vote"
+DEFAULT_CONSTRAINED_GATING_CONFIG: dict[str, Any] = {
+    "gating_hidden_dim": 64,
+    "gating_epochs": 200,
+    "gating_lr": 1e-3,
+    "gating_kl_weight": 0.10,
+    "gating_balance_weight": 0.01,
+    "gating_weight_decay": 1e-4,
+    "gating_batch_size": 2048,
+    "gating_device": "auto",
+}
+DEFAULT_STRATEGIES: tuple[str, ...] = (
+    "rmt_contraction",
+    "random",
+    "difficulty",
+    # "feature_clustering",
+)
+
+
+@dataclass(frozen=True)
+class RMTRegressionExperimentConfig:
+    regression_suite: int | None = OPENML_REGRESSION_SUITE
+    regression_tasks: Sequence[str] | None = DEFAULT_RMT_REGRESSION_TASKS
+    strategies: Sequence[str] = DEFAULT_STRATEGIES
+    models: Sequence[str] = ("lightgbm",)
+    ensemble_methods: Sequence[str] = DEFAULT_ENSEMBLE_METHODS
+    budget_ratios: Sequence[float] = DEFAULT_BUDGET_RATIOS
+    full_dataset_budget_ratio: float = 1.0
+    budget_application: str = DEFAULT_BUDGET_APPLICATION
+    cluster_ensemble_method: str = DEFAULT_CLUSTER_ENSEMBLE_METHOD
+    view_strategies: Sequence[str] = DEFAULT_VIEW_STRATEGIES
+    router_modes: Sequence[str] = DEFAULT_ROUTER_MODES
+    n_partitions: int = 5
+    max_train_rows: int | None = 300_000
+    seed: int = 42
+    show_progress: bool = True
+    synthetic_smoke: bool = False
+    output_dir: str | None = None
+
+
+@dataclass(frozen=True)
+class RMTStrategyGridPoint:
+    strategy: str
+    ensemble_method: str
+    budget_ratio: float
+    view_strategy: str | None = None
+    router: str | None = None
+
+    @property
+    def config_name(self) -> str:
+        ratio_tag = f"{int(round(self.budget_ratio * 100)):02d}"
+        view_tag = f"__view_{self.view_strategy}" if self.view_strategy is not None else ""
+        router_tag = f"__router_{self.router}" if self.router is not None else ""
+        return f"{self.strategy}{view_tag}__{self.ensemble_method}{router_tag}__budget_{ratio_tag}"
+
+
+def make_rmt_experiment_strategy_configs(
+        problem_type: str,
+        strategies: Sequence[str],
+        ensemble_methods: Sequence[str],
+        budget_ratios: Sequence[float],
+        full_dataset_budget_ratio: float,
+        budget_application: str,
+        cluster_ensemble_method: str,
+        view_strategies: Sequence[str],
+        n_partitions: int,
+        seed: int,
+        show_progress: bool = True,
+        router_modes: Sequence[str] = DEFAULT_ROUTER_MODES,
+) -> dict[str, dict[str, Any]]:
+    full_ratio_tag = f"{int(round(full_dataset_budget_ratio * 100)):02d}"
+    full_dataset_config_name = "full_dataset" if full_dataset_budget_ratio >= 1.0 else f"full_dataset__budget_{full_ratio_tag}"
+    configs: dict[str, dict[str, Any]] = {
+        full_dataset_config_name: {
+            "strategy": "full_dataset",
+            "force_direct_model": True,
+            "ensemble_method": "full_dataset",
+            "budget_ratio": float(full_dataset_budget_ratio),
+        }
+    }
+
+    grid = make_rmt_strategy_grid(
+        strategies=strategies,
+        ensemble_methods=ensemble_methods,
+        budget_ratios=budget_ratios,
+        view_strategies=view_strategies,
+        router_modes=router_modes,
+    )
+    for grid_point in tqdm(
+            grid,
+            desc="Build RMT strategy grid",
+            disable=not show_progress,
+            leave=False,
+    ):
+        base_config = make_chunking_strategy_configs(
+            problem_type=problem_type,
+            strategy_names=(grid_point.strategy,),
+            n_partitions=n_partitions,
+            seed=seed,
+            ensemble_method=grid_point.ensemble_method,
+            budget_ratio=grid_point.budget_ratio,
+            force_chunking=True,
+        )[grid_point.strategy]
+        base_config["budget_application"] = budget_application
+        if grid_point.strategy == "rmt_contraction":
+            base_config["cluster_ensemble_method"] = cluster_ensemble_method
+        if grid_point.view_strategy is not None:
+            base_config["view_strategy"] = grid_point.view_strategy
+        if grid_point.router is not None:
+            base_config["router"] = grid_point.router
+        if grid_point.router == "constrained_gating":
+            base_config.update(DEFAULT_CONSTRAINED_GATING_CONFIG)
+        configs[grid_point.config_name] = base_config
+    # del configs['full_dataset']
+    return configs
+
+
+def make_rmt_strategy_grid(
+        strategies: Sequence[str],
+        ensemble_methods: Sequence[str],
+        budget_ratios: Sequence[float],
+        view_strategies: Sequence[str] = DEFAULT_VIEW_STRATEGIES,
+        router_modes: Sequence[str] = DEFAULT_ROUTER_MODES,
+) -> list[RMTStrategyGridPoint]:
+    view_strategies = _normalize_view_strategies(view_strategies)
+    router_modes = _normalize_router_modes(router_modes)
+    grid: list[RMTStrategyGridPoint] = []
+    for strategy in strategies:
+        strategy_view_strategies: Sequence[str | None]
+        if strategy == "rmt_contraction":
+            strategy_view_strategies = tuple(view_strategies)
+        else:
+            strategy_view_strategies = (None,)
+        for view_strategy in strategy_view_strategies:
+            for ensemble_method in ensemble_methods:
+                strategy_router_modes: Sequence[str | None]
+                if strategy == "rmt_contraction" and ensemble_method == "routed_weighted":
+                    strategy_router_modes = tuple(router_modes)
+                else:
+                    strategy_router_modes = (None,)
+                for budget_ratio in budget_ratios:
+                    for router in strategy_router_modes:
+                        grid.append(
+                            RMTStrategyGridPoint(
+                                strategy=strategy,
+                                ensemble_method=ensemble_method,
+                                budget_ratio=float(budget_ratio),
+                                view_strategy=view_strategy,
+                                router=router,
+                            )
+                        )
+    return grid
+
+
+def _normalize_view_strategies(view_strategies: Sequence[str] | str) -> tuple[str, ...]:
+    if isinstance(view_strategies, str):
+        return (view_strategies,)
+    return tuple(view_strategies)
+
+
+def _normalize_router_modes(router_modes: Sequence[str] | str) -> tuple[str, ...]:
+    if isinstance(router_modes, str):
+        return (router_modes,)
+    return tuple(router_modes)
+
+
+class RMTRegressionExperimentOrchestrator:
+    def __init__(self, config: RMTRegressionExperimentConfig) -> None:
+        self.config = config
+        self.report_builder = EnsembleReportBuilder()
+        self.rmt_report_table_builder = RMTReportTableBuilder()
+        self.incremental_saver: IncrementalExperimentSaver | None = None
+        self.experiment_plan: ExperimentPlan | None = None
+
+    def _prepare_runtime(self) -> None:
+        if self.config.synthetic_smoke:
+            os.environ.setdefault("LOKY_MAX_CPU_COUNT", "1")
+            os.environ.setdefault("OMP_NUM_THREADS", "1")
+
+    def _create_logger(self) -> BenchmarkLogger:
+        base_dir = Path(__file__).resolve().parent
+        if self.config.output_dir is not None:
+            output_dir = Path(self.config.output_dir).expanduser()
+            if not output_dir.is_absolute():
+                output_dir = (ROOT_DIR / output_dir).resolve()
+            return BenchmarkLogger(run_id=output_dir.name, artifacts_root=output_dir.parent)
+
+        run_id = f"run_rmt_contraction_regression_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        return BenchmarkLogger(run_id=run_id, artifacts_root=base_dir / "results")
+
+    def _create_incremental_recorder(
+            self,
+            logger: BenchmarkLogger,
+    ) -> Callable[[Mapping[str, Any]], None]:
+        self.incremental_saver = self._create_incremental_saver(logger)
+        self.incremental_saver.start()
+        return self.incremental_saver.record
+
+    def _create_incremental_saver(self, logger: BenchmarkLogger) -> IncrementalExperimentSaver:
+        reference_metrics = load_reference_metrics()
+
+        def _build_ensemble_tables(records: Sequence[Mapping[str, Any]]) -> None:
+            self.report_builder.build_tables(records, logger.paths.metrics)
+
+        def _build_rmt_tables(records: Sequence[Mapping[str, Any]]) -> None:
+            self.rmt_report_table_builder.build_report_tables(records, logger.paths.metrics, reference_metrics)
+
+        def _build_markdown_report(records: Sequence[Mapping[str, Any]]) -> None:
+            logger.create_markdown_report(records)
+
+        return IncrementalExperimentSaver(
+            records_path=logger.paths.metrics / "rmt_regression_runs.jsonl",
+            metadata_path=logger.paths.root / "run_meta.json",
+            snapshot_hooks=(
+                _build_ensemble_tables,
+                _build_rmt_tables,
+                _build_markdown_report,
+            ),
+            metadata_builder=lambda records, status: self._build_run_meta(logger, records, status),
+            json_ready=json_ready,
+        )
+
+    def _create_runner(self, logger: BenchmarkLogger) -> EnsembleChunkBenchmarkRunner:
+        return EnsembleChunkBenchmarkRunner(
+            logger=logger,
+            cv_folds=2 if self.config.synthetic_smoke else 1,
+            seed=self.config.seed,
+            show_progress=self.config.show_progress,
+            on_record=self._create_incremental_recorder(logger),
+        )
+
+    def _load_datasets(self) -> list[RawDatasetBundle]:
+        if self.config.synthetic_smoke:
+            return [make_synthetic_regression_smoke_dataset(self.config.seed)]
+
+        with tqdm(
+            total=2,
+            desc="Load OpenML datasets",
+            disable=not self.config.show_progress,
+            leave=False,
+            unit="stage",
+        ) as load_progress:
+            load_progress.set_postfix_str("resolve suite tasks")
+            datasets = load_suite_raw_datasets(
+                classification_suite=None,
+                regression_suite=self.config.regression_suite,
+                classification_tasks=None,
+                regression_tasks=self.config.regression_tasks,
+                show_progress=self.config.show_progress,
+            )
+            load_progress.update(1)
+
+            load_progress.set_postfix_str("apply row caps")
+            prepared_datasets = []
+            for dataset in tqdm(
+                datasets,
+                desc="Prepare OpenML datasets",
+                disable=not self.config.show_progress,
+                leave=False,
+            ):
+                prepared_datasets.append(
+                    cap_openml_dataset(dataset, self.config.max_train_rows, self.config.seed)
+                    if isinstance(dataset, OpenMLRawDatasetBundle)
+                    else dataset
+                )
+            load_progress.update(1)
+
+        return prepared_datasets
+
+    def _load_available_datasets(self) -> list[RawDatasetBundle]:
+        datasets = self._load_datasets()
+        if not datasets:
+            raise RuntimeError("No regression datasets available for RMT contraction experiment.")
+        return datasets
+
+    def _build_experiment_plan(self) -> ExperimentPlan:
+        plan = build_standard_rmt_experiment_plan(asdict(self.config))
+        self.experiment_plan = plan
+        return plan
+
+    def _build_strategy_grid(self) -> StrategyGridContract:
+        configs = make_rmt_experiment_strategy_configs(
+            problem_type="regression",
+            strategies=self.config.strategies,
+            ensemble_methods=self.config.ensemble_methods,
+            budget_ratios=self.config.budget_ratios,
+            full_dataset_budget_ratio=self.config.full_dataset_budget_ratio,
+            budget_application=self.config.budget_application,
+            cluster_ensemble_method=self.config.cluster_ensemble_method,
+            view_strategies=self.config.view_strategies,
+            n_partitions=self.config.n_partitions,
+            seed=self.config.seed,
+            show_progress=self.config.show_progress,
+            router_modes=self.config.router_modes,
+        )
+        return normalize_strategy_grid(configs)
+
+    def _run_experiment(
+            self,
+            datasets: Sequence[RawDatasetBundle],
+            strategy_configs: StrategyGridContract | Mapping[str, Mapping[str, Any]],
+            runner: EnsembleChunkBenchmarkRunner,
+    ) -> list[dict[str, Any]]:
+        run_records = self._load_existing_run_records()
+        for dataset in tqdm(
+                datasets,
+                desc="Run RMT datasets",
+                disable=not self.config.show_progress,
+                leave=False,
+        ):
+            model_pool = make_model_pool(
+                seed=self.config.seed,
+                model_names=self.config.models,
+                problem_type="regression",
+            )
+            run_records.extend(runner.run_dataset(dataset, strategy_configs, model_pool))
+        return run_records
+
+    def _load_existing_run_records(self) -> list[dict[str, Any]]:
+        if self.incremental_saver is None or self.config.output_dir is None:
+            return []
+
+        records_path = self.incremental_saver.records_path
+        records = load_jsonl_records(records_path)
+        self.incremental_saver.records = [dict(record) for record in records]
+        if records:
+            print(f"Continuing benchmark in {records_path.parent.parent}: loaded {len(records)} existing records.")
+        else:
+            print(f"Continuing benchmark in {records_path.parent.parent}: no existing records found.")
+        return [dict(record) for record in records]
+
+    def _build_report_artifacts(self, run_records: Sequence[Mapping[str, Any]], logger: BenchmarkLogger) -> None:
+        if self.incremental_saver is not None:
+            self.incremental_saver.persist_snapshot(run_records, status="running")
+            return
+        self.report_builder.build_tables(run_records, logger.paths.metrics)
+        self.rmt_report_table_builder.build_report_tables(run_records, logger.paths.metrics, load_reference_metrics())
+        logger.create_markdown_report(run_records)
+
+    def _build_run_meta(
+            self,
+            logger: BenchmarkLogger,
+            run_records: Sequence[Mapping[str, Any]],
+            status: str = "completed",
+    ) -> dict[str, Any]:
+        return {
+            "run_id": logger.run_id,
+            "output_dir": str(logger.paths.root),
+            "regression_suite": self.config.regression_suite,
+            "regression_tasks": list(self.config.regression_tasks or []),
+            "strategies": list(self.config.strategies),
+            "models": list(self.config.models),
+            "ensemble_methods": list(self.config.ensemble_methods),
+            "budget_ratios": list(self.config.budget_ratios),
+            "full_dataset_budget_ratio": self.config.full_dataset_budget_ratio,
+            "budget_application": self.config.budget_application,
+            "cluster_ensemble_method": self.config.cluster_ensemble_method,
+            "view_strategies": list(self.config.view_strategies),
+            "max_train_rows": self.config.max_train_rows,
+            "synthetic_smoke": self.config.synthetic_smoke,
+            "continue_output_dir": self.config.output_dir,
+            "status": status,
+            "records": len(run_records),
+            "experiment_plan": None if self.experiment_plan is None else self.experiment_plan.to_dict(),
+        }
+
+    def _write_run_metadata(self, logger: BenchmarkLogger, run_records: Sequence[Mapping[str, Any]]) -> None:
+        if self.incremental_saver is not None:
+            self.incremental_saver.finalize(run_records)
+            return
+        run_meta = self._build_run_meta(logger, run_records)
+        (logger.paths.root / "run_meta.json").write_text(
+            json.dumps(json_ready(run_meta), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _announce_completion(self, logger: BenchmarkLogger) -> Path:
+        print(f"RMT contraction regression experiment completed. Artifacts: {logger.paths.root}")
+        return logger.paths.root
+
+    def _execute_experiment_plan(self, plan: ExperimentPlan) -> Path:
+        context: dict[str, Any] = {}
+        for stage_id in plan.stage_ids():
+            if stage_id == ExperimentStageId.PREPARE_RUNTIME:
+                self._prepare_runtime()
+            elif stage_id == ExperimentStageId.CREATE_LOGGER:
+                context["logger"] = self._create_logger()
+            elif stage_id == ExperimentStageId.CREATE_RUNNER:
+                context["runner"] = self._create_runner(context["logger"])
+            elif stage_id == ExperimentStageId.LOAD_DATASETS:
+                context["datasets"] = self._load_available_datasets()
+            elif stage_id == ExperimentStageId.BUILD_STRATEGY_GRID:
+                context["strategy_grid"] = self._build_strategy_grid()
+            elif stage_id == ExperimentStageId.RUN_DATASETS:
+                context["run_records"] = self._run_experiment(
+                    context["datasets"],
+                    context["strategy_grid"],
+                    context["runner"],
+                )
+            elif stage_id == ExperimentStageId.BUILD_REPORTS:
+                self._build_report_artifacts(context["run_records"], context["logger"])
+            elif stage_id == ExperimentStageId.WRITE_METADATA:
+                self._write_run_metadata(context["logger"], context["run_records"])
+            elif stage_id == ExperimentStageId.FINALIZE:
+                context["result_path"] = self._announce_completion(context["logger"])
+            else:
+                raise RuntimeError(f"Unsupported experiment stage: {stage_id}")
+        return context["result_path"]
+
+    def run(self) -> Path:
+        plan = self._build_experiment_plan()
+        try:
+            return self._execute_experiment_plan(plan)
+        except Exception as ex:
+            if self.incremental_saver is not None:
+                self.incremental_saver.mark_failed(ex)
+            raise
+
+
+def run_rmt_contraction_regression_experiment(
+        regression_tasks: Sequence[str] | None = None,
+        models: Sequence[str] = ("lightgbm",),
+        max_train_rows: int | None = 300_000,
+        budget_application: str = DEFAULT_BUDGET_APPLICATION,
+        cluster_ensemble_method: str = DEFAULT_CLUSTER_ENSEMBLE_METHOD,
+        show_progress: bool = True,
+        output_dir: str | None = None,
+) -> Path:
+    config = RMTRegressionExperimentConfig(
+        regression_tasks=regression_tasks or DEFAULT_RMT_REGRESSION_TASKS,
+        models=models,
+        max_train_rows=max_train_rows,
+        budget_application=budget_application,
+        cluster_ensemble_method=cluster_ensemble_method,
+        show_progress=show_progress,
+        output_dir=output_dir,
+    )
+    return RMTRegressionExperimentOrchestrator(config).run()
+
+
+if __name__ == "__main__":
+    direct_baseline_specs = (
+        ("Airlines_DepDelay_10M", "tabicl", 0.1),
+        ("black_friday", "tabpfn", 0.25),
+        ("nyc-taxi-green-dec-2016", "tabpfn", 0.15),
+        ("Allstate_Claims_Severity", "tabpfn", 0.15),
+        ("Buzzinsocialmedia_Twitter", "tabpfn", 0.07),
+        ("Yolanda", "tabpfn", 0.05),
+        ("Airlines_DepDelay_10M", "tabpfn", 0.01),
+    )
+
+    for task_name, model_name, budget_ratio in direct_baseline_specs:
+        output_dir = BENCHMARK_DIR / "full_dataset_results" / f"{task_name}_{model_name}"
+        RMTRegressionExperimentOrchestrator(
+            RMTRegressionExperimentConfig(
+                regression_tasks=(task_name,),
+                strategies=(),
+                models=(model_name,),
+                ensemble_methods=(),
+                budget_ratios=(),
+                full_dataset_budget_ratio=budget_ratio,
+                max_train_rows=300_000,
+                budget_application=os.getenv("RMT_BUDGET_APPLICATION", DEFAULT_BUDGET_APPLICATION),
+                show_progress=True,
+                output_dir=str(output_dir),
+            )
+        ).run()

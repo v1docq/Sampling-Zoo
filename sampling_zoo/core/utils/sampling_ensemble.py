@@ -1,4 +1,5 @@
 # model_integration.py
+import copy
 import pickle
 import os
 from time import perf_counter
@@ -45,6 +46,8 @@ class SamplingEnsemble:
     Интеграция Sampling-Zoo с ML моделями для работы с большими датасетами
     через интеллектуальное семплирование и ансамблирование
     """
+
+    _PARTITION_CACHE: Dict[str, Dict[str, Any]] = {}
 
     def __init__(self,
                  problem: str,
@@ -108,6 +111,7 @@ class SamplingEnsemble:
         self.partition_size_diagnostics_contract_ = None
         self.classes_ = None
         self.class_coverage_repairs_ = {}
+        self.budget_policy_ = {'applied': False}
 
     def _log(self, message: str) -> None:
         progress_write(message, enabled=self.show_progress)
@@ -139,21 +143,41 @@ class SamplingEnsemble:
                 stage.update(1)
 
                 started = perf_counter()
-                self.partitions = self._fit_and_collect_partitions(self.partitioner, strategy_name, features, target)
-                timings['partitioner_fit_and_collect'] = perf_counter() - started
-                stage.update(1)
-
-                started = perf_counter()
-                self.partitions = self._apply_budget_policy_to_partitions(
-                    partitions=self.partitions,
-                    total_rows=len(features),
+                partition_features, partition_target = self._apply_budget_policy_before_partitioning(
+                    features=features,
+                    target=target,
                     random_state=random_state,
                 )
-                timings['budget_application'] = perf_counter() - started
+                timings['pre_partition_budget_application'] = perf_counter() - started
+
+                started = perf_counter()
+                cached_partitions = self._load_cached_base_partitions()
+                if cached_partitions is None:
+                    self.partitions = self._fit_and_collect_partitions(
+                        self.partitioner,
+                        strategy_name,
+                        partition_features,
+                        partition_target,
+                    )
+                    self._store_cached_base_partitions(self.partitions)
+                else:
+                    self.partitions = cached_partitions
                 stage.update(1)
+                timings['partitioner_fit_and_collect'] = perf_counter() - started
+
+                started = perf_counter()
+                if self._budget_application_stage() == 'after_partitioning':
+                    self.partitions = self._apply_budget_policy_to_partitions(
+                        partitions=self.partitions,
+                        total_rows=len(features),
+                        random_state=random_state,
+                    )
+                stage.update(1)
+                timings['budget_application'] = perf_counter() - started
 
             started = perf_counter()
-            self.partition_diagnostics_ = self._build_partition_target_diagnostics(self.partitions, target)
+            diagnostics_target = partition_target if self._budget_application_stage() == 'before_partitioning' else target
+            self.partition_diagnostics_ = self._build_partition_target_diagnostics(self.partitions, diagnostics_target)
             self.partition_size_diagnostics_contract_ = (
                 self._build_partition_size_diagnostics_contract(self.partitions)
             )
@@ -181,6 +205,8 @@ class SamplingEnsemble:
             'load_filename',
             'save_filename',
             'budget_ratio',
+            'budget_application',
+            '_partition_cache_key',
             'experiment_chunk_fraction',
             'experiment_scenario',
             'force_chunking',
@@ -398,20 +424,107 @@ class SamplingEnsemble:
             }
         return self._take_local_rows(partition_data, local_indices)
 
+    def _budget_application_stage(self) -> str:
+        raw_stage = str(self.partitioner_config.get('budget_application', 'after_partitioning')).strip().lower()
+        aliases = {
+            'after': 'after_partitioning',
+            'after_partitioning': 'after_partitioning',
+            'post': 'after_partitioning',
+            'post_partitioning': 'after_partitioning',
+            'before': 'before_partitioning',
+            'before_partitioning': 'before_partitioning',
+            'pre': 'before_partitioning',
+            'pre_partitioning': 'before_partitioning',
+        }
+        if raw_stage not in aliases:
+            raise ValueError("budget_application must be one of: before_partitioning, after_partitioning")
+        return aliases[raw_stage]
+
+    def _budget_ratio(self) -> Optional[float]:
+        budget_ratio = self.partitioner_config.get('budget_ratio')
+        if budget_ratio is None:
+            return None
+        budget_ratio = float(budget_ratio)
+        if not (0 < budget_ratio <= 1):
+            raise ValueError("budget_ratio must be in (0, 1]")
+        return budget_ratio
+
+    def _apply_budget_policy_before_partitioning(
+        self,
+        features: pd.DataFrame,
+        target: pd.Series,
+        random_state: int,
+    ) -> tuple[pd.DataFrame, pd.Series]:
+        if self._budget_application_stage() != 'before_partitioning':
+            return features, target
+
+        budget_ratio = self._budget_ratio()
+        if budget_ratio is None:
+            self.budget_policy_ = {
+                'applied': False,
+                'stage': 'before_partitioning',
+                'reason': 'missing_budget_ratio',
+            }
+            return features, target
+
+        total_rows = len(features)
+        budget_size = max(1, min(total_rows, int(round(total_rows * budget_ratio))))
+        if total_rows <= budget_size:
+            self.budget_policy_ = {
+                'applied': False,
+                'stage': 'before_partitioning',
+                'budget_ratio': budget_ratio,
+                'budget_size': budget_size,
+                'current_size': total_rows,
+            }
+            return features, target
+
+        rng = np.random.default_rng(random_state)
+        selected_indices = np.sort(rng.choice(np.arange(total_rows), size=budget_size, replace=False))
+        self.budget_policy_ = {
+            'applied': True,
+            'stage': 'before_partitioning',
+            'budget_ratio': budget_ratio,
+            'budget_size': budget_size,
+            'current_size': total_rows,
+            'selected_size': int(selected_indices.size),
+        }
+        return (
+            self._take_local_rows(features, selected_indices),
+            self._take_local_rows(target, selected_indices),
+        )
+
+    def _load_cached_base_partitions(self) -> Optional[Dict[str, Any]]:
+        cache_key = self.partitioner_config.get('_partition_cache_key')
+        if not cache_key:
+            return None
+        cached = self._PARTITION_CACHE.get(str(cache_key))
+        if cached is None:
+            return None
+        self.partitioner = cached['partitioner']
+        self.budget_policy_ = copy.deepcopy(cached.get('budget_policy', {'applied': False}))
+        return copy.deepcopy(cached['partitions'])
+
+    def _store_cached_base_partitions(self, partitions: Dict[str, Any]) -> None:
+        cache_key = self.partitioner_config.get('_partition_cache_key')
+        if not cache_key:
+            return
+        self._PARTITION_CACHE[str(cache_key)] = {
+            'partitioner': self.partitioner,
+            'partitions': copy.deepcopy(partitions),
+            'budget_policy': copy.deepcopy(getattr(self, 'budget_policy_', {'applied': False})),
+        }
+
     def _apply_budget_policy_to_partitions(
         self,
         partitions: Dict[str, Any],
         total_rows: int,
         random_state: int,
     ) -> Dict[str, Any]:
-        budget_ratio = self.partitioner_config.get('budget_ratio')
+        budget_ratio = self._budget_ratio()
         if budget_ratio is None:
-            self.budget_policy_ = {'applied': False}
+            self.budget_policy_ = {'applied': False, 'stage': 'after_partitioning'}
             return partitions
-
-        budget_ratio = float(budget_ratio)
-        if not (0 < budget_ratio <= 1):
-            raise ValueError("budget_ratio must be in (0, 1]")
 
         sampler_budget_plan = getattr(
             self.partitioner,
@@ -429,7 +542,7 @@ class SamplingEnsemble:
         sizes = {name: self._partition_size(chunk) for name, chunk in partitions.items()}
         sizes = {name: size for name, size in sizes.items() if size > 0}
         if not sizes:
-            self.budget_policy_ = {'applied': False, 'reason': 'empty_partitions'}
+            self.budget_policy_ = {'applied': False, 'stage': 'after_partitioning', 'reason': 'empty_partitions'}
             return partitions
 
         budget_size = max(1, min(total_rows, int(round(total_rows * budget_ratio))))
@@ -437,6 +550,7 @@ class SamplingEnsemble:
         if current_size <= budget_size:
             self.budget_policy_ = {
                 'applied': False,
+                'stage': 'after_partitioning',
                 'budget_ratio': budget_ratio,
                 'budget_size': budget_size,
                 'current_size': current_size,
@@ -473,6 +587,7 @@ class SamplingEnsemble:
 
         self.budget_policy_ = {
             'applied': True,
+            'stage': 'after_partitioning',
             'budget_ratio': budget_ratio,
             'budget_size': budget_size,
             'current_size': current_size,
@@ -1497,6 +1612,7 @@ class SamplingEnsemble:
         reduced_metrics = self._evaluate_current_ensemble(X_val, y_val)
         self._log(f"Ensemble metrics after pruning: {reduced_metrics}")
         self._log(f"Best validation metric after pruning ({validation_metric}): {best_score}")
+        self._log_active_chunk_summary("Active chunks after pruning")
         self.validation_diagnostics_ = self._build_validation_diagnostics(
             X_val=X_val,
             y_val=y_val,
@@ -1552,6 +1668,7 @@ class SamplingEnsemble:
         best_score = routed_metrics.get(validation_metric)
         self._log(f"Routed MoE metrics after local calibration: {routed_metrics}")
         self._log(f"Routed MoE validation metric ({validation_metric}): {best_score}")
+        self._log_active_chunk_summary("Active chunks after routed calibration")
         self.validation_diagnostics_ = self._build_validation_diagnostics(
             X_val=X_val,
             y_val=y_val,
@@ -1676,6 +1793,27 @@ class SamplingEnsemble:
         self.models = [self.models[i] for i in selected]
 
         return selected, best_score
+
+    def _log_active_chunk_summary(self, title: str) -> None:
+        if not self.models:
+            self._log(f"{title}: no active chunks")
+            return
+        chunk_sizes = [
+            (str(model_info.get('name')), int(model_info.get('data_size', 0) or 0))
+            for model_info in self.models
+        ]
+        sizes = [size for _, size in chunk_sizes]
+        self._log(
+            f"{title}: count={len(chunk_sizes)}, "
+            f"total_rows={sum(sizes)}, "
+            f"min={min(sizes)}, "
+            f"max={max(sizes)}, "
+            f"mean={float(np.mean(sizes)):.1f}"
+        )
+        self._log(
+            "Active chunk train sizes: "
+            + ", ".join(f"{name}={size}" for name, size in chunk_sizes)
+        )
 
     def _validation_weights(self, active_models: List[Dict[str, Any]]) -> np.ndarray:
         """

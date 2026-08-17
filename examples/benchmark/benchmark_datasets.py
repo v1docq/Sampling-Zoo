@@ -1,6 +1,8 @@
 from __future__ import annotations
+import csv
 from dataclasses import dataclass
 from inspect import signature
+from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 import numpy as np
 import pandas as pd
@@ -14,6 +16,11 @@ from sampling_zoo.core.repository.constant_repo import AmlbExperimentDataset
 from sampling_zoo.core.utils.amlb_dataloader import AMLBDatasetLoader
 from sampling_zoo.core.utils.progress import progress_bar, progress_iter
 import openml
+
+
+def _log_openml_status(message: str) -> None:
+    print(f"[OpenML] {message}", flush=True)
+
 
 @dataclass(frozen=True)
 class DatasetMetadata:
@@ -410,10 +417,7 @@ class OpenMLRawDatasetBundle(RawDatasetBundle):
                 raise RuntimeError(f"OpenML task {self.task_id} has no valid target values after preprocessing.")
             stage.update(1)
 
-            try:
-                train_idx, test_idx = task.get_train_test_split_indices(repeat=0, fold=0, sample=0)
-            except TypeError:
-                train_idx, test_idx = task.get_train_test_split_indices()
+            train_idx, test_idx = _get_openml_train_test_split_indices(task, self.task_id)
             train_idx = np.asarray(train_idx, dtype=int)
             test_idx = np.asarray(test_idx, dtype=int)
 
@@ -544,23 +548,132 @@ def _resolve_task_name(task_id: int, task_name: Optional[str]) -> str:
     return str(task_details.iloc[0].get("name", f"task_{task_id}"))
 
 
+def _get_openml_train_test_split_indices(task: Any, task_id: int) -> tuple[np.ndarray, np.ndarray]:
+    cached = _load_cached_openml_split_npz(task_id=task_id)
+    if cached is not None:
+        return cached
+
+    try:
+        return task.get_train_test_split_indices(repeat=0, fold=0, sample=0)
+    except TypeError:
+        return task.get_train_test_split_indices()
+    except Exception as exc:
+        parsed = _parse_cached_openml_split_indices(task_id=task_id)
+        if parsed is None:
+            raise
+        train_idx, test_idx = parsed
+        _log_openml_status(
+            f"OpenML split parser failed for task {task_id}: {type(exc).__name__}: {exc}. "
+            f"Using cached datasplits.arff fallback parser "
+            f"({len(train_idx)} train / {len(test_idx)} test rows)."
+        )
+        return train_idx, test_idx
+
+
+def _openml_task_cache_dir(task_id: int) -> Path:
+    cache_dir = Path(getattr(openml.config, "cache_directory", Path.home() / ".cache" / "openml"))
+    return cache_dir / "org" / "openml" / "www" / "tasks" / str(task_id)
+
+
+def _load_cached_openml_split_npz(task_id: int) -> Optional[tuple[np.ndarray, np.ndarray]]:
+    split_path = _openml_task_cache_dir(task_id) / "cached_split_indices_r0_f0_s0.npz"
+    if not split_path.exists():
+        return None
+    try:
+        data = np.load(split_path)
+        train_idx = np.asarray(data["train_idx"], dtype=int)
+        test_idx = np.asarray(data["test_idx"], dtype=int)
+    except Exception:
+        return None
+    if train_idx.size == 0 or test_idx.size == 0:
+        return None
+    return train_idx, test_idx
+
+
+def _parse_cached_openml_split_indices(task_id: int) -> Optional[tuple[np.ndarray, np.ndarray]]:
+    task_cache_dir = _openml_task_cache_dir(task_id)
+    split_path = task_cache_dir / "datasplits.arff"
+    if not split_path.exists():
+        return None
+
+    attributes: list[str] = []
+    rows: list[list[str]] = []
+    in_data = False
+    with split_path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or line.startswith("%"):
+                continue
+            lower = line.lower()
+            if lower.startswith("@attribute"):
+                parts = line.split(maxsplit=2)
+                if len(parts) >= 2:
+                    attributes.append(parts[1].strip("'\"").lower())
+                continue
+            if lower.startswith("@data"):
+                in_data = True
+                continue
+            if in_data:
+                rows.extend(csv.reader([line]))
+
+    if not attributes or not rows:
+        return None
+
+    attr_to_index = {name: idx for idx, name in enumerate(attributes)}
+    type_idx = attr_to_index.get("type")
+    rowid_idx = attr_to_index.get("rowid")
+    repeat_idx = attr_to_index.get("repeat")
+    fold_idx = attr_to_index.get("fold")
+    sample_idx = attr_to_index.get("sample")
+    if type_idx is None or rowid_idx is None:
+        return None
+
+    train: list[int] = []
+    test: list[int] = []
+    for row in rows:
+        if len(row) <= max(type_idx, rowid_idx):
+            continue
+        repeat = int(float(row[repeat_idx])) if repeat_idx is not None and repeat_idx < len(row) else 0
+        fold = int(float(row[fold_idx])) if fold_idx is not None and fold_idx < len(row) else 0
+        sample = int(float(row[sample_idx])) if sample_idx is not None and sample_idx < len(row) else 0
+        if repeat != 0 or fold != 0 or sample != 0:
+            continue
+        split_type = row[type_idx].strip().strip("'\"").upper()
+        row_id = int(float(row[rowid_idx]))
+        if split_type == "TRAIN":
+            train.append(row_id)
+        elif split_type == "TEST":
+            test.append(row_id)
+
+    if not train or not test:
+        return None
+    train_idx = np.asarray(train, dtype=int)
+    test_idx = np.asarray(test, dtype=int)
+    try:
+        np.savez_compressed(
+            task_cache_dir / "cached_split_indices_r0_f0_s0.npz",
+            train_idx=train_idx,
+            test_idx=test_idx,
+        )
+    except Exception:
+        pass
+    return train_idx, test_idx
+
+
 def load_suite_dataset(task_id: int, suite_id: Optional[int] = None, task_name: Optional[str] = None) -> OpenMLRawDatasetBundle:
     if openml is None:
         raise ImportError("openml is not available. Install openml to load suite datasets.")
 
     task = openml.tasks.get_task(task_id)
-    resolved_task_name = _resolve_task_name(task_id=task_id, task_name=task_name)
     problem_type = _to_problem_type(task.task_type)
 
     dataset_obj = openml.datasets.get_dataset(task.dataset_id, download_data=False)
+    resolved_task_name = task_name or str(getattr(dataset_obj, "name", "") or _resolve_task_name(task_id=task_id, task_name=None))
     qualities = dataset_obj.qualities or {}
     n_objects = int(qualities.get("NumberOfInstances") or 0)
     n_features = int(qualities.get("NumberOfFeatures") or 0)
 
-    try:
-        train_idx, _ = task.get_train_test_split_indices(repeat=0, fold=0, sample=0)
-    except TypeError:
-        train_idx, _ = task.get_train_test_split_indices()
+    train_idx, _ = _get_openml_train_test_split_indices(task, task_id)
     n_train_candidates = int(len(train_idx))
 
     dataset_label = f"{resolved_task_name}__task_{task_id}"
@@ -603,26 +716,65 @@ def _load_suite_group(
     if not requested_task_names:
         return []
 
+    _log_openml_status(
+        f"Loading {expected_problem_type} suite {suite_id}; "
+        f"requested tasks: {list(requested_task_names)}"
+    )
     suite = openml.study.get_suite(suite_id)
     task_ids = set(suite.tasks)
     if not task_ids:
+        _log_openml_status(f"Suite {suite_id} has no task ids.")
         return []
+    _log_openml_status(f"Suite {suite_id} contains {len(task_ids)} task ids.")
 
-    tasks_df = openml.tasks.list_tasks(output_format="dataframe")
+    tasks_df = _list_suite_tasks_dataframe(task_ids)
     if tasks_df.empty:
-        return []
+        _log_openml_status(
+            f"Could not resolve suite {suite_id} with batched list_tasks; "
+            "falling back to per-task metadata."
+        )
+        return _load_suite_group_by_task_metadata(
+            suite_id=suite_id,
+            task_ids=task_ids,
+            requested_task_names=requested_task_names,
+            expected_problem_type=expected_problem_type,
+            show_progress=show_progress,
+        )
+
+    if "tid" not in tasks_df.columns:
+        tasks_df = tasks_df.reset_index().rename(columns={"index": "tid"})
+    _log_openml_status(
+        f"Resolved {len(tasks_df)} task rows for suite {suite_id} using batched list_tasks."
+    )
 
     suite_tasks_df = tasks_df[tasks_df["tid"].isin(task_ids)].reset_index(drop=True)
     if suite_tasks_df.empty:
-        return []
+        _log_openml_status(
+            f"Batched list_tasks returned no matching rows for suite {suite_id}; "
+            "falling back to per-task metadata."
+        )
+        return _load_suite_group_by_task_metadata(
+            suite_id=suite_id,
+            task_ids=task_ids,
+            requested_task_names=requested_task_names,
+            expected_problem_type=expected_problem_type,
+            show_progress=show_progress,
+        )
 
     available_names = set(suite_tasks_df["name"].astype(str).tolist())
     requested_names = list(requested_task_names)
     missing = [name for name in requested_names if name not in available_names]
     if missing:
-        raise ValueError(
-            f"Unknown OpenML task names for suite {suite_id}: {missing}. "
-            f"Available: {sorted(available_names)}"
+        _log_openml_status(
+            f"Batched list_tasks missed requested tasks for suite {suite_id}: {missing}; "
+            "falling back to per-task metadata."
+        )
+        return _load_suite_group_by_task_metadata(
+            suite_id=suite_id,
+            task_ids=task_ids,
+            requested_task_names=requested_task_names,
+            expected_problem_type=expected_problem_type,
+            show_progress=show_progress,
         )
 
     selected_rows = suite_tasks_df[suite_tasks_df["name"].isin(requested_names)]
@@ -646,10 +798,75 @@ def _load_suite_group(
         task_name = str(row["name"])
         bundle = load_suite_dataset(task_id=task_id, suite_id=suite_id, task_name=task_name)
         if bundle.problem_type != expected_problem_type:
+            _log_openml_status(
+                f"Skipping task {task_id} ({task_name}): expected {expected_problem_type}, "
+                f"got {bundle.problem_type}."
+            )
             continue
+        _log_openml_status(
+            f"Resolved task {task_id} ({task_name}) from suite {suite_id}: "
+            f"{bundle.metadata.n_objects} x {bundle.metadata.n_features}."
+        )
         bundles.append(bundle)
 
     return bundles
+
+
+def _list_suite_tasks_dataframe(task_ids: set[int]) -> pd.DataFrame:
+    try:
+        _log_openml_status(f"Calling list_tasks for {len(task_ids)} suite task ids.")
+        return openml.tasks.list_tasks(task_id=sorted(task_ids), output_format="dataframe")
+    except Exception as exc:
+        _log_openml_status(f"list_tasks by task_id failed: {type(exc).__name__}: {exc}")
+        return pd.DataFrame()
+
+
+def _load_suite_group_by_task_metadata(
+    suite_id: int,
+    task_ids: set[int],
+    requested_task_names: Sequence[str],
+    expected_problem_type: str,
+    show_progress: bool = True,
+) -> list[OpenMLRawDatasetBundle]:
+    _log_openml_status(
+        f"Fallback resolver for suite {suite_id}: scanning {len(task_ids)} task ids "
+        f"to find {list(requested_task_names)}."
+    )
+    requested_set = set(requested_task_names)
+    bundles_by_name: dict[str, OpenMLRawDatasetBundle] = {}
+    task_iter = progress_iter(
+        sorted(task_ids),
+        enabled=show_progress,
+        total=len(task_ids),
+        desc=f"Resolve OpenML {expected_problem_type} tasks",
+    )
+    for task_id in task_iter:
+        try:
+            bundle = load_suite_dataset(task_id=int(task_id), suite_id=suite_id)
+        except Exception as exc:
+            _log_openml_status(
+                f"Fallback failed to load task {task_id}: {type(exc).__name__}: {exc}"
+            )
+            continue
+        if bundle.problem_type != expected_problem_type:
+            continue
+        if bundle.task_name in requested_set:
+            _log_openml_status(
+                f"Fallback matched task {task_id} ({bundle.task_name}) from suite {suite_id}: "
+                f"{bundle.metadata.n_objects} x {bundle.metadata.n_features}."
+            )
+            bundles_by_name[bundle.task_name] = bundle
+        if len(bundles_by_name) == len(requested_set):
+            break
+
+    missing = [name for name in requested_task_names if name not in bundles_by_name]
+    if missing:
+        raise ValueError(
+            f"Unknown OpenML task names for suite {suite_id}: {missing}. "
+            "OpenML task list endpoint was unavailable, and the fallback resolver "
+            "could not match these names by dataset metadata."
+        )
+    return [bundles_by_name[name] for name in requested_task_names]
 
 
 def load_suite_raw_datasets(

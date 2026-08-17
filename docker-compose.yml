@@ -1,0 +1,19 @@
+services:
+  experiment:
+    image: nvidia/cuda:12.4.0-devel-ubuntu22.04
+    container_name: "artem-sampling-tests"
+
+    gpus:
+      - driver: nvidia
+        device_ids: ["3"]
+        capabilities: [gpu]
+
+    environment:
+      - PYTHONUNBUFFERED=1
+
+    working_dir: /app
+
+    volumes:
+      - .:/app
+
+    tty: true

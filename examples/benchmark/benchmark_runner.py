@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
@@ -45,7 +46,7 @@ from sampling_zoo.core.experiment.resume import (
 )
 from sampling_zoo.core.utils.sampling_ensemble import SamplingEnsemble
 from sampling_zoo.core.utils.amlb_dataloader import AMLBDatasetLoader
-from sampling_zoo.core.utils.progress import progress_bar
+from sampling_zoo.core.utils.progress import progress_bar, progress_iter
 from sampling_zoo.core.utils.utils import safe_index
 from benchmark_datasets import DatasetBundle, OpenMLRawDatasetBundle, RawDatasetBundle
 from benchmark_logging import BenchmarkLogger, build_sample_stats
@@ -746,9 +747,15 @@ class EnsembleFoldBenchmarkExecutor:
         X_test_df: pd.DataFrame,
         fold_stage: Any,
     ) -> dict[str, Any]:
+        X_fit_df, y_fit = self._apply_direct_model_budget(
+            X_train_df=X_train_df,
+            y_train=fold.y_train,
+            partitioner_config=partitioner_config,
+            random_state=self.seed + fold.fold_idx,
+        )
         fit_started = perf_counter()
         model = model_factory()
-        model.fit(X_train_df, fold.y_train)
+        model.fit(X_fit_df, y_fit)
         fit_time = perf_counter() - fit_started
         fold_stage.update(1)
 
@@ -758,7 +765,7 @@ class EnsembleFoldBenchmarkExecutor:
             if dataset.problem_type == "classification"
             else None
         )
-        predictions, y_proba = self._predict_direct_model(
+        predictions, y_proba = self._predict_direct_model_batched(
             model,
             X_test_df,
             dataset.problem_type,
@@ -779,13 +786,13 @@ class EnsembleFoldBenchmarkExecutor:
             ),
         )
         sample_stats = self._build_train_sample_stats(
-            y_train=fold.y_train,
+            y_train=y_fit,
             problem_type=dataset.problem_type,
             total_train_size=len(fold.y_train),
         )
         sample_stats["chunk_count"] = 1
-        sample_stats["chunk_size_mean"] = float(len(fold.y_train))
-        sample_stats["model_fit_rows_total"] = int(len(fold.y_train))
+        sample_stats["chunk_size_mean"] = float(len(y_fit))
+        sample_stats["model_fit_rows_total"] = int(len(y_fit))
         sample_stats["active_model_count"] = 1
         model_complexity_diagnostics = summarize_ensemble_complexity(
             ({"name": "full_dataset", "model": model},),
@@ -806,6 +813,73 @@ class EnsembleFoldBenchmarkExecutor:
         )
         fold_stage.update(1)
         return payload
+
+    @staticmethod
+    def _apply_direct_model_budget(
+        X_train_df: pd.DataFrame,
+        y_train: Any,
+        partitioner_config: Mapping[str, Any],
+        random_state: int,
+    ) -> tuple[pd.DataFrame, Any]:
+        budget_ratio = partitioner_config.get("budget_ratio")
+        if budget_ratio is None:
+            return X_train_df, y_train
+        budget_ratio = float(budget_ratio)
+        if budget_ratio >= 1.0:
+            return X_train_df, y_train
+        if budget_ratio <= 0.0:
+            raise ValueError("budget_ratio must be in (0, 1]")
+
+        train_size = len(y_train)
+        budget_size = max(1, min(train_size, int(round(train_size * budget_ratio))))
+        rng = np.random.default_rng(random_state)
+        indices = np.sort(rng.choice(np.arange(train_size), size=budget_size, replace=False))
+        X_budget = X_train_df.iloc[indices].reset_index(drop=True)
+        if isinstance(y_train, pd.Series):
+            y_budget = y_train.iloc[indices].reset_index(drop=True)
+        else:
+            y_budget = np.asarray(y_train)[indices]
+        return X_budget, y_budget
+
+    def _predict_direct_model_batched(
+        self,
+        model: Any,
+        X_test_df: pd.DataFrame,
+        problem_type: str,
+        batch_size: int = 1000,
+        *,
+        classes: Optional[np.ndarray] = None,
+    ) -> tuple[Any, Any]:
+        n_samples = len(X_test_df)
+        if n_samples == 0:
+            return np.asarray([]), None
+
+        predictions: list[Any] = []
+        probabilities: list[Any] = []
+        total_batches = (n_samples + batch_size - 1) // batch_size
+        batch_iter = progress_iter(
+            range(total_batches),
+            enabled=self.show_progress,
+            total=total_batches,
+            desc="Direct inference batches",
+        )
+        for batch_idx in batch_iter:
+            start = batch_idx * batch_size
+            end = min(start + batch_size, n_samples)
+            batch = X_test_df.iloc[start:end]
+            batch_predictions, batch_proba = self._predict_direct_model(
+                model,
+                batch,
+                problem_type,
+                classes=classes,
+            )
+            predictions.append(np.asarray(batch_predictions))
+            if batch_proba is not None:
+                probabilities.append(np.asarray(batch_proba))
+
+        y_pred = np.concatenate(predictions) if predictions else np.asarray([])
+        y_proba = np.concatenate(probabilities) if probabilities else None
+        return y_pred, y_proba
 
     @staticmethod
     def _predict_direct_model(
@@ -874,6 +948,11 @@ class EnsembleFoldBenchmarkExecutor:
             class_samples = self._class_representatives(X_train_df, fold.y_train, seed=self.seed + fold.fold_idx)
 
         tuned_partitioner_config = self._tune_partitioner_config(partitioner_config, plan)
+        tuned_partitioner_config["_partition_cache_key"] = self._build_partition_cache_key(
+            dataset=dataset,
+            fold=fold,
+            partitioner_config=tuned_partitioner_config,
+        )
         ensemble = SamplingEnsemble(
             problem=dataset.problem_type,
             partitioner_config=tuned_partitioner_config,
@@ -964,6 +1043,59 @@ class EnsembleFoldBenchmarkExecutor:
         tuned_partitioner_config["n_partitions"] = plan.effective_partitions
         tuned_partitioner_config["chunks_percent"] = plan.chunks_percent
         return tuned_partitioner_config
+
+    @staticmethod
+    def _build_partition_cache_key(
+        dataset: RawDatasetBundle,
+        fold: FoldSplit,
+        partitioner_config: Mapping[str, Any],
+    ) -> str:
+        budget_application = str(partitioner_config.get("budget_application", "after_partitioning")).strip().lower()
+        cache_config = {
+            key: value
+            for key, value in partitioner_config.items()
+            if key
+            not in {
+                "budget_ratio",
+                "ensemble_method",
+                "router",
+                "gating_hidden_dim",
+                "gating_epochs",
+                "gating_lr",
+                "gating_kl_weight",
+                "gating_balance_weight",
+                "gating_weight_decay",
+                "gating_batch_size",
+                "gating_device",
+                "routing_refinement",
+                "em_max_iterations",
+                "em_min_improvement",
+                "em_assignment_policy",
+                "em_min_partition_size",
+                "em_refit_router",
+                "em_keep_best",
+                "_partition_cache_key",
+            }
+        }
+        strategy_name = str(partitioner_config.get("strategy", "")).strip().lower()
+        if (
+            budget_application in {"before", "before_partitioning", "pre", "pre_partitioning"}
+            or strategy_name == "rmt_contraction"
+        ):
+            cache_config["budget_ratio"] = partitioner_config.get("budget_ratio")
+        return json.dumps(
+            {
+                "dataset": dataset.name,
+                "problem_type": dataset.problem_type,
+                "source_path": dataset.source_path,
+                "task_id": getattr(dataset, "task_id", None),
+                "split_label": fold.split_label,
+                "n_train": len(fold.y_train),
+                "config": cache_config,
+            },
+            sort_keys=True,
+            default=str,
+        )
 
     @staticmethod
     def _class_representatives(
@@ -1146,7 +1278,7 @@ class EnsembleFoldBenchmarkExecutor:
             dataset_name=dataset.name,
             strategy_name=f"{strategy_name}__{model_name}__{fold.split_label}",
             strategy_params={
-                **dict(tuned_partitioner_config),
+                **self._public_strategy_params(tuned_partitioner_config),
                 "model": model_name,
                 "cv_fold": fold_value,
                 "split_label": fold.split_label,
@@ -1199,6 +1331,14 @@ class EnsembleFoldBenchmarkExecutor:
                 ),
             },
         )
+
+    @staticmethod
+    def _public_strategy_params(strategy_params: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            key: value
+            for key, value in strategy_params.items()
+            if not str(key).startswith("_")
+        }
 
     def _log_failed_fold(
         self,
