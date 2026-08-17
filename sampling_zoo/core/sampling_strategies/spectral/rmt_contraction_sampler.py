@@ -2499,3 +2499,160 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             "n_partitions": int(len(self.partitions)),
             "chunk_sizes": {name: int(len(idx)) for name, idx in self.partitions.items()},
         }
+
+
+class RawFeatureClusterSampler(RMTContractionTensorSampler):
+    """
+    Ablation sampler for testing whether random contractions/SVD are needed.
+
+    The sampler keeps the RMT chunking stack after representation: tabular
+    preprocessing, balanced cluster selection, row selection, routing geometry,
+    routing probabilities, and diagnostics. The representation itself is the
+    standardized encoded feature matrix.
+    """
+
+    def fit(
+        self,
+        data: ArrayLike,
+        target: Optional[Union[np.ndarray, pd.Series]] = None,
+        **kwargs: Any,
+    ) -> "RawFeatureClusterSampler":
+        fit_started = perf_counter()
+        stage_seconds: Dict[str, float] = {}
+        with progress_bar(
+            enabled=self.show_progress,
+            desc="Raw feature cluster sampler fit",
+            total=5,
+        ) as stage:
+            started = perf_counter()
+            self._start_fit()
+            stage_seconds["initialize"] = perf_counter() - started
+            started = perf_counter()
+            X_num = self._fit_transform_features(data)
+            stage_seconds["preprocessing"] = perf_counter() - started
+            stage.update(1)
+
+            started = perf_counter()
+            self.sample_embedding_ = np.asarray(X_num, dtype=np.float64)
+            scores = self._raw_feature_scores(self.sample_embedding_)
+            self.leverage_scores_ = scores
+            rank_info = self._raw_feature_rank_info(self.sample_embedding_)
+            self.rank_selection_info_ = rank_info
+            stage_seconds["raw_feature_embedding"] = perf_counter() - started
+            stage.update(1)
+
+            started = perf_counter()
+            self._fit_clusters_and_partitions(X_num, scores, target)
+            stage_seconds["partition_selection_and_sampling"] = (
+                perf_counter() - started
+            )
+            stage.update(1)
+
+            started = perf_counter()
+            self._fit_partition_geometry()
+            stage_seconds["partition_geometry"] = perf_counter() - started
+            stage.update(1)
+
+            started = perf_counter()
+            self._build_diagnostics(self.sample_embedding_, rank_info)
+            self._mark_raw_feature_diagnostics()
+            stage_seconds["diagnostics"] = perf_counter() - started
+            stage.update(1)
+
+        self.fit_runtime_seconds_ = perf_counter() - fit_started
+        self.fit_stage_seconds_ = stage_seconds
+        self.diagnostics_["fit_runtime_seconds"] = self.fit_runtime_seconds_
+        self.diagnostics_["fit_stage_seconds"] = dict(stage_seconds)
+        return self
+
+    def predict_partition_proba(self, X: ArrayLike) -> np.ndarray:
+        if self.clusterer_ is None or self.sample_embedding_ is None:
+            raise RuntimeError("Sampler not fitted. Call fit() first.")
+        if not self.partition_names_:
+            raise RuntimeError("No partitions available. Call fit() first.")
+
+        embedding = self.transform_embedding(X)
+        if self.partition_geometry_ is not None:
+            _, weights = route_partition_geometry(
+                backend=self._get_rmt_backend(),
+                embedding=embedding,
+                geometry=self.partition_geometry_,
+                temperature=self.routing_geometry_spec.temperature,
+            )
+            return weights.weights
+
+        if self.cluster_centers_ is None:
+            raise RuntimeError("Cluster centers are not available.")
+        active_cluster_ids = np.asarray(
+            [
+                self.partition_to_cluster_[name]
+                for name in self.partition_names_
+            ],
+            dtype=int,
+        )
+        active_centroids = self.cluster_centers_[active_cluster_ids]
+        proba = self._routing_probability(embedding, active_centroids)
+
+        if self.routing_shrinkage > 0:
+            m = proba.shape[1]
+            lam = min(max(self.routing_shrinkage, 0.0), 1.0)
+            proba = (1.0 - lam) * proba + lam / m
+        return proba
+
+    def transform_embedding(self, X: ArrayLike) -> np.ndarray:
+        """Return the standardized encoded feature representation."""
+        return np.asarray(self._transform_features(X), dtype=np.float64)
+
+    @staticmethod
+    def _raw_feature_scores(embedding: np.ndarray) -> np.ndarray:
+        scores = np.sum(np.asarray(embedding, dtype=np.float64) ** 2, axis=1)
+        if scores.size == 0:
+            return scores
+        total = float(np.sum(scores))
+        if not np.isfinite(total) or total <= 0:
+            return np.full(scores.shape[0], 1.0 / scores.shape[0], dtype=np.float64)
+        return scores / total
+
+    def _raw_feature_rank_info(self, embedding: np.ndarray) -> RankSelectionInfo:
+        feature_dim = int(embedding.shape[1]) if embedding.ndim == 2 else 0
+        return RankSelectionInfo(
+            initial_rank=feature_dim,
+            selected_rank=feature_dim,
+            rank_selection_method="none",
+            explained_variance_threshold=0.0,
+            explained_variance_at_selected_rank=1.0,
+        )
+
+    def _mark_raw_feature_diagnostics(self) -> None:
+        self.diagnostics_.update(
+            {
+                "representation": "raw_encoded_features",
+                "uses_random_contractions": False,
+                "uses_svd_embedding": False,
+                "view_strategy": "none",
+                "embedding_mode": "raw_features",
+                "n_views_requested": 0,
+                "n_views": 0,
+                "n_views_policy": "none",
+                "target_feature_coverage": None,
+                "estimated_feature_coverage": None,
+                "max_views_by_unfolding": None,
+                "spectrum_stability_tolerance": None,
+                "spectrum_stability_change": None,
+                "spectrum_stability_candidates": [],
+                "initial_rank": self.rank_selection_info_.initial_rank,
+                "selected_rank": self.rank_selection_info_.selected_rank,
+                "rank_by_explained_variance": self.rank_selection_info_.selected_rank,
+                "rank_by_null_edge": None,
+                "rank_by_stability": None,
+                "rank_by_subspace_stability": None,
+                "selected_rank_reason": "raw_features",
+                "rank_selection_method": "none",
+                "explained_variance_threshold": None,
+                "explained_variance_at_selected_rank": None,
+                "initial_singular_values": [],
+                "singular_values": [],
+                "null_model_status": "disabled",
+                "subspace_stability_status": "disabled",
+            }
+        )

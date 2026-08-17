@@ -220,7 +220,7 @@ def make_chunking_strategy_configs(
     extra_strategy_params = extra_strategy_params or {}
     for strategy_name in strategy_names:
         normalized_name = strategy_name.strip().lower()
-        if normalized_name not in {"difficulty", "random", "feature_clustering", "rmt_contraction"}:
+        if normalized_name not in {"difficulty", "random", "feature_clustering", "rmt_contraction", "raw_feature_clustering"}:
             raise ValueError(f"Unsupported chunking strategy: {strategy_name}")
 
         strategy_config: Dict[str, Any] = {
@@ -241,7 +241,7 @@ def make_chunking_strategy_configs(
             strategy_config["chunks_percent"] = 100
         elif normalized_name == "feature_clustering":
             strategy_config["method"] = "kmeans"
-        elif normalized_name == "rmt_contraction":
+        elif normalized_name in {"rmt_contraction", "raw_feature_clustering"}:
             strategy_config.update({
                 "n_views": "auto",
                 "n_views_policy": "auto",

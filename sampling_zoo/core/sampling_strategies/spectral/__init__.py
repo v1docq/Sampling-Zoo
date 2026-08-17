@@ -55,7 +55,7 @@ from .null_diagnostics import (
     SpectralNullDiagnosticConfig,
     SpectralNullDiagnosticResult,
 )
-from .rmt_contraction_sampler import RMTContractionTensorSampler
+from .rmt_contraction_sampler import RMTContractionTensorSampler, RawFeatureClusterSampler
 from .routing_contracts import (
     PartitionGeometryContract,
     PartitionGeometrySpec,
@@ -108,6 +108,7 @@ __all__ = [
     "PartitionRepresentation",
     "NullDiagnosticStatus",
     "NullModelPolicy",
+    "RawFeatureClusterSampler",
     "RMTContractionTensorSampler",
     "RowSpectralParticipationContract",
     "RoutingDistanceContract",

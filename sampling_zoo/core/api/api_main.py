@@ -14,7 +14,10 @@ from sampling_zoo.core.sampling_strategies.stratified_sampler import (
 from sampling_zoo.core.sampling_strategies.balance_sampler import StratifiedBalancedSplitSampler
 from sampling_zoo.core.sampling_strategies.spectral.spectral_leverage import SpectralLeverageSampler
 from sampling_zoo.core.sampling_strategies.spectral.tensor_energy import TensorEnergySampler
-from sampling_zoo.core.sampling_strategies.spectral.rmt_contraction_sampler import RMTContractionTensorSampler
+from sampling_zoo.core.sampling_strategies.spectral.rmt_contraction_sampler import (
+    RMTContractionTensorSampler,
+    RawFeatureClusterSampler,
+)
 from sampling_zoo.core.sampling_strategies.delaunay_sempler import DelaunaySampler
 from sampling_zoo.core.sampling_strategies.hdbscan_sampler import HDBScanSampler
 from sampling_zoo.core.sampling_strategies.voronoi_sampler import VoronoiSampler
@@ -55,6 +58,7 @@ class SamplingStrategyFactory:
             'hdbscan': HDBScanSampler,
             'voronoi': VoronoiSampler,
             'rmt_contraction': RMTContractionTensorSampler,
+            'raw_feature_clustering': RawFeatureClusterSampler,
         }
 
         # SUBSET SAMPLERS

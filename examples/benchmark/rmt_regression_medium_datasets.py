@@ -203,6 +203,7 @@ def make_rmt_strategy_grid(
 ) -> list[RMTStrategyGridPoint]:
     view_strategies = _normalize_view_strategies(view_strategies)
     router_modes = _normalize_router_modes(router_modes)
+    routed_strategy_names = {"rmt_contraction", "raw_feature_clustering"}
     grid: list[RMTStrategyGridPoint] = []
     for strategy in strategies:
         strategy_view_strategies: Sequence[str | None]
@@ -213,7 +214,7 @@ def make_rmt_strategy_grid(
         for view_strategy in strategy_view_strategies:
             for ensemble_method in ensemble_methods:
                 strategy_router_modes: Sequence[str | None]
-                if strategy == "rmt_contraction" and ensemble_method == "routed_weighted":
+                if strategy in routed_strategy_names and ensemble_method == "routed_weighted":
                     strategy_router_modes = tuple(router_modes)
                 else:
                     strategy_router_modes = (None,)
