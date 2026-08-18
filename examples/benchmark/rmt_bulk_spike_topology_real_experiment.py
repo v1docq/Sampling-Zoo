@@ -74,6 +74,73 @@ REAL_TOPOLOGY_ARMS: tuple[str, ...] = (
     "B3_validation_selected",
 )
 
+STRICT_RESEARCH_GATE_PROFILE = "strict_research"
+PRACTICAL_EXPLORATION_GATE_PROFILE = "practical_exploration"
+
+
+@dataclass(frozen=True)
+class BulkSpikeGateProfile:
+    """Predeclared practical tolerances for the aggregate B3 gate."""
+
+    name: str
+    primary_harm_margin: float
+    tail_harm_margin: float
+    brier_harm_margin: float
+    ece_harm_margin: float
+    f1_macro_harm_margin: float
+    worst_class_recall_harm_margin: float
+
+    def classification_harm_margins(self) -> dict[str, float]:
+        return {
+            "brier_score_gain_vs_b0": self.brier_harm_margin,
+            "expected_calibration_error_gain_vs_b0": self.ece_harm_margin,
+            "f1_macro_gain_vs_b0": self.f1_macro_harm_margin,
+            "worst_class_recall_gain_vs_b0": self.worst_class_recall_harm_margin,
+        }
+
+    def to_dict(self) -> dict[str, float | str]:
+        return {
+            "name": self.name,
+            "primary_harm_margin": self.primary_harm_margin,
+            "tail_harm_margin": self.tail_harm_margin,
+            "brier_harm_margin": self.brier_harm_margin,
+            "ece_harm_margin": self.ece_harm_margin,
+            "f1_macro_harm_margin": self.f1_macro_harm_margin,
+            "worst_class_recall_harm_margin": self.worst_class_recall_harm_margin,
+        }
+
+
+BULK_SPIKE_GATE_PROFILES: dict[str, BulkSpikeGateProfile] = {
+    STRICT_RESEARCH_GATE_PROFILE: BulkSpikeGateProfile(
+        name=STRICT_RESEARCH_GATE_PROFILE,
+        primary_harm_margin=0.005,
+        tail_harm_margin=0.01,
+        brier_harm_margin=0.01,
+        ece_harm_margin=0.01,
+        f1_macro_harm_margin=0.01,
+        worst_class_recall_harm_margin=0.01,
+    ),
+    PRACTICAL_EXPLORATION_GATE_PROFILE: BulkSpikeGateProfile(
+        name=PRACTICAL_EXPLORATION_GATE_PROFILE,
+        primary_harm_margin=0.01,
+        tail_harm_margin=0.015,
+        brier_harm_margin=0.01,
+        ece_harm_margin=0.02,
+        f1_macro_harm_margin=0.01,
+        worst_class_recall_harm_margin=0.01,
+    ),
+}
+
+
+def get_bulk_spike_gate_profile(name: str) -> BulkSpikeGateProfile:
+    try:
+        return BULK_SPIKE_GATE_PROFILES[str(name)]
+    except KeyError as exc:
+        supported = ", ".join(sorted(BULK_SPIKE_GATE_PROFILES))
+        raise ValueError(
+            f"Unknown bulk/spike gate profile {name!r}; expected one of: {supported}"
+        ) from exc
+
 
 @dataclass(frozen=True)
 class FullDatasetReferenceContract:
@@ -116,6 +183,7 @@ class BulkSpikeRealExperimentConfig(RoutingGeometryExperimentConfig):
     topology_min_positive_fold_fraction: float = 0.80
     topology_worst_harm_margin: float = 0.005
     tail_harm_margin: float = 0.01
+    gate_profile: str = STRICT_RESEARCH_GATE_PROFILE
     null_resamples: int = 8
     topology_min_partition_size: int = 32
 
@@ -127,6 +195,7 @@ class BulkSpikeRealExperimentConfig(RoutingGeometryExperimentConfig):
             raise ValueError("selection_folds must be at least 3")
         if int(self.null_resamples) < 2:
             raise ValueError("null_resamples must be at least 2")
+        get_bulk_spike_gate_profile(self.gate_profile)
 
     @property
     def expected_records(self) -> int:
@@ -204,10 +273,14 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
         payload["expected_full_reference_records"] = (
             self.config.expected_reference_records
         )
+        payload["gate_profile"] = self._gate_profile().to_dict()
         path.write_text(
             json.dumps(payload, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+
+    def _gate_profile(self) -> BulkSpikeGateProfile:
+        return get_bulk_spike_gate_profile(self.config.gate_profile)
 
     def _initialize_artifacts(self) -> None:
         super()._initialize_artifacts()
@@ -1122,6 +1195,35 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
             result.loc[index, "partition_total_rows"] = int(
                 sum((record.get("partition_sizes", {}) or {}).values())
             )
+            partition_sizes = record.get("partition_sizes", {}) or {}
+            partition_total = max(int(sum(partition_sizes.values())), 1)
+            for partition_name in ("bulk", "spike"):
+                partition_rows = int(partition_sizes.get(partition_name, 0))
+                result.loc[index, f"{partition_name}_train_rows"] = partition_rows
+                result.loc[index, f"{partition_name}_train_share"] = (
+                    partition_rows / partition_total
+                )
+            routing = (
+                (record.get("validation", {}) or {}).get("routing", {}) or {}
+            )
+            hard_counts = routing.get("hard_assignment_counts", {}) or {}
+            soft_mass = routing.get("soft_assignment_mass", {}) or {}
+            if not isinstance(hard_counts, Mapping):
+                hard_counts = {}
+            if not isinstance(soft_mass, Mapping):
+                soft_mass = {}
+            hard_total = float(sum(hard_counts.values()))
+            soft_total = float(sum(soft_mass.values()))
+            for partition_name in ("bulk", "spike"):
+                hard_rows = int(hard_counts.get(partition_name, 0))
+                result.loc[index, f"{partition_name}_routing_hard_rows"] = hard_rows
+                result.loc[index, f"{partition_name}_routing_hard_share"] = (
+                    hard_rows / hard_total if hard_total else np.nan
+                )
+                soft_value = float(soft_mass.get(partition_name, 0.0))
+                result.loc[index, f"{partition_name}_routing_soft_share"] = (
+                    soft_value / soft_total if soft_total else np.nan
+                )
             topology = (
                 (record.get("sampler_diagnostics", {}) or {}).get(
                     "bulk_spike_topology"
@@ -1177,6 +1279,10 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
         paired.to_csv(self.output_dir_ / "bulk_spike_paired.csv", index=False)
         summary = self._summary(paired)
         summary.to_csv(self.output_dir_ / "bulk_spike_summary.csv", index=False)
+        self._b1_allocation_table(result).to_csv(
+            self.output_dir_ / "bulk_spike_b1_allocation.csv",
+            index=False,
+        )
         gate = self._gate(result, paired)
         (self.output_dir_ / "bulk_spike_gate.json").write_text(
             json.dumps(json_ready(gate), indent=2, ensure_ascii=False),
@@ -1184,6 +1290,41 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
         )
         self._write_report(summary, gate)
         self._write_figure(summary)
+
+    @staticmethod
+    def _b1_allocation_table(result: pd.DataFrame) -> pd.DataFrame:
+        keys = ["dataset", "seed", "budget_ratio", "model"]
+        selected = result[
+            (result["arm_name"] == "B3_validation_selected")
+            & (result["selected_arm_name"] == "B1_bulk_single_spike")
+        ][keys].assign(selected_by_b3=True)
+        b1 = result[result["arm_name"] == "B1_bulk_single_spike"].copy()
+        allocation_columns = [
+            *keys,
+            "problem_type",
+            "n_train",
+            "topology_total_budget",
+            "bulk_train_rows",
+            "spike_train_rows",
+            "bulk_train_share",
+            "spike_train_share",
+            "bulk_routing_hard_rows",
+            "spike_routing_hard_rows",
+            "bulk_routing_hard_share",
+            "spike_routing_hard_share",
+            "bulk_routing_soft_share",
+            "spike_routing_soft_share",
+            "test_primary_metric",
+            "test_primary_value",
+        ]
+        available = [column for column in allocation_columns if column in b1]
+        return (
+            b1[available]
+            .merge(selected, on=keys, how="left", validate="one_to_one")
+            .assign(selected_by_b3=lambda frame: frame["selected_by_b3"].fillna(False))
+            .sort_values(keys)
+            .reset_index(drop=True)
+        )
 
     @staticmethod
     def _paired_results(result: pd.DataFrame) -> pd.DataFrame:
@@ -1280,6 +1421,7 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
         ).agg(**aggregations)
 
     def _gate(self, result: pd.DataFrame, paired: pd.DataFrame) -> dict[str, Any]:
+        profile = self._gate_profile()
         b3 = paired[paired["arm_name"] == "B3_validation_selected"]
         selected = b3[b3["selected_arm_name"] != "B0_standard_A9"]
         specialized = result[
@@ -1289,12 +1431,7 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
         ]
         regression = b3[b3["problem_type"] == "regression"]
         classification = b3[b3["problem_type"] == "classification"]
-        classification_guard_margins = {
-            "brier_score_gain_vs_b0": 0.01,
-            "expected_calibration_error_gain_vs_b0": 0.01,
-            "f1_macro_gain_vs_b0": 0.01,
-            "worst_class_recall_gain_vs_b0": 0.01,
-        }
+        classification_guard_margins = profile.classification_harm_margins()
         classification_guards = {}
         for column, margin in classification_guard_margins.items():
             values = (
@@ -1335,7 +1472,7 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
             "worst_harm_within_margin": bool(
                 not b3.empty
                 and b3["gain_vs_b0"].min()
-                >= -float(self.config.topology_worst_harm_margin)
+                >= -profile.primary_harm_margin
             ),
             "selected_specialization_win_rate_at_least_80pct": bool(
                 not selected.empty
@@ -1346,7 +1483,7 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
                 or (
                     not tail_values.empty
                     and float(tail_values.min())
-                    >= -float(self.config.tail_harm_margin)
+                    >= -profile.tail_harm_margin
                 )
             ),
             "classification_probability_and_balance_noninferiority": bool(
@@ -1355,6 +1492,7 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
         }
         return {
             "status": "passed" if all(checks.values()) else "failed",
+            "gate_profile": profile.to_dict(),
             "checks": checks,
             "expected_records": self.config.expected_records,
             "observed_records": len(result),
@@ -1377,6 +1515,7 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
             "# Пилот топологий тела и сигнала на реальных данных",
             "",
             f"Статус критерия допуска: **{gate['status']}**.",
+            f"Профиль критерия: `{gate['gate_profile']['name']}`.",
             "",
             "## Критерии",
             "",
@@ -1392,6 +1531,9 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
             "## Сводка",
             "",
             markdown_table(summary),
+            "",
+            "Подробное распределение обучающего бюджета и маршрутизации B1: "
+            "`bulk_spike_b1_allocation.csv`.",
             "",
         ]
         (self.output_dir_ / "bulk_spike_report.md").write_text("\n".join(lines), encoding="utf-8")
@@ -1454,6 +1596,7 @@ def run_rmt_bulk_spike_topology_real_experiment(
     budget_ratios: Sequence[float] = DEFAULT_REAL_TOPOLOGY_BUDGETS,
     seeds: Sequence[int] = DEFAULT_REAL_TOPOLOGY_SEEDS,
     max_train_rows: Optional[int] = 100_000,
+    gate_profile: str = STRICT_RESEARCH_GATE_PROFILE,
     output_dir: Optional[str | Path] = None,
     show_progress: bool = True,
 ) -> pd.DataFrame:
@@ -1473,6 +1616,7 @@ def run_rmt_bulk_spike_topology_real_experiment(
             budget_ratios=budget_ratios,
             seeds=seeds,
             max_train_rows=max_train_rows,
+            gate_profile=gate_profile,
             output_dir=None if output_dir is None else Path(output_dir),
             show_progress=show_progress,
         )
@@ -1482,10 +1626,16 @@ def run_rmt_bulk_spike_topology_real_experiment(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument(
+        "--gate-profile",
+        default=STRICT_RESEARCH_GATE_PROFILE,
+        help="Профиль aggregate gate.",
+    )
     parser.add_argument("--no-progress", action="store_true")
     args = parser.parse_args()
     result = run_rmt_bulk_spike_topology_real_experiment(
         output_dir=args.output_dir,
+        gate_profile=args.gate_profile,
         show_progress=not args.no_progress,
     )
     print(result.tail())

@@ -22,6 +22,8 @@ for module_path in (ROOT_DIR, BENCHMARK_DIR):
 
 from rmt_bulk_spike_topology_real_experiment import (  # noqa: E402
     REAL_TOPOLOGY_ARMS,
+    STRICT_RESEARCH_GATE_PROFILE,
+    get_bulk_spike_gate_profile,
     run_rmt_bulk_spike_topology_real_experiment,
 )
 from rmt_classification_geometry_guard_analysis import (  # noqa: E402
@@ -155,6 +157,7 @@ class RMTBulkSpikeResearchProgramConfig:
     max_train_rows: Optional[int] = 100_000
     show_progress: bool = True
     bootstrap_iterations: int = 500
+    topology_gate_profile: str = STRICT_RESEARCH_GATE_PROFILE
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "models", tuple(str(value) for value in self.models))
@@ -185,6 +188,7 @@ class RMTBulkSpikeResearchProgramConfig:
             raise ValueError("scaling_budgets must include the main budget grid")
         if int(self.bootstrap_iterations) < 0:
             raise ValueError("bootstrap_iterations must be non-negative")
+        get_bulk_spike_gate_profile(self.topology_gate_profile)
 
 
 def build_rmt_bulk_spike_research_plan(
@@ -478,6 +482,7 @@ class RMTBulkSpikeResearchProgramOrchestrator:
             budget_ratios=self.config.budgets,
             seeds=self.config.seeds,
             max_train_rows=self.config.max_train_rows,
+            gate_profile=self.config.topology_gate_profile,
             output_dir=output_dir,
             show_progress=self.config.show_progress,
         )
@@ -867,12 +872,18 @@ def main() -> None:
     parser.add_argument("--stages", nargs="+")
     parser.add_argument("--retry-stages", nargs="+")
     parser.add_argument("--max-train-rows", type=int, default=100_000)
+    parser.add_argument(
+        "--topology-gate-profile",
+        default=STRICT_RESEARCH_GATE_PROFILE,
+        help="Профиль gate для этапов bulk/spike.",
+    )
     parser.add_argument("--no-progress", action="store_true")
     parser.add_argument("--plan-only", action="store_true")
     args = parser.parse_args()
     config = RMTBulkSpikeResearchProgramConfig(
         output_root=args.output_root,
         max_train_rows=args.max_train_rows,
+        topology_gate_profile=args.topology_gate_profile,
         show_progress=not args.no_progress,
     )
     orchestrator = RMTBulkSpikeResearchProgramOrchestrator(config)
