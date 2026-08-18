@@ -324,6 +324,7 @@ class RMTBulkSpikeResearchProgramOrchestrator:
         self.plan = build_rmt_bulk_spike_research_plan(config)
         self._handlers = dict(handlers or self._default_handlers())
         self.results: dict[str, ResearchStageResult] = {}
+        self._protocol_amendment: Optional[dict[str, Any]] = None
 
     def run(
         self,
@@ -332,7 +333,9 @@ class RMTBulkSpikeResearchProgramOrchestrator:
         retry_stages: Optional[Sequence[str]] = None,
     ) -> Path:
         self.output_root.mkdir(parents=True, exist_ok=True)
-        self._write_plan()
+        self._write_plan(
+            allow_gate_profile_amendment=bool(retry_stages),
+        )
         self.results = self._load_state()
         if retry_stages:
             self._prepare_stage_retry(retry_stages)
@@ -389,20 +392,20 @@ class RMTBulkSpikeResearchProgramOrchestrator:
             self.results.pop(stage_id, None)
 
         manifest_path = self.output_root / f"research_program_retry_{retry_id}.json"
-        self._atomic_write_json(
-            manifest_path,
-            {
-                "retry_id": retry_id,
-                "created_at": self._timestamp(),
-                **retry_plan.to_dict(),
-                "archived_artifacts": archived,
-                "preserved_stage_ids": [
-                    stage_id
-                    for stage_id in self.plan.stage_ids()
-                    if stage_id in self.results
-                ],
-            },
-        )
+        manifest = {
+            "retry_id": retry_id,
+            "created_at": self._timestamp(),
+            **retry_plan.to_dict(),
+            "archived_artifacts": archived,
+            "preserved_stage_ids": [
+                stage_id
+                for stage_id in self.plan.stage_ids()
+                if stage_id in self.results
+            ],
+        }
+        if self._protocol_amendment is not None:
+            manifest["protocol_amendment"] = dict(self._protocol_amendment)
+        self._atomic_write_json(manifest_path, manifest)
         self._append_event(
             ",".join(retry_plan.requested_stage_ids),
             "retry_prepared",
@@ -482,7 +485,6 @@ class RMTBulkSpikeResearchProgramOrchestrator:
             budget_ratios=self.config.budgets,
             seeds=self.config.seeds,
             max_train_rows=self.config.max_train_rows,
-            gate_profile=self.config.topology_gate_profile,
             output_dir=output_dir,
             show_progress=self.config.show_progress,
         )
@@ -566,6 +568,7 @@ class RMTBulkSpikeResearchProgramOrchestrator:
             budget_ratios=(self.config.budgets if budgets is None else budgets),
             seeds=self.config.seeds,
             max_train_rows=self.config.max_train_rows,
+            gate_profile=self.config.topology_gate_profile,
             output_dir=output_dir,
             show_progress=self.config.show_progress,
         )
@@ -692,7 +695,11 @@ class RMTBulkSpikeResearchProgramOrchestrator:
     def _stage_dir(self, stage: ResearchStageSpec) -> Path:
         return self.output_root / stage.artifact_directory
 
-    def _write_plan(self) -> None:
+    def _write_plan(
+        self,
+        *,
+        allow_gate_profile_amendment: bool = False,
+    ) -> None:
         path = self.output_root / "research_program_plan.json"
         config = asdict(replace(self.config, output_root=self.output_root))
         config.pop("show_progress", None)
@@ -705,9 +712,25 @@ class RMTBulkSpikeResearchProgramOrchestrator:
         }
         if path.exists():
             existing = self._read_json(path)
-            if existing.get("config") != payload["config"] or existing.get(
-                "plan"
-            ) != payload["plan"]:
+            existing_config = dict(existing.get("config", {}) or {})
+            requested_config = dict(payload["config"])
+            existing_profile = str(
+                existing_config.pop(
+                    "topology_gate_profile",
+                    STRICT_RESEARCH_GATE_PROFILE,
+                )
+            )
+            requested_profile = str(
+                requested_config.pop("topology_gate_profile")
+            )
+            incompatible_config = existing_config != requested_config
+            incompatible_plan = existing.get("plan") != payload["plan"]
+            profile_changed = existing_profile != requested_profile
+            if (
+                incompatible_config
+                or incompatible_plan
+                or (profile_changed and not allow_gate_profile_amendment)
+            ):
                 raise ValueError(
                     "research program resume config does not match the "
                     "existing plan"
@@ -716,6 +739,18 @@ class RMTBulkSpikeResearchProgramOrchestrator:
                 "created_at",
                 existing.get("created_or_updated_at", payload["created_at"]),
             )
+            amendments = list(existing.get("protocol_amendments", []) or [])
+            if profile_changed:
+                self._protocol_amendment = {
+                    "field": "topology_gate_profile",
+                    "from": existing_profile,
+                    "to": requested_profile,
+                    "reason": "explicit_stage_retry",
+                    "changed_at": payload["updated_at"],
+                }
+                amendments.append(dict(self._protocol_amendment))
+            if amendments:
+                payload["protocol_amendments"] = amendments
         self._atomic_write_json(path, payload)
 
     def _load_state(self) -> dict[str, ResearchStageResult]:
