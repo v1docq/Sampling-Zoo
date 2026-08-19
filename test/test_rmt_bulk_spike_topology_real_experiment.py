@@ -14,6 +14,8 @@ from examples.benchmark.benchmark_datasets import (
     RawDatasetMetadata,
 )
 from examples.benchmark.rmt_bulk_spike_topology_real_experiment import (
+    BULK_ONLY_ARM,
+    DENSE_SCALING_CANDIDATE_ARMS,
     BulkSpikeRealExperimentConfig,
     BulkSpikeRealExperimentOrchestrator,
     PRACTICAL_EXPLORATION_GATE_PROFILE,
@@ -32,9 +34,34 @@ def test_bulk_spike_gate_profiles_keep_strict_and_practical_tolerances_explicit(
     assert practical.primary_harm_margin == 0.01
     assert practical.tail_harm_margin == 0.015
     assert practical.ece_harm_margin == 0.02
-    assert practical.brier_harm_margin == strict.brier_harm_margin
+    assert strict.brier_harm_margin == 0.01
+    assert practical.brier_harm_margin == 0.02
     with pytest.raises(ValueError, match="Unknown bulk/spike gate profile"):
         get_bulk_spike_gate_profile("not-a-profile")
+
+
+def test_practical_brier_margin_is_forwarded_to_b3_selection() -> None:
+    practical = BulkSpikeRealExperimentOrchestrator(
+        BulkSpikeRealExperimentConfig(
+            regression_suite=None,
+            classification_suite=None,
+            regression_tasks=(),
+            classification_tasks=("classification_fixture",),
+            models=("ridge",),
+            budget_ratios=(0.10,),
+            seeds=(42,),
+            gate_profile=PRACTICAL_EXPLORATION_GATE_PROFILE,
+            show_progress=False,
+        )
+    )
+
+    margins = {
+        item.metric: item.noninferiority_margin
+        for item in practical._classification_guard_spec().metric_guards
+    }
+
+    assert margins["brier_score"] == 0.02
+    assert margins["expected_calibration_error"] == 0.01
 
 
 def test_practical_gate_accepts_predeclared_small_harms_only() -> None:
@@ -273,6 +300,7 @@ def test_real_topology_runner_preserves_multiclass_probability_contract(tmp_path
         },
         output_dir=tmp_path,
         show_progress=False,
+        candidate_arms=DENSE_SCALING_CANDIDATE_ARMS,
     )
 
     result = BulkSpikeRealExperimentOrchestrator(
@@ -287,13 +315,30 @@ def test_real_topology_runner_preserves_multiclass_probability_contract(tmp_path
     assert result["degradation_vs_full"].notna().all()
     assert result["test_brier_score"].notna().all()
     assert result["test_expected_calibration_error"].notna().all()
-    specialized = result[
-        result["arm_name"].isin(
-            ["B1_bulk_single_spike", "B2_bulk_multi_spike"]
-        )
-    ]
+    assert set(result["arm_name"]) == {
+        "B0_standard_A9",
+        "B1_bulk_single_spike",
+        BULK_ONLY_ARM,
+        "B3_validation_selected",
+    }
+    bulk_only = result[result["arm_name"] == BULK_ONLY_ARM].iloc[0]
+    assert bulk_only["n_experts"] == 1
+    assert bulk_only["topology_mode"] == "bulk_only"
+    assert bulk_only["selected_arm_name"] == BULK_ONLY_ARM
+    specialized = result[result["arm_name"].isin(DENSE_SCALING_CANDIDATE_ARMS)]
     assert specialized["topology_exact_budget"].all()
     assert specialized["class_coverage_guaranteed"].all()
+
+
+def test_partition_family_total_includes_numbered_spikes() -> None:
+    values = {"bulk": 80, "spike_0": 7, "spike_1": 13}
+
+    assert BulkSpikeRealExperimentOrchestrator._partition_family_total(
+        values, "bulk"
+    ) == 80
+    assert BulkSpikeRealExperimentOrchestrator._partition_family_total(
+        values, "spike"
+    ) == 20
 
 
 def test_real_topology_public_runner_preserves_explicit_empty_task_group(

@@ -20,6 +20,8 @@ from examples.benchmark.rmt_bulk_spike_research_program import (
     build_rmt_bulk_spike_research_plan,
 )
 from examples.benchmark.rmt_bulk_spike_topology_real_experiment import (
+    DEFAULT_TOPOLOGY_CANDIDATE_ARMS,
+    DENSE_SCALING_CANDIDATE_ARMS,
     PRACTICAL_EXPLORATION_GATE_PROFILE,
 )
 from sampling_zoo.core.experiment.research_program import (
@@ -121,21 +123,26 @@ def test_program_forwards_gate_profile_only_to_topology_stages(
     tmp_path,
 ) -> None:
     classification_kwargs = {}
-    topology_kwargs = {}
+    topology_calls = []
 
     def fake_classification(**kwargs):
         classification_kwargs.update(kwargs)
         return pd.DataFrame(index=range(480))
 
     def fake_topology(**kwargs):
-        topology_kwargs.update(kwargs)
+        topology_calls.append(dict(kwargs))
         output_dir = kwargs["output_dir"]
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "bulk_spike_gate.json").write_text(
             json.dumps({"status": "passed"}),
             encoding="utf-8",
         )
-        return pd.DataFrame(index=range(640))
+        record_count = (
+            1_600
+            if tuple(kwargs["candidate_arms"]) == DENSE_SCALING_CANDIDATE_ARMS
+            else 640
+        )
+        return pd.DataFrame(index=range(record_count))
 
     monkeypatch.setattr(
         program_module,
@@ -166,6 +173,78 @@ def test_program_forwards_gate_profile_only_to_topology_stages(
     orchestrator._run_topology_confirmation(
         orchestrator.plan.stage(PROGRAM_STAGE_CONFIRMATION)
     )
+    monkeypatch.setattr(
+        orchestrator,
+        "_reuse_full_grid_references",
+        lambda output_dir: None,
+    )
+    orchestrator._run_dense_scaling(
+        orchestrator.plan.stage(PROGRAM_STAGE_SCALING)
+    )
 
     assert "gate_profile" not in classification_kwargs
-    assert topology_kwargs["gate_profile"] == PRACTICAL_EXPLORATION_GATE_PROFILE
+    assert len(topology_calls) == 2
+    assert topology_calls[0]["gate_profile"] == PRACTICAL_EXPLORATION_GATE_PROFILE
+    assert tuple(topology_calls[0]["candidate_arms"]) == (
+        DEFAULT_TOPOLOGY_CANDIDATE_ARMS
+    )
+    assert tuple(topology_calls[1]["candidate_arms"]) == (
+        DENSE_SCALING_CANDIDATE_ARMS
+    )
+
+
+def test_program_rechecks_completed_full_grid_gate_without_rerun(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    orchestrator = RMTBulkSpikeResearchProgramOrchestrator(
+        RMTBulkSpikeResearchProgramConfig(
+            output_root=tmp_path,
+            topology_gate_profile=PRACTICAL_EXPLORATION_GATE_PROFILE,
+            show_progress=False,
+        )
+    )
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    orchestrator._write_plan()
+    stage = orchestrator.plan.stage(PROGRAM_STAGE_FULL_GRID)
+    output_dir = tmp_path / stage.artifact_directory
+    output_dir.mkdir(parents=True)
+    (output_dir / "bulk_spike_gate.json").write_text(
+        json.dumps(
+            {
+                "status": "failed",
+                "gate_profile": {"brier_harm_margin": 0.01},
+            }
+        ),
+        encoding="utf-8",
+    )
+    orchestrator.results = {
+        PROGRAM_STAGE_FULL_GRID: ResearchStageResult(
+            stage_id=PROGRAM_STAGE_FULL_GRID,
+            status=ResearchStageStatus.COMPLETED,
+            record_count=stage.expected_records,
+            expected_records=stage.expected_records,
+            artifact_directory=str(output_dir),
+            gate_status="failed",
+        )
+    }
+    monkeypatch.setattr(
+        program_module,
+        "reevaluate_rmt_bulk_spike_gate",
+        lambda **kwargs: {
+            "status": "passed",
+            "gate_profile": {"brier_harm_margin": 0.02},
+        },
+    )
+
+    orchestrator._recheck_topology_gates((PROGRAM_STAGE_FULL_GRID,))
+
+    assert orchestrator.results[PROGRAM_STAGE_FULL_GRID].gate_status == "passed"
+    plan = json.loads(
+        (tmp_path / "research_program_plan.json").read_text(encoding="utf-8")
+    )
+    assert plan["protocol_amendments"][-1]["field"] == (
+        "practical_exploration.brier_harm_margin"
+    )
+    assert plan["protocol_amendments"][-1]["from"] == 0.01
+    assert plan["protocol_amendments"][-1]["to"] == 0.02

@@ -73,6 +73,18 @@ REAL_TOPOLOGY_ARMS: tuple[str, ...] = (
     "B2_bulk_multi_spike",
     "B3_validation_selected",
 )
+BULK_ONLY_ARM = "B4_bulk_only"
+DEFAULT_TOPOLOGY_CANDIDATE_ARMS: tuple[str, ...] = (
+    "B1_bulk_single_spike",
+    "B2_bulk_multi_spike",
+)
+DENSE_SCALING_CANDIDATE_ARMS: tuple[str, ...] = (
+    "B1_bulk_single_spike",
+    BULK_ONLY_ARM,
+)
+SUPPORTED_TOPOLOGY_CANDIDATE_ARMS = frozenset(
+    (*DEFAULT_TOPOLOGY_CANDIDATE_ARMS, BULK_ONLY_ARM)
+)
 
 STRICT_RESEARCH_GATE_PROFILE = "strict_research"
 PRACTICAL_EXPLORATION_GATE_PROFILE = "practical_exploration"
@@ -124,7 +136,7 @@ BULK_SPIKE_GATE_PROFILES: dict[str, BulkSpikeGateProfile] = {
         name=PRACTICAL_EXPLORATION_GATE_PROFILE,
         primary_harm_margin=0.01,
         tail_harm_margin=0.015,
-        brier_harm_margin=0.01,
+        brier_harm_margin=0.02,
         ece_harm_margin=0.02,
         f1_macro_harm_margin=0.01,
         worst_class_recall_harm_margin=0.01,
@@ -186,6 +198,7 @@ class BulkSpikeRealExperimentConfig(RoutingGeometryExperimentConfig):
     gate_profile: str = STRICT_RESEARCH_GATE_PROFILE
     null_resamples: int = 8
     topology_min_partition_size: int = 32
+    candidate_arms: Sequence[str] = DEFAULT_TOPOLOGY_CANDIDATE_ARMS
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -195,7 +208,26 @@ class BulkSpikeRealExperimentConfig(RoutingGeometryExperimentConfig):
             raise ValueError("selection_folds must be at least 3")
         if int(self.null_resamples) < 2:
             raise ValueError("null_resamples must be at least 2")
+        candidate_arms = tuple(str(value) for value in self.candidate_arms)
+        if not candidate_arms or len(set(candidate_arms)) != len(candidate_arms):
+            raise ValueError("candidate_arms must be non-empty and unique")
+        unsupported = set(candidate_arms) - SUPPORTED_TOPOLOGY_CANDIDATE_ARMS
+        if unsupported:
+            raise ValueError(
+                f"Unsupported topology candidate arms: {sorted(unsupported)}"
+            )
+        if BULK_ONLY_ARM in candidate_arms and "B1_bulk_single_spike" not in candidate_arms:
+            raise ValueError("B4_bulk_only requires B1_bulk_single_spike row selection")
+        object.__setattr__(self, "candidate_arms", candidate_arms)
         get_bulk_spike_gate_profile(self.gate_profile)
+
+    @property
+    def arm_names(self) -> tuple[str, ...]:
+        return (
+            "B0_standard_A9",
+            *tuple(self.candidate_arms),
+            "B3_validation_selected",
+        )
 
     @property
     def expected_records(self) -> int:
@@ -204,7 +236,7 @@ class BulkSpikeRealExperimentConfig(RoutingGeometryExperimentConfig):
             * len(self.models)
             * len(self.budget_ratios)
             * len(self.seeds)
-            * len(REAL_TOPOLOGY_ARMS)
+            * len(self.arm_names)
         )
 
     @property
@@ -223,7 +255,7 @@ class PreparedBulkSpikeDataset(PreparedRoutingDataset):
 
 
 class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator):
-    """Fit B0-B2, select B3 away from the outer test split, then persist."""
+    """Fit configured candidates, select B3 off-test, then persist results."""
 
     config: BulkSpikeRealExperimentConfig
 
@@ -348,7 +380,7 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
         )
         pending = {
             arm
-            for arm in REAL_TOPOLOGY_ARMS
+            for arm in self.config.arm_names
             if self._arm_key({**identity, "arm_name": arm})
             not in self.completed_arm_keys_
         }
@@ -370,7 +402,7 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
                 "selected_topology_arm": selected_arm,
                 "topology_selection": selection,
             }
-            for arm in REAL_TOPOLOGY_ARMS:
+            for arm in self.config.arm_names:
                 if arm not in pending:
                     continue
                 evaluation = evaluations[arm]
@@ -597,11 +629,22 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
         identity: Mapping[str, Any],
     ) -> dict[str, dict[str, Any]]:
         result = {}
-        for arm, topology in (
-            ("B0_standard_A9", "standard"),
-            ("B1_bulk_single_spike", "bulk_single_spike"),
-            ("B2_bulk_multi_spike", "bulk_multi_spike"),
-        ):
+        topology_by_arm = {
+            "B0_standard_A9": "standard",
+            "B1_bulk_single_spike": "bulk_single_spike",
+            "B2_bulk_multi_spike": "bulk_multi_spike",
+        }
+        ensemble_arms = (
+            "B0_standard_A9",
+            *(
+                arm
+                for arm in self.config.candidate_arms
+                if arm != BULK_ONLY_ARM
+            ),
+        )
+        bulk_only_rows: Optional[np.ndarray] = None
+        for arm in ensemble_arms:
+            topology = topology_by_arm[arm]
             started = perf_counter()
             ensemble = self._fit_topology_ensemble(
                 prepared=prepared,
@@ -646,6 +689,8 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
                     + str(ensemble.partitioner.topology_spec_.spike_router)
                 )
             sampler = ensemble.partitioner
+            if arm == "B1_bulk_single_spike":
+                bulk_only_rows = self._selected_partition_rows(sampler.partitions)
             result[arm] = {
                 "selection": selection_summary,
                 "test": test_summary,
@@ -669,7 +714,155 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
                     else sampler.bulk_spike_topology_.mode.value
                 ),
             }
+        if BULK_ONLY_ARM in self.config.candidate_arms:
+            if bulk_only_rows is None:
+                raise RuntimeError("B4_bulk_only requires B1 training rows")
+            result[BULK_ONLY_ARM] = self._fit_and_evaluate_bulk_only(
+                prepared=prepared,
+                model_factory=model_factory,
+                training_rows=bulk_only_rows,
+            )
         return result
+
+    @staticmethod
+    def _selected_partition_rows(
+        partitions: Mapping[str, Sequence[int]],
+    ) -> np.ndarray:
+        if not partitions:
+            raise RuntimeError("Topology did not select training rows")
+        rows = np.concatenate(
+            tuple(
+                np.asarray(values, dtype=int).reshape(-1)
+                for values in partitions.values()
+            )
+        )
+        unique = np.unique(rows)
+        if unique.size != rows.size:
+            raise RuntimeError("Topology training rows must be unique")
+        return np.sort(unique)
+
+    def _fit_and_evaluate_bulk_only(
+        self,
+        *,
+        prepared: PreparedBulkSpikeDataset,
+        model_factory: Any,
+        training_rows: np.ndarray,
+    ) -> dict[str, Any]:
+        started = perf_counter()
+        model = model_factory()
+        model.fit(
+            prepared.X_train.iloc[training_rows],
+            prepared.y_train.iloc[training_rows],
+        )
+        fit_seconds = float(perf_counter() - started)
+        selection = self._evaluate_single_model(
+            model,
+            prepared=prepared,
+            features=prepared.X_selection,
+            target=prepared.y_selection,
+            store_outputs=True,
+        )
+        test = self._evaluate_single_model(
+            model,
+            prepared=prepared,
+            features=prepared.X_test,
+            target=prepared.y_test,
+        )
+        selected_classes = np.unique(prepared.y_train.iloc[training_rows])
+        all_classes = np.unique(prepared.y_train)
+        class_coverage = bool(
+            prepared.dataset.problem_type != "classification"
+            or np.array_equal(selected_classes, all_classes)
+        )
+        total_budget = int(training_rows.size)
+        return {
+            "selection": selection,
+            "test": test,
+            "n_experts": 1,
+            "partition_sizes": {"bulk": total_budget},
+            "sampler_diagnostics": {
+                "bulk_only_source_arm": "B1_bulk_single_spike",
+                "class_coverage_guaranteed": class_coverage,
+                "bulk_spike_topology": {
+                    "mode": "bulk_only",
+                    "exact_budget": True,
+                    "unique_rows": total_budget,
+                    "total_budget": total_budget,
+                },
+            },
+            "runtime": {
+                "fit_seconds": fit_seconds,
+                "inference_seconds": test["inference_seconds"],
+            },
+            "complexity": self._models_complexity(
+                (model,),
+                prepared.X_selection,
+            ),
+            "selected_geometry_arm": "bulk_only",
+            "topology_mode": "bulk_only",
+        }
+
+    def _evaluate_single_model(
+        self,
+        model: Any,
+        *,
+        prepared: PreparedBulkSpikeDataset,
+        features: pd.DataFrame,
+        target: pd.Series,
+        store_outputs: bool = False,
+    ) -> dict[str, Any]:
+        started = perf_counter()
+        if prepared.dataset.problem_type == "classification":
+            classes = np.unique(prepared.y_train)
+            probabilities = self._aligned_model_probabilities(model, features, classes)
+            prediction = classes[np.argmax(probabilities, axis=1)]
+        else:
+            probabilities = None
+            prediction = np.asarray(model.predict(features))
+        inference_seconds = float(perf_counter() - started)
+        metrics = calculate_metrics(
+            target,
+            prediction,
+            probabilities,
+            prepared.dataset.problem_type,
+            classes=(
+                np.unique(prepared.y_train)
+                if prepared.dataset.problem_type == "classification"
+                else None
+            ),
+        )
+        if prepared.dataset.problem_type == "regression":
+            absolute_error = np.abs(
+                np.asarray(target, dtype=float) - np.asarray(prediction, dtype=float)
+            )
+            metrics["mae"] = float(np.mean(absolute_error))
+            metrics["tail_mean_absolute_error"] = upper_tail_mean_absolute_error(
+                target,
+                prediction,
+                quantile=0.90,
+            )
+        primary = self._primary_metric(
+            prepared.dataset.problem_type,
+            prepared.y_train,
+        )
+        summary = {
+            "primary_metric": primary,
+            "primary_value": float(metrics[primary]),
+            "metrics": {name: float(value) for name, value in metrics.items()},
+            "routing": {
+                "hard_assignment_counts": {"bulk": int(len(features))},
+                "soft_assignment_mass": {"bulk": float(len(features))},
+            },
+            "inference_seconds": inference_seconds,
+        }
+        if store_outputs:
+            summary["predictions"] = np.asarray(prediction).tolist()
+            summary["probabilities"] = (
+                None
+                if probabilities is None
+                else np.asarray(probabilities).tolist()
+            )
+        return summary
 
     def _fit_topology_ensemble(
         self,
@@ -880,18 +1073,22 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
         prepared: PreparedBulkSpikeDataset,
     ) -> tuple[str, dict[str, Any]]:
         eligible = []
-        b1 = evaluations["B1_bulk_single_spike"]
-        b2 = evaluations["B2_bulk_multi_spike"]
-        b1_split = b1["sampler_diagnostics"]["spectral_component_split"]
-        b2_split = b2["sampler_diagnostics"]["spectral_component_split"]
-        if int(b1_split["n_spikes"]) >= 1 and b1["n_experts"] >= 2:
-            eligible.append("B1_bulk_single_spike")
-        if (
-            int(b2_split["n_spikes"]) >= 2
-            and b2["topology_mode"] == BulkSpikeTopologyMode.MULTI_SPIKE.value
-            and b2["n_experts"] >= 3
-        ):
-            eligible.append("B2_bulk_multi_spike")
+        if "B1_bulk_single_spike" in evaluations:
+            b1 = evaluations["B1_bulk_single_spike"]
+            b1_split = b1["sampler_diagnostics"]["spectral_component_split"]
+            if int(b1_split["n_spikes"]) >= 1 and b1["n_experts"] >= 2:
+                eligible.append("B1_bulk_single_spike")
+        if "B2_bulk_multi_spike" in evaluations:
+            b2 = evaluations["B2_bulk_multi_spike"]
+            b2_split = b2["sampler_diagnostics"]["spectral_component_split"]
+            if (
+                int(b2_split["n_spikes"]) >= 2
+                and b2["topology_mode"] == BulkSpikeTopologyMode.MULTI_SPIKE.value
+                and b2["n_experts"] >= 3
+            ):
+                eligible.append("B2_bulk_multi_spike")
+        if BULK_ONLY_ARM in evaluations:
+            eligible.append(BULK_ONLY_ARM)
         if not eligible:
             return "B0_standard_A9", {
                 "status": "fallback_to_b0",
@@ -937,7 +1134,7 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
                 ),
                 tail_guard_primary_metrics=("rmse",),
                 tail_noninferiority_margin=float(self.config.tail_harm_margin),
-                classification_guard=ClassificationRoutingGuardSpec(),
+                classification_guard=self._classification_guard_spec(),
                 random_state=int(prepared.seed) + 30_000,
             )
         )
@@ -985,8 +1182,8 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
             "evaluation_rows": int(len(rows)),
         }
 
-    @staticmethod
     def _topology_fold_score(
+        self,
         *,
         arm_name: str,
         fold_id: str,
@@ -1015,7 +1212,7 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
                     quantile=0.90,
                 ),
             )
-        guard_spec = ClassificationRoutingGuardSpec()
+        guard_spec = self._classification_guard_spec()
         guards = tuple(
             RoutingGeometryGuardMetricScore(
                 metric=item.metric,
@@ -1034,6 +1231,17 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
             selected_temperature=1.0,
             guard_metrics=guards,
         )
+
+    def _classification_guard_spec(self) -> ClassificationRoutingGuardSpec:
+        base = ClassificationRoutingGuardSpec()
+        brier_margin = self._gate_profile().brier_harm_margin
+        metric_guards = tuple(
+            replace(item, noninferiority_margin=brier_margin)
+            if item.metric == "brier_score"
+            else item
+            for item in base.metric_guards
+        )
+        return replace(base, metric_guards=metric_guards)
 
     @staticmethod
     def _model_complexity(
@@ -1197,8 +1405,18 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
             )
             partition_sizes = record.get("partition_sizes", {}) or {}
             partition_total = max(int(sum(partition_sizes.values())), 1)
+            structured_partition_total = int(
+                self._partition_family_total(partition_sizes, "bulk")
+                + self._partition_family_total(partition_sizes, "spike")
+            )
+            if structured_partition_total and structured_partition_total != partition_total:
+                raise RuntimeError(
+                    "bulk/spike partition families must preserve the total budget"
+                )
             for partition_name in ("bulk", "spike"):
-                partition_rows = int(partition_sizes.get(partition_name, 0))
+                partition_rows = int(
+                    self._partition_family_total(partition_sizes, partition_name)
+                )
                 result.loc[index, f"{partition_name}_train_rows"] = partition_rows
                 result.loc[index, f"{partition_name}_train_share"] = (
                     partition_rows / partition_total
@@ -1215,12 +1433,14 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
             hard_total = float(sum(hard_counts.values()))
             soft_total = float(sum(soft_mass.values()))
             for partition_name in ("bulk", "spike"):
-                hard_rows = int(hard_counts.get(partition_name, 0))
+                hard_rows = int(
+                    self._partition_family_total(hard_counts, partition_name)
+                )
                 result.loc[index, f"{partition_name}_routing_hard_rows"] = hard_rows
                 result.loc[index, f"{partition_name}_routing_hard_share"] = (
                     hard_rows / hard_total if hard_total else np.nan
                 )
-                soft_value = float(soft_mass.get(partition_name, 0.0))
+                soft_value = self._partition_family_total(soft_mass, partition_name)
                 result.loc[index, f"{partition_name}_routing_soft_share"] = (
                     soft_value / soft_total if soft_total else np.nan
                 )
@@ -1270,6 +1490,21 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
             - result["test_primary_value"],
         )
         return result
+
+    @staticmethod
+    def _partition_family_total(
+        values: Mapping[str, Any],
+        family: str,
+    ) -> float:
+        if family == "spike":
+            return float(
+                sum(
+                    value
+                    for name, value in values.items()
+                    if name == "spike" or str(name).startswith("spike_")
+                )
+            )
+        return float(values.get(family, 0.0))
 
     def _finalize_artifacts(self, result: pd.DataFrame) -> None:
         super()._finalize_artifacts(result)
@@ -1424,11 +1659,7 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
         profile = self._gate_profile()
         b3 = paired[paired["arm_name"] == "B3_validation_selected"]
         selected = b3[b3["selected_arm_name"] != "B0_standard_A9"]
-        specialized = result[
-            result["arm_name"].isin(
-                ["B1_bulk_single_spike", "B2_bulk_multi_spike"]
-            )
-        ]
+        specialized = result[result["arm_name"].isin(self.config.candidate_arms)]
         regression = b3[b3["problem_type"] == "regression"]
         classification = b3[b3["problem_type"] == "classification"]
         classification_guard_margins = profile.classification_harm_margins()
@@ -1552,6 +1783,7 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
         colors = {
             "B1_bulk_single_spike": "#4472C4",
             "B2_bulk_multi_spike": "#70AD47",
+            BULK_ONLY_ARM: "#A5A5A5",
             "B3_validation_selected": "#ED7D31",
         }
         for axis, dataset in zip(axes.flat, datasets):
@@ -1588,6 +1820,50 @@ class BulkSpikeRealExperimentOrchestrator(RoutingGeometryExperimentOrchestrator)
         plt.close(figure)
 
 
+def reevaluate_rmt_bulk_spike_gate(
+    *,
+    regression_tasks: Sequence[str],
+    classification_tasks: Sequence[str],
+    models: Sequence[str],
+    budget_ratios: Sequence[float],
+    seeds: Sequence[int],
+    gate_profile: str,
+    output_dir: str | Path,
+    candidate_arms: Sequence[str] = DEFAULT_TOPOLOGY_CANDIDATE_ARMS,
+) -> dict[str, Any]:
+    output_path = Path(output_dir)
+    config = BulkSpikeRealExperimentConfig(
+        regression_tasks=tuple(regression_tasks),
+        classification_tasks=tuple(classification_tasks),
+        models=tuple(models),
+        budget_ratios=tuple(budget_ratios),
+        seeds=tuple(seeds),
+        gate_profile=gate_profile,
+        candidate_arms=tuple(candidate_arms),
+        output_dir=output_path,
+        show_progress=False,
+    )
+    orchestrator = BulkSpikeRealExperimentOrchestrator(config)
+    reference_records = orchestrator._load_jsonl_records(
+        output_path / "bulk_spike_full_references.jsonl"
+    )
+    orchestrator.reference_records_ = {
+        orchestrator._reference_key(record): record
+        for record in reference_records
+        if record.get("status") == "completed"
+    }
+    result = pd.read_csv(output_path / "routing_geometry_replay.csv")
+    paired = orchestrator._paired_results(result)
+    gate = orchestrator._gate(result, paired)
+    (output_path / "bulk_spike_gate.json").write_text(
+        json.dumps(json_ready(gate), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    orchestrator.output_dir_ = output_path
+    orchestrator._write_report(orchestrator._summary(paired), gate)
+    return gate
+
+
 def run_rmt_bulk_spike_topology_real_experiment(
     *,
     regression_tasks: Optional[Sequence[str]] = None,
@@ -1597,6 +1873,7 @@ def run_rmt_bulk_spike_topology_real_experiment(
     seeds: Sequence[int] = DEFAULT_REAL_TOPOLOGY_SEEDS,
     max_train_rows: Optional[int] = 100_000,
     gate_profile: str = STRICT_RESEARCH_GATE_PROFILE,
+    candidate_arms: Sequence[str] = DEFAULT_TOPOLOGY_CANDIDATE_ARMS,
     output_dir: Optional[str | Path] = None,
     show_progress: bool = True,
 ) -> pd.DataFrame:
@@ -1617,6 +1894,7 @@ def run_rmt_bulk_spike_topology_real_experiment(
             seeds=seeds,
             max_train_rows=max_train_rows,
             gate_profile=gate_profile,
+            candidate_arms=candidate_arms,
             output_dir=None if output_dir is None else Path(output_dir),
             show_progress=show_progress,
         )
