@@ -21,9 +21,12 @@ for module_path in (ROOT_DIR, BENCHMARK_DIR):
         sys.path.insert(0, str(module_path))
 
 from rmt_bulk_spike_topology_real_experiment import (  # noqa: E402
+    DEFAULT_TOPOLOGY_CANDIDATE_ARMS,
+    DENSE_SCALING_CANDIDATE_ARMS,
     REAL_TOPOLOGY_ARMS,
     STRICT_RESEARCH_GATE_PROFILE,
     get_bulk_spike_gate_profile,
+    reevaluate_rmt_bulk_spike_gate,
     run_rmt_bulk_spike_topology_real_experiment,
 )
 from rmt_classification_geometry_guard_analysis import (  # noqa: E402
@@ -198,6 +201,7 @@ def build_rmt_bulk_spike_research_plan(
     seeds = len(config.seeds)
     budgets = len(config.budgets)
     topology_arms = len(REAL_TOPOLOGY_ARMS)
+    scaling_topology_arms = len(DENSE_SCALING_CANDIDATE_ARMS) + 2
     geometry_arms = len(default_validation_selector_arms()) + 1
     stage_specs = (
         ResearchStageSpec(
@@ -287,7 +291,7 @@ def build_rmt_bulk_spike_research_plan(
                 * models
                 * seeds
                 * len(config.scaling_budgets)
-                * topology_arms
+                * scaling_topology_arms
             ),
             dependencies=(PROGRAM_STAGE_FULL_GRID,),
             gate_dependencies=(PROGRAM_STAGE_FULL_GRID,),
@@ -331,12 +335,15 @@ class RMTBulkSpikeResearchProgramOrchestrator:
         *,
         selected_stages: Optional[Sequence[str]] = None,
         retry_stages: Optional[Sequence[str]] = None,
+        recheck_gates: Optional[Sequence[str]] = None,
     ) -> Path:
         self.output_root.mkdir(parents=True, exist_ok=True)
         self._write_plan(
-            allow_gate_profile_amendment=bool(retry_stages),
+            allow_gate_profile_amendment=bool(retry_stages or recheck_gates),
         )
         self.results = self._load_state()
+        if recheck_gates:
+            self._recheck_topology_gates(recheck_gates)
         if retry_stages:
             self._prepare_stage_retry(retry_stages)
         selected = (
@@ -412,6 +419,99 @@ class RMTBulkSpikeResearchProgramOrchestrator:
             str(manifest_path),
         )
         self._write_state()
+
+    def _recheck_topology_gates(self, stage_ids: Sequence[str]) -> None:
+        protocols = {
+            PROGRAM_STAGE_PILOT: (
+                PILOT_REGRESSION_TASKS,
+                PILOT_CLASSIFICATION_TASKS,
+                self.config.budgets,
+                DEFAULT_TOPOLOGY_CANDIDATE_ARMS,
+            ),
+            PROGRAM_STAGE_CONFIRMATION: (
+                CONFIRMATION_REGRESSION_TASKS,
+                CONFIRMATION_CLASSIFICATION_TASKS,
+                self.config.budgets,
+                DEFAULT_TOPOLOGY_CANDIDATE_ARMS,
+            ),
+            PROGRAM_STAGE_FULL_GRID: (
+                FULL_REGRESSION_TASKS,
+                FULL_CLASSIFICATION_TASKS,
+                self.config.budgets,
+                DEFAULT_TOPOLOGY_CANDIDATE_ARMS,
+            ),
+            PROGRAM_STAGE_SCALING: (
+                SCALING_REGRESSION_TASKS,
+                SCALING_CLASSIFICATION_TASKS,
+                self.config.scaling_budgets,
+                DENSE_SCALING_CANDIDATE_ARMS,
+            ),
+        }
+        for stage_id in tuple(str(value) for value in stage_ids):
+            if stage_id not in protocols:
+                raise ValueError(f"Stage {stage_id} does not have a bulk/spike gate")
+            existing = self.results.get(stage_id)
+            if existing is None or not existing.complete:
+                raise ValueError(f"Stage {stage_id} must be completed before gate recheck")
+            stage = self.plan.stage(stage_id)
+            output_dir = self._stage_dir(stage)
+            old_gate = self._read_json(output_dir / "bulk_spike_gate.json")
+            regression_tasks, classification_tasks, budgets, candidate_arms = protocols[
+                stage_id
+            ]
+            gate = reevaluate_rmt_bulk_spike_gate(
+                regression_tasks=regression_tasks,
+                classification_tasks=classification_tasks,
+                models=self.config.models,
+                budget_ratios=budgets,
+                seeds=self.config.seeds,
+                gate_profile=self.config.topology_gate_profile,
+                candidate_arms=candidate_arms,
+                output_dir=output_dir,
+            )
+            self.results[stage_id] = replace(
+                existing,
+                gate_status=str(gate["status"]),
+                message="",
+            )
+            amendment = self._gate_recheck_amendment(stage_id, old_gate, gate)
+            if amendment is not None:
+                self._protocol_amendment = amendment
+                self._append_protocol_amendment(amendment)
+            self._append_event(stage_id, "gate_rechecked", str(gate["status"]))
+        self._write_state()
+
+    def _gate_recheck_amendment(
+        self,
+        stage_id: str,
+        old_gate: Mapping[str, Any],
+        new_gate: Mapping[str, Any],
+    ) -> Optional[dict[str, Any]]:
+        old_margin = (old_gate.get("gate_profile", {}) or {}).get(
+            "brier_harm_margin"
+        )
+        new_margin = (new_gate.get("gate_profile", {}) or {}).get(
+            "brier_harm_margin"
+        )
+        if old_margin == new_margin:
+            return None
+        return {
+            "field": "practical_exploration.brier_harm_margin",
+            "from": old_margin,
+            "to": new_margin,
+            "reason": "explicit_gate_recheck",
+            "stage_id": stage_id,
+            "changed_at": self._timestamp(),
+        }
+
+    def _append_protocol_amendment(self, amendment: Mapping[str, Any]) -> None:
+        path = self.output_root / "research_program_plan.json"
+        payload = self._read_json(path)
+        amendments = list(payload.get("protocol_amendments", []) or [])
+        amendments.append(dict(amendment))
+        payload["protocol_amendments"] = amendments
+        payload["updated_at"] = self._timestamp()
+        self._atomic_write_json(path, payload)
 
     def _execute_stage(self, stage: ResearchStageSpec) -> None:
         handler = self._handlers.get(stage.stage_id)
@@ -559,6 +659,7 @@ class RMTBulkSpikeResearchProgramOrchestrator:
         regression_tasks: Sequence[str],
         classification_tasks: Sequence[str],
         budgets: Optional[Sequence[float]] = None,
+        candidate_arms: Sequence[str] = DEFAULT_TOPOLOGY_CANDIDATE_ARMS,
     ) -> ResearchStageResult:
         output_dir = self._stage_dir(stage)
         result = run_rmt_bulk_spike_topology_real_experiment(
@@ -569,6 +670,7 @@ class RMTBulkSpikeResearchProgramOrchestrator:
             seeds=self.config.seeds,
             max_train_rows=self.config.max_train_rows,
             gate_profile=self.config.topology_gate_profile,
+            candidate_arms=candidate_arms,
             output_dir=output_dir,
             show_progress=self.config.show_progress,
         )
@@ -580,12 +682,13 @@ class RMTBulkSpikeResearchProgramOrchestrator:
         stage: ResearchStageSpec,
     ) -> ResearchStageResult:
         output_dir = self._stage_dir(stage)
-        self._reuse_full_grid_records(output_dir)
+        self._reuse_full_grid_references(output_dir)
         return self._run_topology_stage(
             stage,
             regression_tasks=SCALING_REGRESSION_TASKS,
             classification_tasks=SCALING_CLASSIFICATION_TASKS,
             budgets=self.config.scaling_budgets,
+            candidate_arms=DENSE_SCALING_CANDIDATE_ARMS,
         )
 
     def _run_final_analysis(
@@ -605,35 +708,30 @@ class RMTBulkSpikeResearchProgramOrchestrator:
         self._write_final_report(output_dir, temporary, fits)
         return result
 
-    def _reuse_full_grid_records(self, output_dir: Path) -> None:
+    def _reuse_full_grid_references(self, output_dir: Path) -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
-        target_records = output_dir / "routing_geometry_runs.jsonl"
         target_references = output_dir / "bulk_spike_full_references.jsonl"
-        if target_records.exists() or target_references.exists():
+        if target_references.exists():
             return
         full_dir = self._stage_dir(self.plan.stage(PROGRAM_STAGE_FULL_GRID))
         requested = {
             *SCALING_REGRESSION_TASKS,
             *SCALING_CLASSIFICATION_TASKS,
         }
-        selected_records = self._filter_jsonl_by_task(
-            full_dir / "routing_geometry_runs.jsonl",
-            requested,
-        )
         selected_references = self._filter_jsonl_by_task(
             full_dir / "bulk_spike_full_references.jsonl",
             requested,
         )
-        self._write_jsonl(target_records, selected_records)
         self._write_jsonl(target_references, selected_references)
         (output_dir / "reuse_manifest.json").write_text(
             json.dumps(
                 {
                     "source": str(full_dir),
-                    "reused_arm_records": len(selected_records),
+                    "reused_arm_records": 0,
                     "reused_reference_records": len(selected_references),
                     "tasks": sorted(requested),
                     "budgets": list(self.config.budgets),
+                    "candidate_arms": list(DENSE_SCALING_CANDIDATE_ARMS),
                 },
                 indent=2,
                 ensure_ascii=False,
@@ -892,12 +990,14 @@ def run_rmt_bulk_spike_research_program(
     *,
     selected_stages: Optional[Sequence[str]] = None,
     retry_stages: Optional[Sequence[str]] = None,
+    recheck_gates: Optional[Sequence[str]] = None,
 ) -> Path:
     return RMTBulkSpikeResearchProgramOrchestrator(
         config or RMTBulkSpikeResearchProgramConfig()
     ).run(
         selected_stages=selected_stages,
         retry_stages=retry_stages,
+        recheck_gates=recheck_gates,
     )
 
 
@@ -906,6 +1006,7 @@ def main() -> None:
     parser.add_argument("--output-root", type=Path)
     parser.add_argument("--stages", nargs="+")
     parser.add_argument("--retry-stages", nargs="+")
+    parser.add_argument("--recheck-gates", nargs="+")
     parser.add_argument("--max-train-rows", type=int, default=100_000)
     parser.add_argument(
         "--topology-gate-profile",
@@ -931,6 +1032,7 @@ def main() -> None:
         orchestrator.run(
             selected_stages=args.stages,
             retry_stages=args.retry_stages,
+            recheck_gates=args.recheck_gates,
         )
     )
 
