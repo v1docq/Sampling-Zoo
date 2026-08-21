@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import copy
 import math
+import os
 from dataclasses import dataclass, field, replace
 from time import perf_counter
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
@@ -61,7 +63,7 @@ from .routing_contracts import (
     RoutingWeightContract,
 )
 from .routing_geometry import PartitionGeometryBuilder, route_partition_geometry
-from ...utils.progress import progress_bar
+from ...utils.progress import progress_bar, progress_write
 from ...utils.utils import safe_index
 from ...experiment.budgeting import PartitionBudgetPlan, build_partition_budget_plan
 
@@ -189,6 +191,11 @@ class RMTContractionConfig:
     dtype: str = "float32"
     max_unfolding_elements: Optional[int] = None
     show_progress: bool = True
+    structure_cache_key: Optional[str] = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
     random_state: Union[int, None] = 42
 
     @classmethod
@@ -269,6 +276,9 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
     - predict_partitions(...) maps new points to chunks;
     - predict_partition_proba(...) returns soft memberships for routed ensembles.
     """
+
+    _STRUCTURE_CACHE: Dict[str, Dict[str, Any]] = {}
+    _STRUCTURE_CACHE_ORDER: List[str] = []
 
     def __init__(
         self,
@@ -565,6 +575,7 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         self.oversample_factor = int(cfg.oversample_factor)
         self.power_iterations = int(cfg.power_iterations)
         self.max_unfolding_elements = cfg.max_unfolding_elements
+        self.structure_cache_key = cfg.structure_cache_key
         self._rmt_backend: Optional[Union[MatrixRMTBackend, TensorRMTBackend]] = None
         self.classification_partition_budget_plan_: Optional[
             ClassificationPartitionBudgetPlan
@@ -802,44 +813,91 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
     ) -> "RMTContractionTensorSampler":
         fit_started = perf_counter()
         stage_seconds: Dict[str, float] = {}
+        structure_cache_hit = False
         with progress_bar(
             enabled=self.show_progress,
             desc="RMT sampler fit",
             total=9,
         ) as stage:
+            progress_write("[RMT 1/9] Initialize sampler state", enabled=self.show_progress)
             started = perf_counter()
             rng = self._start_fit()
             stage_seconds["initialize"] = perf_counter() - started
+            cached_structure = self._load_cached_structure(target)
+            if cached_structure is not None:
+                progress_write(
+                    "[cache] rmt_structure=hit; reuse preprocessing, views, spectral basis and clusters",
+                    enabled=self.show_progress,
+                )
+                self._restore_cached_structure(cached_structure)
+                M = self.mode0_unfolding_shape_
+                rank = self.rank_selection_info_
+                if rank is None:
+                    raise RuntimeError("Cached RMT structure is missing rank info")
+                structure_cache_hit = True
+                stage_seconds["preprocessing"] = 0.0
+                stage_seconds["unfolding_and_view_selection"] = 0.0
+                stage_seconds["spectral_basis"] = 0.0
+                stage_seconds["null_diagnostics"] = 0.0
+                stage_seconds["component_diagnostics"] = 0.0
+                stage_seconds["subspace_diagnostics"] = 0.0
+                stage.update(6)
+            else:
+                progress_write(
+                    "[cache] rmt_structure=miss; compute reusable spectral structure",
+                    enabled=self.show_progress,
+                )
+                progress_write("[RMT 2/9] Preprocess features", enabled=self.show_progress)
+                started = perf_counter()
+                X_num = self._fit_transform_features(data)
+                stage_seconds["preprocessing"] = perf_counter() - started
+                stage.update(1)
+                progress_write("[RMT 3/9] Build random views and unfolding", enabled=self.show_progress)
+                started = perf_counter()
+                M = self._build_fit_unfolding(X_num, rng)
+                self.mode0_unfolding_shape_ = tuple(map(int, M.shape))
+                stage_seconds["unfolding_and_view_selection"] = perf_counter() - started
+                stage.update(1)
+                progress_write("[RMT 4/9] Fit spectral basis", enabled=self.show_progress)
+                started = perf_counter()
+                U, S, Vt, scores, rank = self._fit_spectral_basis(M)
+                stage_seconds["spectral_basis"] = perf_counter() - started
+                stage.update(1)
+                self._store_spectral_basis(U, S, Vt, scores)
+                progress_write("[RMT 5/9] Compute spectral null diagnostics", enabled=self.show_progress)
+                started = perf_counter()
+                self._fit_spectral_null_diagnostic(X_num)
+                stage_seconds["null_diagnostics"] = perf_counter() - started
+                stage.update(1)
+                progress_write("[RMT 6/9] Compute component diagnostics", enabled=self.show_progress)
+                started = perf_counter()
+                self._fit_component_diagnostics()
+                stage_seconds["component_diagnostics"] = perf_counter() - started
+                stage.update(1)
+                progress_write("[RMT 7/9] Compute subspace diagnostics", enabled=self.show_progress)
+                started = perf_counter()
+                self._fit_spectral_subspace_diagnostic(X_num)
+                stage_seconds["subspace_diagnostics"] = perf_counter() - started
+                stage.update(1)
+            progress_write("[RMT 8/9] Select partitions and rows", enabled=self.show_progress)
             started = perf_counter()
-            X_num = self._fit_transform_features(data)
-            stage_seconds["preprocessing"] = perf_counter() - started
-            stage.update(1)
-            started = perf_counter()
-            M = self._build_fit_unfolding(X_num, rng)
-            stage_seconds["unfolding_and_view_selection"] = perf_counter() - started
-            stage.update(1)
-            started = perf_counter()
-            U, S, Vt, scores, rank = self._fit_spectral_basis(M)
-            stage_seconds["spectral_basis"] = perf_counter() - started
-            stage.update(1)
-            self._store_spectral_basis(U, S, Vt, scores)
-            started = perf_counter()
-            self._fit_spectral_null_diagnostic(X_num)
-            stage_seconds["null_diagnostics"] = perf_counter() - started
-            stage.update(1)
-            started = perf_counter()
-            self._fit_component_diagnostics()
-            stage_seconds["component_diagnostics"] = perf_counter() - started
-            stage.update(1)
-            started = perf_counter()
-            self._fit_spectral_subspace_diagnostic(X_num)
-            stage_seconds["subspace_diagnostics"] = perf_counter() - started
-            stage.update(1)
-            started = perf_counter()
-            self._fit_clusters_and_partitions(X_num, scores, target)
+            if not structure_cache_hit:
+                self._fit_cluster_structure(X_num, target)
+                self._store_cached_structure(target)
+            else:
+                self._prepare_classification_partition_budget(
+                    target,
+                    n_rows=int(self.sample_embedding_.shape[0]),
+                )
+            self._build_partitions_from_labels(
+                self._require_cluster_labels(),
+                self._require_leverage_scores(),
+                target,
+            )
             self._fit_bulk_spike_topology(target)
             stage_seconds["partition_selection_and_sampling"] = perf_counter() - started
             stage.update(1)
+            progress_write("[RMT 9/9] Fit routing geometry and finalize diagnostics", enabled=self.show_progress)
             started = perf_counter()
             self._fit_partition_geometry()
             stage_seconds["partition_geometry"] = perf_counter() - started
@@ -853,9 +911,15 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
                 name: float(value) for name, value in stage_seconds.items()
             },
             "total_seconds": float(perf_counter() - fit_started),
-            "cold_start": True,
+            "cold_start": not structure_cache_hit,
+            "structure_cache_hit": bool(structure_cache_hit),
         }
         self.diagnostics_["runtime"] = dict(self.runtime_diagnostics_)
+        progress_write(
+            f"[RMT completed] duration={self.runtime_diagnostics_['total_seconds']:.3f}s "
+            f"structure_cache={'hit' if structure_cache_hit else 'miss'}",
+            enabled=self.show_progress,
+        )
         return self
 
     def _start_fit(self) -> np.random.Generator:
@@ -902,9 +966,157 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             )
         )
         self.row_spectral_participation_ = None
+        self.mode0_unfolding_shape_ = None
         if self.n_views_requested == "auto":
             self.n_views = self.min_views
         return np.random.default_rng(self.random_state)
+
+    def _fit_cluster_structure(
+        self,
+        features: np.ndarray,
+        target: Optional[Union[np.ndarray, pd.Series]],
+    ) -> None:
+        if self.sample_embedding_ is None:
+            raise RuntimeError("Sample embedding is not available")
+        self._prepare_classification_partition_budget(
+            target,
+            n_rows=int(self.sample_embedding_.shape[0]),
+        )
+        labels = self._fit_cluster_labels(
+            self.sample_embedding_,
+            target,
+            downstream_features=features,
+            sample_scores=self._require_leverage_scores(),
+        )
+        self.cluster_labels_ = labels
+
+    def _require_cluster_labels(self) -> np.ndarray:
+        if self.cluster_labels_ is None:
+            raise RuntimeError("Cluster labels are not available")
+        return np.asarray(self.cluster_labels_, dtype=int)
+
+    def _require_leverage_scores(self) -> np.ndarray:
+        if self.leverage_scores_ is None:
+            raise RuntimeError("Leverage scores are not available")
+        return np.asarray(self.leverage_scores_, dtype=float)
+
+    @classmethod
+    def _structure_cache_limit(cls) -> int:
+        raw_value = os.getenv("SAMPLING_ZOO_RMT_STRUCTURE_CACHE_SIZE", "4")
+        try:
+            return max(0, int(raw_value))
+        except ValueError:
+            return 4
+
+    def _can_use_structure_cache(
+        self,
+        target: Optional[Union[np.ndarray, pd.Series]],
+    ) -> bool:
+        if not self.structure_cache_key:
+            return False
+        if self.budget_feasibility_mode != "off":
+            return False
+        if infer_target_type(target, self.cluster_target_type) == "classification":
+            return False
+        return self.expert_topology == "standard"
+
+    def _load_cached_structure(
+        self,
+        target: Optional[Union[np.ndarray, pd.Series]],
+    ) -> Optional[Dict[str, Any]]:
+        if not self._can_use_structure_cache(target):
+            return None
+        cached = self._STRUCTURE_CACHE.get(str(self.structure_cache_key))
+        if cached is None:
+            return None
+        self._touch_structure_cache_key(str(self.structure_cache_key))
+        return copy.deepcopy(cached)
+
+    def _store_cached_structure(
+        self,
+        target: Optional[Union[np.ndarray, pd.Series]],
+    ) -> None:
+        if not self._can_use_structure_cache(target):
+            return
+        if self._structure_cache_limit() <= 0:
+            return
+        key = str(self.structure_cache_key)
+        self._STRUCTURE_CACHE[key] = {
+            name: copy.deepcopy(getattr(self, name, None))
+            for name in self._structure_cache_attribute_names()
+        }
+        self._touch_structure_cache_key(key)
+        self._evict_structure_cache_if_needed()
+
+    def _restore_cached_structure(self, cached: Dict[str, Any]) -> None:
+        for name in self._structure_cache_attribute_names():
+            setattr(self, name, copy.deepcopy(cached.get(name)))
+        self.config = replace(
+            self.config,
+            sampling_budget_ratio=self.sampling_budget_ratio,
+            structure_cache_key=self.structure_cache_key,
+        )
+
+    @staticmethod
+    def _structure_cache_attribute_names() -> Tuple[str, ...]:
+        return (
+            "backend_",
+            "_rmt_backend",
+            "n_views",
+            "view_specs_",
+            "raw_encoded_feature_count_",
+            "encoded_feature_count_",
+            "encoded_feature_subset_",
+            "mode0_unfolding_shape_",
+            "initial_singular_values_",
+            "initial_left_basis_",
+            "initial_right_basis_",
+            "left_basis_",
+            "right_basis_",
+            "singular_values_",
+            "sample_embedding_",
+            "leverage_scores_",
+            "rank_selection_info_",
+            "n_views_selection_info_",
+            "spectral_null_diagnostic_result_",
+            "spectral_subspace_diagnostic_result_",
+            "spectral_component_split_",
+            "row_spectral_participation_",
+            "cluster_selector_",
+            "clusterer_",
+            "cluster_centers_",
+            "cluster_labels_",
+            "partition_selection_info_",
+            "resolved_class_coverage_policy_",
+            "class_coverage_guaranteed_",
+            "diagnostics_",
+            "preprocessor_",
+            "numeric_columns_",
+            "categorical_columns_",
+            "feature_columns_",
+            "fitted_columns_",
+            "category_levels_",
+            "impute_values_",
+        )
+
+    @classmethod
+    def _touch_structure_cache_key(cls, cache_key: str) -> None:
+        try:
+            cls._STRUCTURE_CACHE_ORDER.remove(cache_key)
+        except ValueError:
+            pass
+        cls._STRUCTURE_CACHE_ORDER.append(cache_key)
+
+    @classmethod
+    def _evict_structure_cache_if_needed(cls) -> None:
+        limit = cls._structure_cache_limit()
+        if limit <= 0:
+            cls._STRUCTURE_CACHE.clear()
+            cls._STRUCTURE_CACHE_ORDER.clear()
+            return
+        while len(cls._STRUCTURE_CACHE_ORDER) > limit:
+            old_key = cls._STRUCTURE_CACHE_ORDER.pop(0)
+            cls._STRUCTURE_CACHE.pop(old_key, None)
 
     def _make_rmt_backend(self) -> Union[MatrixRMTBackend, TensorRMTBackend]:
         if self.backend_ == "torch":
@@ -2253,6 +2465,7 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
         )
 
     def _build_diagnostics(self, M: Any, rank_info: RankSelectionInfo) -> None:
+        mode0_shape = M if isinstance(M, tuple) else M.shape
         scores = self.leverage_scores_
         entropy = None
         eff_n = None
@@ -2269,7 +2482,7 @@ class RMTContractionTensorSampler(SpectralSamplerBase):
             "backend": self.backend_,
             "device": self.device if self.backend_ == "torch" else None,
             "dtype": self.dtype,
-            "mode0_unfolding_shape": tuple(map(int, M.shape)),
+            "mode0_unfolding_shape": tuple(map(int, mode0_shape)),
             "raw_encoded_feature_count": self.raw_encoded_feature_count_,
             "encoded_feature_count": self.encoded_feature_count_,
             "encoded_feature_cap_applied": self.encoded_feature_subset_ is not None,
@@ -2519,35 +2732,66 @@ class RawFeatureClusterSampler(RMTContractionTensorSampler):
     ) -> "RawFeatureClusterSampler":
         fit_started = perf_counter()
         stage_seconds: Dict[str, float] = {}
+        structure_cache_hit = False
         with progress_bar(
             enabled=self.show_progress,
             desc="Raw feature cluster sampler fit",
             total=5,
         ) as stage:
+            progress_write("[raw-feature 1/5] Initialize sampler state", enabled=self.show_progress)
             started = perf_counter()
             self._start_fit()
             stage_seconds["initialize"] = perf_counter() - started
-            started = perf_counter()
-            X_num = self._fit_transform_features(data)
-            stage_seconds["preprocessing"] = perf_counter() - started
-            stage.update(1)
+            cached_structure = self._load_cached_structure(target)
+            if cached_structure is not None:
+                progress_write("[cache] raw_feature_structure=hit", enabled=self.show_progress)
+                self._restore_cached_structure(cached_structure)
+                rank_info = self.rank_selection_info_
+                if rank_info is None:
+                    raise RuntimeError("Cached raw-feature structure is missing rank info")
+                structure_cache_hit = True
+                stage_seconds["preprocessing"] = 0.0
+                stage_seconds["raw_feature_embedding"] = 0.0
+                stage.update(2)
+            else:
+                progress_write("[cache] raw_feature_structure=miss", enabled=self.show_progress)
+                progress_write("[raw-feature 2/5] Preprocess features", enabled=self.show_progress)
+                started = perf_counter()
+                X_num = self._fit_transform_features(data)
+                stage_seconds["preprocessing"] = perf_counter() - started
+                stage.update(1)
 
-            started = perf_counter()
-            self.sample_embedding_ = np.asarray(X_num, dtype=np.float64)
-            scores = self._raw_feature_scores(self.sample_embedding_)
-            self.leverage_scores_ = scores
-            rank_info = self._raw_feature_rank_info(self.sample_embedding_)
-            self.rank_selection_info_ = rank_info
-            stage_seconds["raw_feature_embedding"] = perf_counter() - started
-            stage.update(1)
+                progress_write("[raw-feature 3/5] Build standardized feature embedding", enabled=self.show_progress)
+                started = perf_counter()
+                self.sample_embedding_ = np.asarray(X_num, dtype=np.float64)
+                scores = self._raw_feature_scores(self.sample_embedding_)
+                self.leverage_scores_ = scores
+                rank_info = self._raw_feature_rank_info(self.sample_embedding_)
+                self.rank_selection_info_ = rank_info
+                stage_seconds["raw_feature_embedding"] = perf_counter() - started
+                stage.update(1)
 
+            progress_write("[raw-feature 4/5] Select partitions and rows", enabled=self.show_progress)
             started = perf_counter()
-            self._fit_clusters_and_partitions(X_num, scores, target)
+            if not structure_cache_hit:
+                self._fit_cluster_structure(self.sample_embedding_, target)
+                self._store_cached_structure(target)
+            else:
+                self._prepare_classification_partition_budget(
+                    target,
+                    n_rows=int(self.sample_embedding_.shape[0]),
+                )
+            self._build_partitions_from_labels(
+                self._require_cluster_labels(),
+                self._require_leverage_scores(),
+                target,
+            )
             stage_seconds["partition_selection_and_sampling"] = (
                 perf_counter() - started
             )
             stage.update(1)
 
+            progress_write("[raw-feature 5/5] Fit routing geometry and diagnostics", enabled=self.show_progress)
             started = perf_counter()
             self._fit_partition_geometry()
             stage_seconds["partition_geometry"] = perf_counter() - started
@@ -2563,6 +2807,12 @@ class RawFeatureClusterSampler(RMTContractionTensorSampler):
         self.fit_stage_seconds_ = stage_seconds
         self.diagnostics_["fit_runtime_seconds"] = self.fit_runtime_seconds_
         self.diagnostics_["fit_stage_seconds"] = dict(stage_seconds)
+        self.diagnostics_["structure_cache_hit"] = bool(structure_cache_hit)
+        progress_write(
+            f"[raw-feature completed] duration={self.fit_runtime_seconds_:.3f}s "
+            f"structure_cache={'hit' if structure_cache_hit else 'miss'}",
+            enabled=self.show_progress,
+        )
         return self
 
     def predict_partition_proba(self, X: ArrayLike) -> np.ndarray:

@@ -15,7 +15,11 @@ if str(BENCHMARK_DIR) not in sys.path:
 
 from benchmark_datasets import RawDatasetBundle, RawDatasetMetadata  # noqa: E402
 from benchmark_logging import BenchmarkLogger  # noqa: E402
-from benchmark_runner import EnsembleChunkBenchmarkRunner  # noqa: E402
+from benchmark_runner import (  # noqa: E402
+    EnsembleChunkBenchmarkRunner,
+    EnsembleFoldBenchmarkExecutor,
+    FoldSplit,
+)
 from sampling_zoo.core.experiment.contracts import (  # noqa: E402
     ModelStrategyScenarioGridContract,
     ModelStrategyScenarioSpec,
@@ -29,6 +33,7 @@ from sampling_zoo.core.experiment.resume import (  # noqa: E402
     build_resume_plan,
     leaf_run_key_from_components,
 )
+from sampling_zoo.core.utils.sampling_ensemble import SamplingEnsemble  # noqa: E402
 
 
 def _tiny_regression_dataset() -> RawDatasetBundle:
@@ -52,6 +57,276 @@ def _tiny_regression_dataset() -> RawDatasetBundle:
         categorical_columns=[],
         numeric_columns=list(X.columns),
     )
+
+
+def test_trained_partition_cache_key_reuses_models_across_aggregation_modes() -> None:
+    dataset = _tiny_regression_dataset()
+    fold = FoldSplit(
+        fold_idx=1,
+        split_label="fold_1",
+        X_train=dataset.X,
+        X_val=dataset.X.iloc[:2],
+        X_test=dataset.X.iloc[2:],
+        y_train=dataset.y,
+        y_val=dataset.y.iloc[:2],
+        y_test=dataset.y.iloc[2:],
+    )
+    base_config = {
+        "strategy": "rmt_contraction",
+        "n_partitions": 2,
+        "budget_ratio": 0.1,
+        "partition_selection_method": "auto",
+        "_partition_cache_key": "shared-partitions",
+    }
+    voting_key = EnsembleFoldBenchmarkExecutor._build_trained_partition_cache_key(
+        dataset=dataset,
+        fold=fold,
+        partitioner_config={**base_config, "ensemble_method": "voting"},
+        model_name="tabpfn",
+    )
+    routed_key = EnsembleFoldBenchmarkExecutor._build_trained_partition_cache_key(
+        dataset=dataset,
+        fold=fold,
+        partitioner_config={
+            **base_config,
+            "ensemble_method": "routed_weighted",
+            "router": "constrained_gating",
+            "gating_epochs": 200,
+        },
+        model_name="tabpfn",
+    )
+    different_budget_key = EnsembleFoldBenchmarkExecutor._build_trained_partition_cache_key(
+        dataset=dataset,
+        fold=fold,
+        partitioner_config={**base_config, "ensemble_method": "voting", "budget_ratio": 0.3},
+        model_name="tabpfn",
+    )
+    different_model_key = EnsembleFoldBenchmarkExecutor._build_trained_partition_cache_key(
+        dataset=dataset,
+        fold=fold,
+        partitioner_config={**base_config, "ensemble_method": "voting"},
+        model_name="tabicl",
+    )
+    refinement_key = EnsembleFoldBenchmarkExecutor._build_trained_partition_cache_key(
+        dataset=dataset,
+        fold=fold,
+        partitioner_config={
+            **base_config,
+            "ensemble_method": "routed_weighted",
+            "routing_refinement": "em",
+        },
+        model_name="tabpfn",
+    )
+    no_pruning_key = EnsembleFoldBenchmarkExecutor._build_trained_partition_cache_key(
+        dataset=dataset,
+        fold=fold,
+        partitioner_config={
+            **base_config,
+            "ensemble_method": "voting",
+            "validation_pruning": False,
+        },
+        model_name="tabpfn",
+    )
+
+    assert voting_key == routed_key
+    assert voting_key == no_pruning_key
+    assert voting_key != different_budget_key
+    assert voting_key != different_model_key
+    assert refinement_key is None
+
+
+def test_partition_cache_key_matches_partition_stage_dependencies() -> None:
+    dataset = _tiny_regression_dataset()
+    fold = FoldSplit(
+        fold_idx=1,
+        split_label="fold_1",
+        X_train=dataset.X,
+        X_val=dataset.X.iloc[:2],
+        X_test=dataset.X.iloc[2:],
+        y_train=dataset.y,
+        y_val=dataset.y.iloc[:2],
+        y_test=dataset.y.iloc[2:],
+    )
+    base_config = {
+        "strategy": "rmt_contraction",
+        "n_partitions": 2,
+        "budget_application": "after_partitioning",
+        "cluster_selection_metric": "balanced_silhouette",
+    }
+
+    def key(config: dict, model_name: str = "tabpfn") -> str:
+        return EnsembleFoldBenchmarkExecutor._build_partition_cache_key(
+            dataset=dataset,
+            fold=fold,
+            partitioner_config=config,
+            model_name=model_name,
+        )
+
+    rmt_small = key({**base_config, "budget_ratio": 0.1})
+    rmt_large = key({**base_config, "budget_ratio": 0.5})
+    rmt_other_model = key(
+        {**base_config, "budget_ratio": 0.1},
+        model_name="tabicl",
+    )
+    raw_small = key(
+        {
+            **base_config,
+            "strategy": "raw_feature_clustering",
+            "budget_ratio": 0.1,
+        }
+    )
+    raw_large = key(
+        {
+            **base_config,
+            "strategy": "raw_feature_clustering",
+            "budget_ratio": 0.5,
+        }
+    )
+    before_small = key(
+        {
+            **base_config,
+            "budget_application": "before_partitioning",
+            "budget_ratio": 0.1,
+        }
+    )
+    before_large = key(
+        {
+            **base_config,
+            "budget_application": "before_partitioning",
+            "budget_ratio": 0.5,
+        }
+    )
+    downstream_tabpfn = key(
+        {
+            **base_config,
+            "budget_ratio": 0.1,
+            "cluster_selection_metric": "downstream_proxy",
+        },
+        model_name="tabpfn",
+    )
+    downstream_tabicl = key(
+        {
+            **base_config,
+            "budget_ratio": 0.1,
+            "cluster_selection_metric": "downstream_proxy",
+        },
+        model_name="tabicl",
+    )
+
+    assert rmt_small != rmt_large
+    assert rmt_small == rmt_other_model
+    assert raw_small != raw_large
+    assert before_small != before_large
+    assert downstream_tabpfn != downstream_tabicl
+
+
+def test_partition_cache_has_lru_bound(monkeypatch) -> None:
+    monkeypatch.setenv("SAMPLING_ZOO_PARTITION_CACHE_SIZE", "2")
+    SamplingEnsemble._PARTITION_CACHE.clear()
+    SamplingEnsemble._PARTITION_CACHE_ORDER.clear()
+
+    def store(cache_key: str) -> SamplingEnsemble:
+        ensemble = SamplingEnsemble(
+            problem="regression",
+            partitioner_config={
+                "strategy": "random",
+                "_partition_cache_key": cache_key,
+            },
+            model_factory=lambda: Ridge(),
+            show_progress=False,
+        )
+        ensemble._store_cached_base_partitions(
+            {"chunk_0": np.asarray([cache_key])}
+        )
+        return ensemble
+
+    first = store("first")
+    store("second")
+    assert first._load_cached_base_partitions() is not None
+    store("third")
+
+    assert set(SamplingEnsemble._PARTITION_CACHE) == {"first", "third"}
+    assert SamplingEnsemble._PARTITION_CACHE_ORDER == ["first", "third"]
+    SamplingEnsemble._PARTITION_CACHE.clear()
+    SamplingEnsemble._PARTITION_CACHE_ORDER.clear()
+
+
+def test_trained_partition_cache_rejects_empty_entries() -> None:
+    SamplingEnsemble._TRAINED_PARTITION_CACHE.clear()
+    SamplingEnsemble._TRAINED_PARTITION_CACHE_ORDER.clear()
+    ensemble = SamplingEnsemble(
+        problem="regression",
+        partitioner_config={
+            "strategy": "random",
+            "_trained_partition_cache_key": "empty-model-cache",
+        },
+        model_factory=lambda: Ridge(),
+        show_progress=False,
+    )
+    cache_key = ensemble._trained_partition_cache_key("rmse")
+    assert cache_key is not None
+    SamplingEnsemble._TRAINED_PARTITION_CACHE[cache_key] = {
+        "models": [],
+        "partition_metrics": {},
+        "class_coverage_repairs": {},
+    }
+    SamplingEnsemble._TRAINED_PARTITION_CACHE_ORDER.append(cache_key)
+
+    assert ensemble._restore_cached_trained_partitions("rmse") is False
+    assert cache_key not in SamplingEnsemble._TRAINED_PARTITION_CACHE
+    assert cache_key not in SamplingEnsemble._TRAINED_PARTITION_CACHE_ORDER
+
+
+def test_sampler_structure_cache_key_reuses_clustering_across_budgets() -> None:
+    dataset = _tiny_regression_dataset()
+    fold = FoldSplit(
+        fold_idx=1,
+        split_label="fold_1",
+        X_train=dataset.X,
+        X_val=dataset.X.iloc[:2],
+        X_test=dataset.X.iloc[2:],
+        y_train=dataset.y,
+        y_val=dataset.y.iloc[:2],
+        y_test=dataset.y.iloc[2:],
+    )
+    base_config = {
+        "strategy": "rmt_contraction",
+        "n_partitions": 2,
+        "partition_selection_method": "auto",
+        "budget_application": "after_partitioning",
+    }
+
+    small_budget_key = EnsembleFoldBenchmarkExecutor._build_sampler_structure_cache_key(
+        dataset=dataset,
+        fold=fold,
+        partitioner_config={
+            **base_config,
+            "budget_ratio": 0.1,
+            "ensemble_method": "voting",
+        },
+    )
+    large_budget_key = EnsembleFoldBenchmarkExecutor._build_sampler_structure_cache_key(
+        dataset=dataset,
+        fold=fold,
+        partitioner_config={
+            **base_config,
+            "budget_ratio": 0.5,
+            "ensemble_method": "routed_weighted",
+            "router": "spectral",
+        },
+    )
+    before_partition_key = EnsembleFoldBenchmarkExecutor._build_sampler_structure_cache_key(
+        dataset=dataset,
+        fold=fold,
+        partitioner_config={
+            **base_config,
+            "budget_ratio": 0.5,
+            "budget_application": "before_partitioning",
+        },
+    )
+
+    assert small_budget_key == large_budget_key
+    assert before_partition_key is None
 
 
 def test_ensemble_chunk_runner_delegates_fold_work_to_executor(tmp_path) -> None:

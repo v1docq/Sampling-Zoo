@@ -10,6 +10,7 @@ from sklearn.linear_model import Ridge
 from sampling_zoo.core.sampling_strategies.spectral.backend.matrix_backend import MatrixRMTBackend
 from sampling_zoo.core.sampling_strategies.spectral.backend.tensor_backend import TensorRMTBackend
 from sampling_zoo.core.sampling_strategies.spectral.rmt_contraction_sampler import (
+    RawFeatureClusterSampler,
     RMTContractionConfig,
     RMTContractionTensorSampler,
 )
@@ -732,6 +733,141 @@ def test_partition_probability_columns_align_with_partition_names() -> None:
 
     assert proba.shape[1] == len(sampler.partition_names_)
     assert set(sampler.partition_names_) == set(sampler.partitions)
+
+
+def test_structure_cache_preserves_exact_budgeted_partitions() -> None:
+    rng = np.random.default_rng(123)
+    X = pd.DataFrame(
+        rng.normal(size=(160, 5)),
+        columns=[f"x{index}" for index in range(5)],
+    )
+    y = pd.Series(1.7 * X["x0"] - 0.8 * X["x2"] + rng.normal(scale=0.05, size=len(X)))
+    X_route = pd.DataFrame(
+        rng.normal(size=(17, 5)),
+        columns=X.columns,
+    )
+    base_kwargs = {
+        "n_partitions": 3,
+        "partition_selection_method": "auto",
+        "cluster_algorithms": ("kmeans",),
+        "cluster_selection_metric": "balanced_silhouette",
+        "cluster_ensemble_method": "best_score",
+        "min_partitions": 2,
+        "max_partitions": 3,
+        "min_auto_partition_size": 1,
+        "n_views": "auto",
+        "min_views": 2,
+        "max_views": 4,
+        "spectrum_stability_tolerance": 1e-12,
+        "projection_dim": 3,
+        "backend": "numpy",
+        "random_state": 77,
+        "show_progress": False,
+        "structure_cache_key": "rmt_exact_equivalence_test",
+    }
+
+    RMTContractionTensorSampler._STRUCTURE_CACHE.clear()
+    RMTContractionTensorSampler._STRUCTURE_CACHE_ORDER.clear()
+    warm = RMTContractionTensorSampler(
+        sampling_budget_ratio=0.25,
+        **base_kwargs,
+    ).fit(X, target=y)
+    cached = RMTContractionTensorSampler(
+        sampling_budget_ratio=0.50,
+        **base_kwargs,
+    ).fit(X, target=y)
+
+    RMTContractionTensorSampler._STRUCTURE_CACHE.clear()
+    RMTContractionTensorSampler._STRUCTURE_CACHE_ORDER.clear()
+    cold = RMTContractionTensorSampler(
+        sampling_budget_ratio=0.50,
+        **base_kwargs,
+    ).fit(X, target=y)
+
+    assert warm.diagnostics_["runtime"]["structure_cache_hit"] is False
+    assert cached.diagnostics_["runtime"]["structure_cache_hit"] is True
+    assert cold.diagnostics_["runtime"]["structure_cache_hit"] is False
+    assert warm.n_views == 4
+    assert cached.n_views == cold.n_views == warm.n_views
+    assert cached.diagnostics_["n_views"] == cold.diagnostics_["n_views"] == 4
+    assert (
+        warm.diagnostics_["classification_partition_budget_plan"]["total_budget"]
+        == 40
+    )
+    assert (
+        cached.diagnostics_["classification_partition_budget_plan"]["total_budget"]
+        == cold.diagnostics_["classification_partition_budget_plan"]["total_budget"]
+        == 80
+    )
+    assert np.array_equal(cached.cluster_labels_, cold.cluster_labels_)
+    assert cached.partitions.keys() == cold.partitions.keys()
+    for name in cached.partitions:
+        assert np.array_equal(cached.partitions[name], cold.partitions[name])
+    assert (
+        cached.diagnostics_["partition_budget_plan"]
+        == cold.diagnostics_["partition_budget_plan"]
+    )
+    assert np.array_equal(
+        cached.predict_partition_proba(X_route),
+        cold.predict_partition_proba(X_route),
+    )
+
+
+def test_raw_feature_structure_cache_refreshes_budget_diagnostics() -> None:
+    rng = np.random.default_rng(321)
+    X = pd.DataFrame(
+        rng.normal(size=(160, 5)),
+        columns=[f"x{index}" for index in range(5)],
+    )
+    y = pd.Series(0.9 * X["x1"] - 0.4 * X["x3"])
+    base_kwargs = {
+        "n_partitions": 3,
+        "partition_selection_method": "auto",
+        "cluster_algorithms": ("kmeans",),
+        "cluster_selection_metric": "balanced_silhouette",
+        "cluster_ensemble_method": "best_score",
+        "min_partitions": 2,
+        "max_partitions": 3,
+        "min_auto_partition_size": 1,
+        "backend": "numpy",
+        "random_state": 79,
+        "show_progress": False,
+        "structure_cache_key": "raw_feature_budget_diagnostics_test",
+    }
+
+    RMTContractionTensorSampler._STRUCTURE_CACHE.clear()
+    RMTContractionTensorSampler._STRUCTURE_CACHE_ORDER.clear()
+    warm = RawFeatureClusterSampler(
+        sampling_budget_ratio=0.25,
+        **base_kwargs,
+    ).fit(X, target=y)
+    cached = RawFeatureClusterSampler(
+        sampling_budget_ratio=0.50,
+        **base_kwargs,
+    ).fit(X, target=y)
+
+    RMTContractionTensorSampler._STRUCTURE_CACHE.clear()
+    RMTContractionTensorSampler._STRUCTURE_CACHE_ORDER.clear()
+    cold = RawFeatureClusterSampler(
+        sampling_budget_ratio=0.50,
+        **base_kwargs,
+    ).fit(X, target=y)
+
+    assert warm.diagnostics_["structure_cache_hit"] is False
+    assert cached.diagnostics_["structure_cache_hit"] is True
+    assert cold.diagnostics_["structure_cache_hit"] is False
+    assert (
+        warm.diagnostics_["classification_partition_budget_plan"]["total_budget"]
+        == 40
+    )
+    assert (
+        cached.diagnostics_["classification_partition_budget_plan"]["total_budget"]
+        == cold.diagnostics_["classification_partition_budget_plan"]["total_budget"]
+        == 80
+    )
+    assert cached.partitions.keys() == cold.partitions.keys()
+    for name in cached.partitions:
+        assert np.array_equal(cached.partitions[name], cold.partitions[name])
 
 
 @pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch is optional")

@@ -1,5 +1,6 @@
 # model_integration.py
 import copy
+import json
 import pickle
 import os
 from time import perf_counter
@@ -48,6 +49,9 @@ class SamplingEnsemble:
     """
 
     _PARTITION_CACHE: Dict[str, Dict[str, Any]] = {}
+    _PARTITION_CACHE_ORDER: List[str] = []
+    _TRAINED_PARTITION_CACHE: Dict[str, Dict[str, Any]] = {}
+    _TRAINED_PARTITION_CACHE_ORDER: List[str] = []
 
     def __init__(self,
                  problem: str,
@@ -79,6 +83,9 @@ class SamplingEnsemble:
         self.model_factory = model_factory
         self.ensemble_method = ensemble_method
         self.show_progress = show_progress
+        self.validation_pruning = self._normalize_validation_pruning(
+            self.partitioner_config.get('validation_pruning', True)
+        )
         self.partition_model_mode = normalize_partition_model_mode(
             self.partitioner_config.get('partition_model_mode')
         )
@@ -112,6 +119,22 @@ class SamplingEnsemble:
         self.classes_ = None
         self.class_coverage_repairs_ = {}
         self.budget_policy_ = {'applied': False}
+        self.partition_cache_status_ = 'disabled'
+        self.trained_partition_cache_status_ = 'disabled'
+
+    @staticmethod
+    def _normalize_validation_pruning(value: Any) -> bool:
+        if isinstance(value, (bool, np.bool_)):
+            return bool(value)
+        normalized = str(value).strip().lower()
+        if normalized in {'true', '1', 'on', 'enabled', 'enable'}:
+            return True
+        if normalized in {'false', '0', 'off', 'disabled', 'disable'}:
+            return False
+        raise ValueError(
+            "validation_pruning must be a boolean or one of "
+            "on/off, enabled/disabled"
+        )
 
     def _log(self, message: str) -> None:
         progress_write(message, enabled=self.show_progress)
@@ -133,16 +156,22 @@ class SamplingEnsemble:
                 total=4,
             ) as stage:
                 started = perf_counter()
+                self._log(f"[partitioning 1/6] Resolve configuration for strategy={strategy_name}")
                 strategy_kwargs = self._build_partitioner_kwargs(strategy_name, random_state)
                 timings['config_resolution'] = perf_counter() - started
                 stage.update(1)
 
                 started = perf_counter()
+                self._log("[partitioning 2/6] Initialize partitioner")
                 self.partitioner = self._create_partitioner(strategy_name, strategy_kwargs)
                 timings['partitioner_initialization'] = perf_counter() - started
                 stage.update(1)
 
                 started = perf_counter()
+                self._log(
+                    f"[partitioning 3/6] Apply pre-partition budget "
+                    f"(stage={self._budget_application_stage()}, ratio={self._budget_ratio()})"
+                )
                 partition_features, partition_target = self._apply_budget_policy_before_partitioning(
                     features=features,
                     target=target,
@@ -151,8 +180,13 @@ class SamplingEnsemble:
                 timings['pre_partition_budget_application'] = perf_counter() - started
 
                 started = perf_counter()
+                self._log("[partitioning 4/6] Look up reusable base partitions")
                 cached_partitions = self._load_cached_base_partitions()
                 if cached_partitions is None:
+                    self._log(
+                        f"[cache] base_partitions={self.partition_cache_status_}; "
+                        "fit partitioner and collect chunks"
+                    )
                     self.partitions = self._fit_and_collect_partitions(
                         self.partitioner,
                         strategy_name,
@@ -161,11 +195,13 @@ class SamplingEnsemble:
                     )
                     self._store_cached_base_partitions(self.partitions)
                 else:
+                    self._log("[cache] base_partitions=hit; reuse partitioner and chunks")
                     self.partitions = cached_partitions
                 stage.update(1)
                 timings['partitioner_fit_and_collect'] = perf_counter() - started
 
                 started = perf_counter()
+                self._log("[partitioning 5/6] Apply post-partition row budget")
                 if self._budget_application_stage() == 'after_partitioning':
                     self.partitions = self._apply_budget_policy_to_partitions(
                         partitions=self.partitions,
@@ -176,6 +212,7 @@ class SamplingEnsemble:
                 timings['budget_application'] = perf_counter() - started
 
             started = perf_counter()
+            self._log("[partitioning 6/6] Build partition diagnostics")
             diagnostics_target = partition_target if self._budget_application_stage() == 'before_partitioning' else target
             self.partition_diagnostics_ = self._build_partition_target_diagnostics(self.partitions, diagnostics_target)
             self.partition_size_diagnostics_contract_ = (
@@ -184,6 +221,9 @@ class SamplingEnsemble:
             timings['partition_diagnostics'] = perf_counter() - started
             timings['total'] = perf_counter() - partition_started
             self.runtime_diagnostics_['partitioning'] = timings
+            self.runtime_diagnostics_['cache'] = {
+                'base_partitions': self.partition_cache_status_,
+            }
             self._log_partition_summary(self.partitions)
             return self.partitions
 
@@ -207,6 +247,7 @@ class SamplingEnsemble:
             'budget_ratio',
             'budget_application',
             '_partition_cache_key',
+            '_trained_partition_cache_key',
             'experiment_chunk_fraction',
             'experiment_scenario',
             'force_chunking',
@@ -262,7 +303,7 @@ class SamplingEnsemble:
         allowed_keys = allowed_by_strategy.get(strategy_name)
         if allowed_keys is not None:
             return {key: value for key, value in strategy_kwargs.items() if key in allowed_keys}
-        if strategy_name == 'rmt_contraction':
+        if strategy_name in {'rmt_contraction', 'raw_feature_clustering'}:
             strategy_kwargs.setdefault('show_progress', self.show_progress)
             budget_ratio = self.partitioner_config.get('budget_ratio')
             if budget_ratio is not None:
@@ -497,10 +538,15 @@ class SamplingEnsemble:
     def _load_cached_base_partitions(self) -> Optional[Dict[str, Any]]:
         cache_key = self.partitioner_config.get('_partition_cache_key')
         if not cache_key:
+            self.partition_cache_status_ = 'disabled'
             return None
-        cached = self._PARTITION_CACHE.get(str(cache_key))
+        normalized_key = str(cache_key)
+        cached = self._PARTITION_CACHE.get(normalized_key)
         if cached is None:
+            self.partition_cache_status_ = 'miss'
             return None
+        self.partition_cache_status_ = 'hit'
+        self._touch_partition_cache_key(normalized_key)
         self.partitioner = cached['partitioner']
         self.budget_policy_ = copy.deepcopy(cached.get('budget_policy', {'applied': False}))
         return copy.deepcopy(cached['partitions'])
@@ -509,11 +555,44 @@ class SamplingEnsemble:
         cache_key = self.partitioner_config.get('_partition_cache_key')
         if not cache_key:
             return
-        self._PARTITION_CACHE[str(cache_key)] = {
+        if self._partition_cache_limit() <= 0:
+            self._evict_partition_cache_if_needed()
+            return
+        normalized_key = str(cache_key)
+        self._PARTITION_CACHE[normalized_key] = {
             'partitioner': self.partitioner,
             'partitions': copy.deepcopy(partitions),
             'budget_policy': copy.deepcopy(getattr(self, 'budget_policy_', {'applied': False})),
         }
+        self._touch_partition_cache_key(normalized_key)
+        self._evict_partition_cache_if_needed()
+
+    @classmethod
+    def _partition_cache_limit(cls) -> int:
+        raw_value = os.getenv("SAMPLING_ZOO_PARTITION_CACHE_SIZE", "16")
+        try:
+            return max(0, int(raw_value))
+        except ValueError:
+            return 16
+
+    @classmethod
+    def _touch_partition_cache_key(cls, cache_key: str) -> None:
+        try:
+            cls._PARTITION_CACHE_ORDER.remove(cache_key)
+        except ValueError:
+            pass
+        cls._PARTITION_CACHE_ORDER.append(cache_key)
+
+    @classmethod
+    def _evict_partition_cache_if_needed(cls) -> None:
+        limit = cls._partition_cache_limit()
+        if limit <= 0:
+            cls._PARTITION_CACHE.clear()
+            cls._PARTITION_CACHE_ORDER.clear()
+            return
+        while len(cls._PARTITION_CACHE_ORDER) > limit:
+            old_key = cls._PARTITION_CACHE_ORDER.pop(0)
+            cls._PARTITION_CACHE.pop(old_key, None)
 
     def _apply_budget_policy_to_partitions(
         self,
@@ -991,7 +1070,10 @@ class SamplingEnsemble:
         if calculation_mode == 'batch':
             predict_labels, predict_proba = [], []
             batch_size = batch_size if batch_size is not None else self.bs_size
-            batch_data = [test_data.iloc[i:i + self.bs_size] for i in list(range(0, len(test_data), batch_size))]
+            batch_data = [
+                test_data.iloc[i:i + batch_size]
+                for i in range(0, len(test_data), batch_size)
+            ]
             for batch in progress_iter(
                 batch_data,
                 enabled=self.show_progress,
@@ -1091,6 +1173,10 @@ class SamplingEnsemble:
         Train models from independent or concatenated prepared partitions.
         """
         training_started = perf_counter()
+        self._log(
+            f"[training 1/4] Prepare chunks for strategy={self._strategy_name()} "
+            f"fold={cv_fold}"
+        )
         self._ensure_classification_classes(y_train, y_val)
         self.class_coverage_repairs_ = {}
         started = perf_counter()
@@ -1114,19 +1200,34 @@ class SamplingEnsemble:
         )
 
         started = perf_counter()
-        self._train_partition_loop(
-            partitions=training_partitions,
-            X_val=X_val,
-            y_val=y_val,
-            class_samples=class_samples,
-            cv_fold=cv_fold,
+        self._log("[training 2/4] Look up trained chunk models")
+        restored_from_cache = self._restore_cached_trained_partitions(
             validation_metric=validation_metric,
-            metric_is_better=metric_is_better,
-            train_all_chunks=train_all_chunks,
-            save_models_to_disk=save_models_to_disk,
         )
+        if not restored_from_cache:
+            self._log(
+                f"[cache] trained_chunk_models={self.trained_partition_cache_status_}; "
+                f"train {len(training_partitions)} chunk model(s)"
+            )
+            self._train_partition_loop(
+                partitions=training_partitions,
+                X_val=X_val,
+                y_val=y_val,
+                class_samples=class_samples,
+                cv_fold=cv_fold,
+                validation_metric=validation_metric,
+                metric_is_better=metric_is_better,
+                train_all_chunks=train_all_chunks,
+                save_models_to_disk=save_models_to_disk,
+            )
+            self._store_cached_trained_partitions(
+                validation_metric=validation_metric,
+            )
+        else:
+            self._log("[cache] trained_chunk_models=hit; skip chunk-model fitting")
         model_training_time = perf_counter() - started
         started = perf_counter()
+        self._log("[training 3/4] Finalize validation weights and router")
         self._finalize_partition_training(
             partitions=training_partitions,
             X_val=X_val,
@@ -1155,8 +1256,17 @@ class SamplingEnsemble:
                     for model_info in self.models
                 )
             ),
+            'restored_chunk_models_from_cache': bool(restored_from_cache),
             'total': float(perf_counter() - training_started),
         }
+        self.runtime_diagnostics_.setdefault('cache', {}).update({
+            'base_partitions': self.partition_cache_status_,
+            'trained_chunk_models': self.trained_partition_cache_status_,
+        })
+        self._log(
+            f"[training 4/4] Completed in "
+            f"{self.runtime_diagnostics_['training']['total']:.3f}s"
+        )
         stage_seconds = {
             f"partitioning.{name}": float(value)
             for name, value in self.runtime_diagnostics_.get('partitioning', {}).items()
@@ -1177,6 +1287,7 @@ class SamplingEnsemble:
                 'n_partitions': len(partitions),
                 'n_training_partitions': len(training_partitions),
                 'partition_model_mode': self.partition_model_mode.value,
+                'restored_chunk_models_from_cache': bool(restored_from_cache),
             },
         )
 
@@ -1255,6 +1366,121 @@ class SamplingEnsemble:
             return 'f1_weighted'
         return validation_metric
 
+    @classmethod
+    def _trained_partition_cache_limit(cls) -> int:
+        raw_value = os.getenv("SAMPLING_ZOO_TRAINED_PARTITION_CACHE_SIZE", "8")
+        try:
+            return max(0, int(raw_value))
+        except ValueError:
+            return 8
+
+    def _trained_partition_cache_key(self, validation_metric: str) -> Optional[str]:
+        raw_key = self.partitioner_config.get('_trained_partition_cache_key')
+        if not raw_key:
+            return None
+        return json.dumps(
+            {
+                "base": str(raw_key),
+                "validation_metric": validation_metric,
+                "problem": self.problem,
+                "partition_model_mode": self.partition_model_mode.value,
+            },
+            sort_keys=True,
+            default=str,
+        )
+
+    @staticmethod
+    def _clone_model_info_for_cache(model_info: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            key: value
+            for key, value in model_info.items()
+            if key
+            not in {
+                "local_metrics",
+                "local_assigned_count",
+                "local_mean_routing_probability",
+            }
+        }
+
+    @classmethod
+    def _touch_trained_partition_cache_key(cls, cache_key: str) -> None:
+        try:
+            cls._TRAINED_PARTITION_CACHE_ORDER.remove(cache_key)
+        except ValueError:
+            pass
+        cls._TRAINED_PARTITION_CACHE_ORDER.append(cache_key)
+
+    @classmethod
+    def _evict_trained_partition_cache_if_needed(cls) -> None:
+        limit = cls._trained_partition_cache_limit()
+        if limit <= 0:
+            cls._TRAINED_PARTITION_CACHE.clear()
+            cls._TRAINED_PARTITION_CACHE_ORDER.clear()
+            return
+        while len(cls._TRAINED_PARTITION_CACHE_ORDER) > limit:
+            old_key = cls._TRAINED_PARTITION_CACHE_ORDER.pop(0)
+            cls._TRAINED_PARTITION_CACHE.pop(old_key, None)
+
+    def _restore_cached_trained_partitions(self, validation_metric: str) -> bool:
+        cache_key = self._trained_partition_cache_key(validation_metric)
+        if cache_key is None:
+            self.trained_partition_cache_status_ = 'disabled'
+            return False
+        cached = self._TRAINED_PARTITION_CACHE.get(cache_key)
+        if cached is None:
+            self.trained_partition_cache_status_ = 'miss'
+            return False
+        cached_models = cached.get('models', [])
+        if not cached_models:
+            self._TRAINED_PARTITION_CACHE.pop(cache_key, None)
+            try:
+                self._TRAINED_PARTITION_CACHE_ORDER.remove(cache_key)
+            except ValueError:
+                pass
+            self.trained_partition_cache_status_ = 'miss'
+            return False
+        self.models = [
+            self._clone_model_info_for_cache(model_info)
+            for model_info in cached_models
+        ]
+        self.partition_metrics = copy.deepcopy(
+            cached.get('partition_metrics', {})
+        )
+        self.class_coverage_repairs_ = copy.deepcopy(
+            cached.get('class_coverage_repairs', {})
+        )
+        if self.class_coverage_repairs_:
+            self.partition_diagnostics_['class_coverage_repairs'] = dict(
+                self.class_coverage_repairs_
+            )
+        self._touch_trained_partition_cache_key(cache_key)
+        self.trained_partition_cache_status_ = 'hit'
+        self._log(
+            f"Reusing {len(self.models)} trained chunk models from cache."
+        )
+        return True
+
+    def _store_cached_trained_partitions(self, validation_metric: str) -> None:
+        cache_key = self._trained_partition_cache_key(validation_metric)
+        if cache_key is None:
+            return
+        if not self.models:
+            return
+        if self._trained_partition_cache_limit() <= 0:
+            return
+        self._TRAINED_PARTITION_CACHE[cache_key] = {
+            'models': [
+                self._clone_model_info_for_cache(model_info)
+                for model_info in self.models
+            ],
+            'partition_metrics': copy.deepcopy(self.partition_metrics),
+            'class_coverage_repairs': copy.deepcopy(
+                self.class_coverage_repairs_
+            ),
+        }
+        self._touch_trained_partition_cache_key(cache_key)
+        self._evict_trained_partition_cache_if_needed()
+
     def _train_partition_loop(
         self,
         partitions: Dict[str, Any],
@@ -1322,7 +1548,7 @@ class SamplingEnsemble:
         validation_metric: str,
         save_models_to_disk: bool,
     ) -> float:
-        model_info = self._train_single_partition_model(
+        self._train_single_partition_model(
             partition_name=partition_name,
             partition_data=partition_data,
             X_val=X_val,
@@ -1595,12 +1821,31 @@ class SamplingEnsemble:
                 partitions=partitions,
                 X_val=X_val,
                 y_val=y_val,
+                metric_is_better=metric_is_better,
                 validation_metric=validation_metric,
             )
             return
 
         full_metrics = self._evaluate_current_ensemble(X_val, y_val)
         self._log(f"Ensemble metrics before pruning: {full_metrics}")
+
+        if not self.validation_pruning:
+            best_score = full_metrics.get(validation_metric)
+            self._log(
+                "Validation pruning is disabled; keep all "
+                f"{len(self.models)} trained chunk experts"
+            )
+            self._log_active_chunk_summary("Active chunks without pruning")
+            self.validation_diagnostics_ = self._build_validation_diagnostics(
+                X_val=X_val,
+                y_val=y_val,
+                full_metrics=full_metrics,
+                reduced_metrics=full_metrics,
+                best_score=best_score,
+                validation_metric=validation_metric,
+                selection_policy='all_experts_no_pruning',
+            )
+            return
 
         _selected, best_score = self.select_best_models_forward(
             X_val=X_val,
@@ -1634,10 +1879,25 @@ class SamplingEnsemble:
         partitions: Dict[str, Any],
         X_val: pd.DataFrame,
         y_val: pd.Series,
+        metric_is_better: Callable,
         validation_metric: str,
     ) -> None:
         full_metrics = self._evaluate_current_ensemble(X_val, y_val)
         self._log(f"Routed MoE metrics before local calibration: {full_metrics}")
+
+        local_metric_keys = (
+            'local_metrics',
+            'local_assigned_count',
+            'local_mean_routing_probability',
+        )
+        model_local_state = [
+            {
+                key: (key in model_info, copy.deepcopy(model_info.get(key)))
+                for key in local_metric_keys
+            }
+            for model_info in self.models
+        ]
+        router_before_calibration = copy.deepcopy(self.router)
 
         local_metrics = self._build_local_validation_metrics(
             X_val,
@@ -1657,6 +1917,40 @@ class SamplingEnsemble:
             self._attach_local_validation_metrics(self.models, local_metrics)
 
         routed_metrics = self._evaluate_current_ensemble(X_val, y_val)
+        baseline_score = full_metrics.get(validation_metric)
+        calibrated_score = routed_metrics.get(validation_metric)
+        calibration_rejected = (
+            baseline_score is None
+            or calibrated_score is None
+            or not np.isfinite(float(calibrated_score))
+            or metric_is_better(float(baseline_score), float(calibrated_score))
+        )
+        if calibration_rejected:
+            self.router = router_before_calibration
+            self.router_mode = self.router.router_mode
+            for model_info, snapshot in zip(self.models, model_local_state):
+                for key, (was_present, value) in snapshot.items():
+                    if was_present:
+                        model_info[key] = value
+                    else:
+                        model_info.pop(key, None)
+            routed_metrics = full_metrics
+            calibration_diagnostics = {
+                'status': 'rejected_no_validation_improvement',
+                'baseline_metric': self._safe_float(baseline_score),
+                'calibrated_metric': self._safe_float(calibrated_score),
+            }
+            self._log(
+                "Local routing calibration rejected: "
+                f"{validation_metric} {calibrated_score} did not improve "
+                f"baseline {baseline_score}"
+            )
+        else:
+            calibration_diagnostics = {
+                'status': 'accepted',
+                'baseline_metric': self._safe_float(baseline_score),
+                'calibrated_metric': self._safe_float(calibrated_score),
+            }
         routing_refinement = self._run_routing_refinement(
             partitions=partitions,
             X_val=X_val,
@@ -1666,7 +1960,7 @@ class SamplingEnsemble:
         if routing_refinement.get('status') == 'completed':
             routed_metrics = self._evaluate_current_ensemble(X_val, y_val)
         best_score = routed_metrics.get(validation_metric)
-        self._log(f"Routed MoE metrics after local calibration: {routed_metrics}")
+        self._log(f"Routed MoE metrics after routing finalization: {routed_metrics}")
         self._log(f"Routed MoE validation metric ({validation_metric}): {best_score}")
         self._log_active_chunk_summary("Active chunks after routed calibration")
         self.validation_diagnostics_ = self._build_validation_diagnostics(
@@ -1677,6 +1971,7 @@ class SamplingEnsemble:
             best_score=best_score,
             validation_metric=validation_metric,
             selection_policy='moe_keep_routed_experts',
+            local_calibration_diagnostics=calibration_diagnostics,
             routing_refinement_diagnostics=routing_refinement,
         )
 
@@ -1834,6 +2129,7 @@ class SamplingEnsemble:
         best_score: Any,
         validation_metric: str,
         selection_policy: str,
+        local_calibration_diagnostics: Optional[Dict[str, Any]] = None,
         routing_refinement_diagnostics: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         active_models = list(self.models)
@@ -1849,6 +2145,9 @@ class SamplingEnsemble:
             'local_partition_metrics': self._build_local_validation_metrics(X_val, y_val, active_models),
             'router': dict(self.router.diagnostics_),
             'router_head': dict(self.router.diagnostics_),
+            'local_calibration': local_calibration_diagnostics or {
+                'status': 'not_applicable'
+            },
             'routing_refinement': routing_refinement_diagnostics or {'mode': 'none', 'status': 'disabled'},
         }
 
@@ -1947,7 +2246,7 @@ class SamplingEnsemble:
                     try:
                         proba = model_info['model'].predict_proba(features)
                         proba_predictions.append(proba)
-                    except:
+                    except Exception:
                         # Fallback to hard voting
                         proba_predictions.append(pd.get_dummies(model_info['model'].predict(features)))
 
@@ -2314,8 +2613,6 @@ class SingleModelImplementation(SamplingEnsemble):
             validation_metric = 'f1_weighted' if self.problem == 'classification' else 'rmse'
         elif validation_metric == 'f1':
             validation_metric = 'f1_weighted'
-
-        metric_is_better = get_metric_comparator(validation_metric)
 
         all_features = []
         all_targets = []

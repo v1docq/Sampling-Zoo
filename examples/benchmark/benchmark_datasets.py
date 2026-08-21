@@ -18,6 +18,22 @@ from sampling_zoo.core.utils.progress import progress_bar, progress_iter
 import openml
 
 
+# Stable OpenML task ids already used by the repository's recorded AMLB
+# regression experiments.  Resolving these directly avoids the comparatively
+# slow suite-wide ``list_tasks`` endpoint for the standard medium benchmark.
+KNOWN_OPENML_SUITE_TASK_IDS: dict[int, dict[str, int]] = {
+    269: {
+        "diamonds": 233211,
+        "house_16H": 359952,
+        "house_sales": 359949,
+        "elevators": 359936,
+        "pol": 359946,
+        "Brazilian_houses": 359938,
+        "OnlineNewsPopularity": 359941,
+    },
+}
+
+
 def _log_openml_status(message: str) -> None:
     print(f"[OpenML] {message}", flush=True)
 
@@ -571,8 +587,19 @@ def _get_openml_train_test_split_indices(task: Any, task_id: int) -> tuple[np.nd
 
 
 def _openml_task_cache_dir(task_id: int) -> Path:
-    cache_dir = Path(getattr(openml.config, "cache_directory", Path.home() / ".cache" / "openml"))
-    return cache_dir / "org" / "openml" / "www" / "tasks" / str(task_id)
+    get_cache_directory = getattr(openml.config, "get_cache_directory", None)
+    if callable(get_cache_directory):
+        # OpenML >= 0.15 returns the fully resolved API cache directory,
+        # including ``org/openml/www``.
+        cache_dir = Path(get_cache_directory())
+        return cache_dir / "tasks" / str(task_id)
+
+    # Compatibility with older OpenML releases, where ``cache_directory``
+    # referred to the cache root rather than the resolved API directory.
+    cache_root = Path(
+        getattr(openml.config, "cache_directory", Path.home() / ".cache" / "openml")
+    )
+    return cache_root / "org" / "openml" / "www" / "tasks" / str(task_id)
 
 
 def _load_cached_openml_split_npz(task_id: int) -> Optional[tuple[np.ndarray, np.ndarray]]:
@@ -720,6 +747,39 @@ def _load_suite_group(
         f"Loading {expected_problem_type} suite {suite_id}; "
         f"requested tasks: {list(requested_task_names)}"
     )
+    known_task_ids = KNOWN_OPENML_SUITE_TASK_IDS.get(int(suite_id), {})
+    requested_names = list(requested_task_names)
+    if all(name in known_task_ids for name in requested_names):
+        _log_openml_status(
+            f"Resolving {len(requested_names)} registered task id(s) directly; "
+            "skip suite-wide list_tasks."
+        )
+        bundles: list[OpenMLRawDatasetBundle] = []
+        task_iter = progress_iter(
+            requested_names,
+            enabled=show_progress,
+            total=len(requested_names),
+            desc=f"Resolve OpenML {expected_problem_type} tasks",
+        )
+        for requested_name in task_iter:
+            task_id = known_task_ids[requested_name]
+            bundle = load_suite_dataset(
+                task_id=task_id,
+                suite_id=suite_id,
+                task_name=requested_name,
+            )
+            if bundle.problem_type != expected_problem_type:
+                raise ValueError(
+                    f"Registered OpenML task {task_id} ({requested_name}) has "
+                    f"type {bundle.problem_type}, expected {expected_problem_type}."
+                )
+            _log_openml_status(
+                f"Resolved registered task {task_id} ({requested_name}): "
+                f"{bundle.metadata.n_objects} x {bundle.metadata.n_features}."
+            )
+            bundles.append(bundle)
+        return bundles
+
     suite = openml.study.get_suite(suite_id)
     task_ids = set(suite.tasks)
     if not task_ids:
@@ -762,7 +822,6 @@ def _load_suite_group(
         )
 
     available_names = set(suite_tasks_df["name"].astype(str).tolist())
-    requested_names = list(requested_task_names)
     missing = [name for name in requested_names if name not in available_names]
     if missing:
         _log_openml_status(

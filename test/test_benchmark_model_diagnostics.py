@@ -59,6 +59,8 @@ def test_unsupported_model_complexity_is_non_fatal() -> None:
     assert diagnostics == {
         "status": "unsupported",
         "model_type": "object",
+        "model_module": "builtins",
+        "model_params": {},
     }
 
 

@@ -54,7 +54,7 @@ from benchmark_adapters import _normalize_scores,_select_top_k_by_importance,_st
 from benchmark_repo import AMLB_CATEGORY_PROFILES
 from benchmark_sampling_strategies import make_strategies
 from benchmark_models import _to_dense
-from benchmark_model_diagnostics import summarize_ensemble_complexity
+from benchmark_model_diagnostics import describe_estimator, summarize_ensemble_complexity
 
 
 @dataclass
@@ -520,20 +520,47 @@ class EnsembleFoldBenchmarkExecutor:
         fold: FoldSplit,
     ) -> dict[str, Any]:
         plan = self._build_execution_plan(partitioner_config, train_size=len(fold.y_train))
+        event_details = {
+            "dataset": dataset.name,
+            "strategy": strategy_name,
+            "model": model_name,
+            "split": fold.split_label,
+            "seed": self.seed,
+            "budget_ratio": partitioner_config.get("budget_ratio"),
+            "ensemble_method": partitioner_config.get("ensemble_method"),
+            "n_train_initial": len(fold.y_train),
+            "n_test": len(fold.y_test),
+        }
         try:
-            with progress_bar(
-                enabled=self.show_progress,
-                desc=f"Fold pipeline ({dataset.name}/{strategy_name}/{model_name}/{fold.split_label})",
-                total=5,
-            ) as fold_stage:
-                fold = self._ensure_validation_split(dataset, partitioner_config, fold)
-                fold_stage.update(1)
+            with self.logger.stage("fold.pipeline", **event_details):
+                with progress_bar(
+                    enabled=self.show_progress,
+                    desc=f"Fold pipeline ({dataset.name}/{strategy_name}/{model_name}/{fold.split_label})",
+                    total=5,
+                ) as fold_stage:
+                    with self.logger.stage("fold.validation_split", **event_details):
+                        fold = self._ensure_validation_split(dataset, partitioner_config, fold)
+                    fold_stage.update(1)
 
-                X_train_df, X_val_df, X_test_df = self._ensure_fold_dataframes(dataset, fold)
-                fold_stage.update(1)
+                    with self.logger.stage("fold.dataframe_preparation", **event_details):
+                        X_train_df, X_val_df, X_test_df = self._ensure_fold_dataframes(dataset, fold)
+                    fold_stage.update(1)
 
-                if plan.use_direct_model:
-                    return self._run_direct_model_fold(
+                    if plan.use_direct_model:
+                        return self._run_direct_model_fold(
+                            dataset=dataset,
+                            strategy_name=strategy_name,
+                            partitioner_config=partitioner_config,
+                            model_name=model_name,
+                            model_factory=model_factory,
+                            fold=fold,
+                            plan=plan,
+                            X_train_df=X_train_df,
+                            X_test_df=X_test_df,
+                            fold_stage=fold_stage,
+                        )
+
+                    return self._run_ensemble_fold(
                         dataset=dataset,
                         strategy_name=strategy_name,
                         partitioner_config=partitioner_config,
@@ -542,23 +569,10 @@ class EnsembleFoldBenchmarkExecutor:
                         fold=fold,
                         plan=plan,
                         X_train_df=X_train_df,
+                        X_val_df=X_val_df,
                         X_test_df=X_test_df,
                         fold_stage=fold_stage,
                     )
-
-                return self._run_ensemble_fold(
-                    dataset=dataset,
-                    strategy_name=strategy_name,
-                    partitioner_config=partitioner_config,
-                    model_name=model_name,
-                    model_factory=model_factory,
-                    fold=fold,
-                    plan=plan,
-                    X_train_df=X_train_df,
-                    X_val_df=X_val_df,
-                    X_test_df=X_test_df,
-                    fold_stage=fold_stage,
-                )
         except Exception as ex:
             return self._log_failed_fold(
                 dataset=dataset,
@@ -641,8 +655,17 @@ class EnsembleFoldBenchmarkExecutor:
         )
         configured_partitions = int(partitioner_config.get("n_partitions", 1))
         effective_partitions = configured_partitions if force_chunking else max(1, int(np.ceil(train_size / 20000)))
-        target_chunks = 10
-        chunks_percent = min(100.0, 100.0 * target_chunks / max(1, effective_partitions))
+        configured_chunks_percent = partitioner_config.get("chunks_percent")
+        if configured_chunks_percent is None:
+            target_chunks = 10
+            chunks_percent = min(
+                100.0,
+                100.0 * target_chunks / max(1, effective_partitions),
+            )
+        else:
+            chunks_percent = float(configured_chunks_percent)
+            if not 0.0 < chunks_percent <= 100.0:
+                raise ValueError("chunks_percent must be in (0, 100]")
         use_direct_model = force_direct_model or (train_size < 20000 and not force_chunking)
         return FoldExecutionPlan(
             force_chunking=force_chunking,
@@ -747,6 +770,13 @@ class EnsembleFoldBenchmarkExecutor:
         X_test_df: pd.DataFrame,
         fold_stage: Any,
     ) -> dict[str, Any]:
+        event_details = {
+            "dataset": dataset.name,
+            "strategy": strategy_name,
+            "model": model_name,
+            "split": fold.split_label,
+            "seed": self.seed,
+        }
         X_fit_df, y_fit = self._apply_direct_model_budget(
             X_train_df=X_train_df,
             y_train=fold.y_train,
@@ -754,8 +784,9 @@ class EnsembleFoldBenchmarkExecutor:
             random_state=self.seed + fold.fold_idx,
         )
         fit_started = perf_counter()
-        model = model_factory()
-        model.fit(X_fit_df, y_fit)
+        with self.logger.stage("fold.direct_model_fit", **event_details, n_fit=len(y_fit)):
+            model = model_factory()
+            model.fit(X_fit_df, y_fit)
         fit_time = perf_counter() - fit_started
         fold_stage.update(1)
 
@@ -765,52 +796,53 @@ class EnsembleFoldBenchmarkExecutor:
             if dataset.problem_type == "classification"
             else None
         )
-        predictions, y_proba = self._predict_direct_model_batched(
-            model,
-            X_test_df,
-            dataset.problem_type,
-            classes=direct_classes,
-        )
+        with self.logger.stage("fold.direct_model_inference", **event_details, n_test=len(X_test_df)):
+            predictions, y_proba = self._predict_direct_model_batched(
+                model,
+                X_test_df,
+                dataset.problem_type,
+                classes=direct_classes,
+            )
         infer_time = perf_counter() - infer_started
         fold_stage.update(1)
 
-        model_metrics = calculate_metrics(
-            y_true=fold.y_test,
-            y_labels=predictions,
-            y_proba=y_proba if dataset.problem_type == "classification" else None,
-            problem_type=dataset.problem_type,
-            classes=(
-                direct_classes
-                if dataset.problem_type == "classification"
-                else None
-            ),
-        )
-        sample_stats = self._build_train_sample_stats(
-            y_train=y_fit,
-            problem_type=dataset.problem_type,
-            total_train_size=len(fold.y_train),
-        )
-        sample_stats["chunk_count"] = 1
-        sample_stats["chunk_size_mean"] = float(len(y_fit))
-        sample_stats["model_fit_rows_total"] = int(len(y_fit))
-        sample_stats["active_model_count"] = 1
-        model_complexity_diagnostics = summarize_ensemble_complexity(
-            ({"name": "full_dataset", "model": model},),
-            X_test_df,
-        )
-
-        payload = self._log_direct_model_fold(
-            dataset=dataset,
-            strategy_name=strategy_name,
-            partitioner_config=partitioner_config,
-            model_name=model_name,
-            fold=fold,
-            model_metrics=model_metrics,
-            fit_time=fit_time,
-            infer_time=infer_time,
-            sample_stats=sample_stats,
-            model_complexity_diagnostics=model_complexity_diagnostics,
-        )
+        with self.logger.stage("fold.metrics_and_artifacts", **event_details):
+            model_metrics = calculate_metrics(
+                y_true=fold.y_test,
+                y_labels=predictions,
+                y_proba=y_proba if dataset.problem_type == "classification" else None,
+                problem_type=dataset.problem_type,
+                classes=(
+                    direct_classes
+                    if dataset.problem_type == "classification"
+                    else None
+                ),
+            )
+            sample_stats = self._build_train_sample_stats(
+                y_train=y_fit,
+                problem_type=dataset.problem_type,
+                total_train_size=len(fold.y_train),
+            )
+            sample_stats["chunk_count"] = 1
+            sample_stats["chunk_size_mean"] = float(len(y_fit))
+            sample_stats["model_fit_rows_total"] = int(len(y_fit))
+            sample_stats["active_model_count"] = 1
+            model_complexity_diagnostics = summarize_ensemble_complexity(
+                ({"name": "full_dataset", "model": model},),
+                X_test_df,
+            )
+            payload = self._log_direct_model_fold(
+                dataset=dataset,
+                strategy_name=strategy_name,
+                partitioner_config=partitioner_config,
+                model_name=model_name,
+                fold=fold,
+                model_metrics=model_metrics,
+                fit_time=fit_time,
+                infer_time=infer_time,
+                sample_stats=sample_stats,
+                model_complexity_diagnostics=model_complexity_diagnostics,
+            )
         fold_stage.update(1)
         return payload
 
@@ -943,15 +975,40 @@ class EnsembleFoldBenchmarkExecutor:
         X_test_df: pd.DataFrame,
         fold_stage: Any,
     ) -> dict[str, Any]:
+        event_details = {
+            "dataset": dataset.name,
+            "strategy": strategy_name,
+            "model": model_name,
+            "split": fold.split_label,
+            "seed": self.seed,
+            "budget_ratio": partitioner_config.get("budget_ratio"),
+            "ensemble_method": partitioner_config.get("ensemble_method"),
+        }
         class_samples = None
         if dataset.problem_type == "classification":
             class_samples = self._class_representatives(X_train_df, fold.y_train, seed=self.seed + fold.fold_idx)
 
         tuned_partitioner_config = self._tune_partitioner_config(partitioner_config, plan)
+        structure_cache_key = self._build_sampler_structure_cache_key(
+            dataset=dataset,
+            fold=fold,
+            partitioner_config=tuned_partitioner_config,
+        )
+        if structure_cache_key is not None:
+            tuned_partitioner_config["structure_cache_key"] = structure_cache_key
         tuned_partitioner_config["_partition_cache_key"] = self._build_partition_cache_key(
             dataset=dataset,
             fold=fold,
             partitioner_config=tuned_partitioner_config,
+            model_name=model_name,
+        )
+        tuned_partitioner_config["_trained_partition_cache_key"] = (
+            self._build_trained_partition_cache_key(
+                dataset=dataset,
+                fold=fold,
+                partitioner_config=tuned_partitioner_config,
+                model_name=model_name,
+            )
         )
         ensemble = SamplingEnsemble(
             problem=dataset.problem_type,
@@ -962,80 +1019,149 @@ class EnsembleFoldBenchmarkExecutor:
         )
 
         fit_started = perf_counter()
-        ensemble.train_partition_models(
-            X_train=X_train_df,
-            y_train=fold.y_train,
-            X_val=X_val_df,
-            y_val=fold.y_val,
-            class_samples=class_samples,
-            cv_fold=fold.fold_idx,
-            validation_metric=(
-                primary_classification_metric(np.unique(np.asarray(fold.y_train)))
-                if dataset.problem_type == "classification"
-                else "rmse"
-            ),
-            train_all_chunks=True,
-            save_models_to_disk=False,
-        )
+        with self.logger.stage("fold.partition_and_train", **event_details):
+            ensemble.train_partition_models(
+                X_train=X_train_df,
+                y_train=fold.y_train,
+                X_val=X_val_df,
+                y_val=fold.y_val,
+                class_samples=class_samples,
+                cv_fold=fold.fold_idx,
+                validation_metric=(
+                    primary_classification_metric(np.unique(np.asarray(fold.y_train)))
+                    if dataset.problem_type == "classification"
+                    else "rmse"
+                ),
+                train_all_chunks=True,
+                save_models_to_disk=False,
+            )
         fit_time = perf_counter() - fit_started
         fold_stage.update(1)
 
-        infer_started = perf_counter()
-        y_proba = (
-            ensemble.ensemble_predict_proba_batch(
-                X_test_df,
-                batch_size=10000,
-            )
-            if dataset.problem_type == "classification"
-            else None
+        cache_details = self._cache_usage_details(ensemble)
+        print(
+            "[cache] "
+            + " ".join(f"{name}={status}" for name, status in cache_details.items()),
+            flush=True,
         )
-        predictions = (
-            ensemble._labels_from_proba(y_proba)
-            if y_proba is not None
-            else ensemble.ensemble_predict_batch(X_test_df, batch_size=10000)
+        self.logger.log_event(
+            "fold.cache_usage",
+            status="observed",
+            details={**event_details, **cache_details},
         )
-        infer_time = perf_counter() - infer_started
-        test_routing_diagnostics = ensemble.build_routing_diagnostics(X_test_df)
-        fold_stage.update(1)
 
-        model_metrics = calculate_metrics(
-            y_true=fold.y_test,
-            y_labels=predictions,
-            y_proba=y_proba,
-            problem_type=dataset.problem_type,
-            classes=(
-                ensemble._classification_classes()
+        infer_started = perf_counter()
+        with self.logger.stage("fold.ensemble_inference", **event_details, n_test=len(X_test_df)):
+            y_proba = (
+                ensemble.ensemble_predict_proba_batch(
+                    X_test_df,
+                    batch_size=10000,
+                )
                 if dataset.problem_type == "classification"
                 else None
-            ),
-        )
-        sample_stats, chunk_sizes = self._build_ensemble_sample_stats(
-            ensemble=ensemble,
-            y_train=fold.y_train,
-            problem_type=dataset.problem_type,
-        )
-        model_complexity_diagnostics = summarize_ensemble_complexity(
-            ensemble.models,
-            X_test_df,
-        )
-        payload = self._log_ensemble_fold(
-            dataset=dataset,
-            strategy_name=strategy_name,
-            tuned_partitioner_config=tuned_partitioner_config,
-            model_name=model_name,
-            fold=fold,
-            plan=plan,
-            ensemble=ensemble,
-            model_metrics=model_metrics,
-            fit_time=fit_time,
-            infer_time=infer_time,
-            sample_stats=sample_stats,
-            chunk_sizes=chunk_sizes,
-            test_routing_diagnostics=test_routing_diagnostics,
-            model_complexity_diagnostics=model_complexity_diagnostics,
-        )
+            )
+            predictions = (
+                ensemble._labels_from_proba(y_proba)
+                if y_proba is not None
+                else ensemble.ensemble_predict_batch(X_test_df, batch_size=10000)
+            )
+        infer_time = perf_counter() - infer_started
+        fold_stage.update(1)
+
+        with self.logger.stage("fold.metrics_and_artifacts", **event_details):
+            test_routing_diagnostics = ensemble.build_routing_diagnostics(X_test_df)
+            model_metrics = calculate_metrics(
+                y_true=fold.y_test,
+                y_labels=predictions,
+                y_proba=y_proba,
+                problem_type=dataset.problem_type,
+                classes=(
+                    ensemble._classification_classes()
+                    if dataset.problem_type == "classification"
+                    else None
+                ),
+            )
+            sample_stats, chunk_sizes = self._build_ensemble_sample_stats(
+                ensemble=ensemble,
+                y_train=fold.y_train,
+                problem_type=dataset.problem_type,
+            )
+            model_complexity_diagnostics = summarize_ensemble_complexity(
+                ensemble.models,
+                X_test_df,
+            )
+            payload = self._log_ensemble_fold(
+                dataset=dataset,
+                strategy_name=strategy_name,
+                tuned_partitioner_config=tuned_partitioner_config,
+                model_name=model_name,
+                fold=fold,
+                plan=plan,
+                ensemble=ensemble,
+                model_metrics=model_metrics,
+                fit_time=fit_time,
+                infer_time=infer_time,
+                sample_stats=sample_stats,
+                chunk_sizes=chunk_sizes,
+                test_routing_diagnostics=test_routing_diagnostics,
+                model_complexity_diagnostics=model_complexity_diagnostics,
+            )
         fold_stage.update(1)
         return payload
+
+    @staticmethod
+    def _cache_usage_details(ensemble: SamplingEnsemble) -> dict[str, str]:
+        sampler_runtime = getattr(ensemble.partitioner, "runtime_diagnostics_", {}) or {}
+        sampler_diagnostics = getattr(ensemble.partitioner, "diagnostics_", {}) or {}
+        base_partition_status = str(
+            getattr(ensemble, "partition_cache_status_", "unknown")
+        )
+        structure_configured = bool(ensemble.partitioner_config.get("structure_cache_key"))
+        structure_hit = sampler_runtime.get(
+            "structure_cache_hit",
+            sampler_diagnostics.get("structure_cache_hit"),
+        )
+        structure_status = (
+            "disabled"
+            if not structure_configured
+            else "not_checked_base_partitions_hit"
+            if base_partition_status == "hit"
+            else "hit" if bool(structure_hit) else "miss"
+        )
+        return {
+            "structure": structure_status,
+            "base_partitions": base_partition_status,
+            "trained_models": str(getattr(ensemble, "trained_partition_cache_status_", "unknown")),
+        }
+
+    @staticmethod
+    def _ensemble_compute_cost_diagnostics(
+        ensemble: SamplingEnsemble,
+        *,
+        n_test: int,
+        inference_batch_size: int = 10000,
+    ) -> dict[str, Any]:
+        cache_hit = getattr(ensemble, "trained_partition_cache_status_", None) == "hit"
+        runtime_contract = getattr(ensemble, "runtime_contract_", None)
+        runtime_metadata = (
+            getattr(runtime_contract, "metadata", {})
+            if runtime_contract is not None
+            else {}
+        )
+        training_partitions = int(
+            runtime_metadata.get("n_training_partitions", len(ensemble.models))
+        )
+        active_models = int(len(ensemble.models))
+        inference_batches = int(np.ceil(n_test / inference_batch_size)) if n_test else 0
+        return {
+            "chunk_model_fit_calls": 0 if cache_hit else training_partitions,
+            "chunk_model_fit_calls_avoided_by_cache": training_partitions if cache_hit else 0,
+            "active_model_count": active_models,
+            "test_model_predict_calls": active_models * inference_batches,
+            "test_rows_scored_total": active_models * int(n_test),
+            "routing_batch_calls": inference_batches if ensemble.ensemble_method == "routed_weighted" else 0,
+            "inference_batch_size": inference_batch_size,
+        }
 
     @staticmethod
     def _tune_partitioner_config(partitioner_config: Mapping[str, Any], plan: FoldExecutionPlan) -> dict[str, Any]:
@@ -1049,6 +1175,7 @@ class EnsembleFoldBenchmarkExecutor:
         dataset: RawDatasetBundle,
         fold: FoldSplit,
         partitioner_config: Mapping[str, Any],
+        model_name: str,
     ) -> str:
         budget_application = str(partitioner_config.get("budget_application", "after_partitioning")).strip().lower()
         cache_config = {
@@ -1074,14 +1201,22 @@ class EnsembleFoldBenchmarkExecutor:
                 "em_min_partition_size",
                 "em_refit_router",
                 "em_keep_best",
+                "validation_pruning",
                 "_partition_cache_key",
             }
         }
         strategy_name = str(partitioner_config.get("strategy", "")).strip().lower()
+        selection_metric = str(
+            partitioner_config.get("cluster_selection_metric", "")
+        ).strip().lower()
         if (
             budget_application in {"before", "before_partitioning", "pre", "pre_partitioning"}
-            or strategy_name == "rmt_contraction"
+            or strategy_name in {"rmt_contraction", "raw_feature_clustering"}
         ):
+            # Both spectral samplers materialize budgeted rows while building
+            # their partitions.  Their expensive representation/cluster
+            # structure has a separate budget-independent cache, but the
+            # materialized base partitions must never cross budget boundaries.
             cache_config["budget_ratio"] = partitioner_config.get("budget_ratio")
         return json.dumps(
             {
@@ -1091,6 +1226,121 @@ class EnsembleFoldBenchmarkExecutor:
                 "task_id": getattr(dataset, "task_id", None),
                 "split_label": fold.split_label,
                 "n_train": len(fold.y_train),
+                "partition_model": (
+                    model_name
+                    if selection_metric == "downstream_proxy"
+                    else None
+                ),
+                "config": cache_config,
+            },
+            sort_keys=True,
+            default=str,
+        )
+
+    @staticmethod
+    def _build_sampler_structure_cache_key(
+        dataset: RawDatasetBundle,
+        fold: FoldSplit,
+        partitioner_config: Mapping[str, Any],
+    ) -> str | None:
+        strategy_name = str(partitioner_config.get("strategy", "")).strip().lower()
+        budget_application = str(partitioner_config.get("budget_application", "after_partitioning")).strip().lower()
+        if strategy_name not in {"rmt_contraction", "raw_feature_clustering"}:
+            return None
+        if budget_application in {"before", "before_partitioning", "pre", "pre_partitioning"}:
+            return None
+        cache_config = {
+            key: value
+            for key, value in partitioner_config.items()
+            if key
+            not in {
+                "budget_ratio",
+                "ensemble_method",
+                "router",
+                "gating_hidden_dim",
+                "gating_epochs",
+                "gating_lr",
+                "gating_kl_weight",
+                "gating_balance_weight",
+                "gating_weight_decay",
+                "gating_batch_size",
+                "gating_device",
+                "routing_refinement",
+                "em_max_iterations",
+                "em_min_improvement",
+                "em_assignment_policy",
+                "em_min_partition_size",
+                "em_refit_router",
+                "em_keep_best",
+                "validation_pruning",
+                "_partition_cache_key",
+                "_trained_partition_cache_key",
+                "structure_cache_key",
+            }
+        }
+        return json.dumps(
+            {
+                "dataset": dataset.name,
+                "problem_type": dataset.problem_type,
+                "source_path": dataset.source_path,
+                "task_id": getattr(dataset, "task_id", None),
+                "split_label": fold.split_label,
+                "n_train": len(fold.y_train),
+                "config": cache_config,
+            },
+            sort_keys=True,
+            default=str,
+        )
+
+    @staticmethod
+    def _build_trained_partition_cache_key(
+        dataset: RawDatasetBundle,
+        fold: FoldSplit,
+        partitioner_config: Mapping[str, Any],
+        model_name: str,
+    ) -> str | None:
+        routing_refinement = str(
+            partitioner_config.get("routing_refinement", "none")
+        ).strip().lower()
+        if routing_refinement not in {"", "none", "off", "disabled"}:
+            return None
+        cache_config = {
+            key: value
+            for key, value in partitioner_config.items()
+            if key
+            not in {
+                "ensemble_method",
+                "router",
+                "gating_hidden_dim",
+                "gating_epochs",
+                "gating_lr",
+                "gating_kl_weight",
+                "gating_balance_weight",
+                "gating_weight_decay",
+                "gating_batch_size",
+                "gating_device",
+                "routing_refinement",
+                "em_max_iterations",
+                "em_min_improvement",
+                "em_assignment_policy",
+                "em_min_partition_size",
+                "em_refit_router",
+                "em_keep_best",
+                "validation_pruning",
+                "_partition_cache_key",
+                "_trained_partition_cache_key",
+            }
+        }
+        return json.dumps(
+            {
+                "dataset": dataset.name,
+                "problem_type": dataset.problem_type,
+                "source_path": dataset.source_path,
+                "task_id": getattr(dataset, "task_id", None),
+                "split_label": fold.split_label,
+                "n_train": len(fold.y_train),
+                "n_val": len(fold.y_val),
+                "model": model_name,
                 "config": cache_config,
             },
             sort_keys=True,
@@ -1253,6 +1503,13 @@ class EnsembleFoldBenchmarkExecutor:
                 "model_complexity_diagnostics": dict(
                     model_complexity_diagnostics
                 ),
+                "compute_cost_diagnostics": {
+                    "model_fit_calls": 1,
+                    "model_fit_rows_total": int(sample_stats.get("sample_size", len(fold.y_train))),
+                    "test_model_predict_calls": int(np.ceil(len(fold.y_test) / 1000)),
+                    "test_rows_scored_total": int(len(fold.y_test)),
+                    "inference_batch_size": 1000,
+                },
             },
         )
 
@@ -1312,6 +1569,20 @@ class EnsembleFoldBenchmarkExecutor:
                 "sampler_diagnostics": getattr(ensemble.partitioner, "diagnostics_", {}),
                 "budget_policy": getattr(ensemble, "budget_policy_", {}),
                 "runtime_diagnostics": getattr(ensemble, "runtime_diagnostics_", {}),
+                "cache_usage": self._cache_usage_details(ensemble),
+                "partitioner_implementation": {
+                    "partitioner_type": type(ensemble.partitioner).__name__,
+                    "partitioner_module": type(ensemble.partitioner).__module__,
+                    "support_model": (
+                        describe_estimator(ensemble.partitioner.model)
+                        if getattr(ensemble.partitioner, "model", None) is not None
+                        else None
+                    ),
+                },
+                "compute_cost_diagnostics": self._ensemble_compute_cost_diagnostics(
+                    ensemble,
+                    n_test=len(fold.y_test),
+                ),
                 "model_complexity_diagnostics": dict(
                     model_complexity_diagnostics
                 ),
@@ -1436,6 +1707,9 @@ class EnsembleFoldBenchmarkExecutor:
             "n_train": int(len(fold.X_train)),
             "n_val": int(len(fold.X_val)),
             "n_test": int(len(fold.X_test)),
+            "validation_fraction": float(
+                len(fold.X_val) / max(len(fold.X_train) + len(fold.X_val), 1)
+            ),
             "task_id": task_id,
             "task_name": getattr(dataset, "task_name", None),
             "suite_id": getattr(dataset, "suite_id", None),
@@ -1443,6 +1717,7 @@ class EnsembleFoldBenchmarkExecutor:
             "openml_repeat": 0 if task_id is not None else None,
             "openml_fold": 0 if task_id is not None else None,
             "openml_sample": 0 if task_id is not None else None,
+            "seed": self.seed,
             "leaf_run_key": leaf_run.key,
             "leaf_run": leaf_run.to_dict(),
         }

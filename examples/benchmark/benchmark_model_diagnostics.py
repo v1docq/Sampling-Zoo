@@ -13,11 +13,12 @@ def summarize_model_complexity(
     *,
     shap_sample_size: int = 256,
 ) -> dict[str, Any]:
+    identity = describe_estimator(model)
     booster = getattr(model, "booster_", None)
     if booster is None:
         return {
             "status": "unsupported",
-            "model_type": type(model).__name__,
+            **identity,
         }
 
     try:
@@ -26,7 +27,7 @@ def summarize_model_complexity(
     except Exception as exc:
         return {
             "status": "failed",
-            "model_type": type(model).__name__,
+            **identity,
             "error_type": type(exc).__name__,
             "error": str(exc),
         }
@@ -38,11 +39,48 @@ def summarize_model_complexity(
     )
     return {
         "status": "ok",
-        "model_type": type(model).__name__,
+        **identity,
         **tree_diagnostics,
         **importance_diagnostics,
         "shap": shap_diagnostics,
     }
+
+
+def describe_estimator(model: Any) -> dict[str, Any]:
+    """Capture an estimator's effective public parameters in JSON-safe form."""
+    params: Mapping[str, Any] = {}
+    if hasattr(model, "get_params"):
+        try:
+            params = model.get_params(deep=False)
+        except Exception:
+            params = {}
+    return {
+        "model_type": type(model).__name__,
+        "model_module": type(model).__module__,
+        "model_params": _safe_parameter_value(dict(params)),
+    }
+
+
+def _safe_parameter_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Mapping):
+        return {
+            str(key): (
+                "<redacted>"
+                if any(
+                    marker in str(key).lower()
+                    for marker in ("api_key", "password", "secret", "credential", "access_token")
+                )
+                else _safe_parameter_value(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_safe_parameter_value(item) for item in value]
+    return repr(value)
 
 
 def summarize_ensemble_complexity(

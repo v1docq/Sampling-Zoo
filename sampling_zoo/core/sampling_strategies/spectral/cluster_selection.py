@@ -948,6 +948,10 @@ class SpectralClusterSelector:
             "cluster_ensemble_method": self.ensemble_method,
             "max_cluster_imbalance_ratio": float(self.max_cluster_imbalance_ratio),
             "min_cluster_fraction": float(self.min_cluster_fraction),
+            "imbalance_penalty_weight": float(self.imbalance_penalty_weight),
+            "tiny_cluster_penalty_weight": float(self.tiny_cluster_penalty_weight),
+            "target_contrast_weight": float(self.target_contrast_weight),
+            "hard_constraint_penalty": 1.0,
             "cluster_target_type": self.target_type,
             "resolved_cluster_target_type": (
                 scoring_context.resolved_target_type

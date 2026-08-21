@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+import traceback
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -212,13 +214,13 @@ def make_rmt_strategy_grid(
         else:
             strategy_view_strategies = (None,)
         for view_strategy in strategy_view_strategies:
-            for ensemble_method in ensemble_methods:
-                strategy_router_modes: Sequence[str | None]
-                if strategy in routed_strategy_names and ensemble_method == "routed_weighted":
-                    strategy_router_modes = tuple(router_modes)
-                else:
-                    strategy_router_modes = (None,)
-                for budget_ratio in budget_ratios:
+            for budget_ratio in budget_ratios:
+                for ensemble_method in ensemble_methods:
+                    strategy_router_modes: Sequence[str | None]
+                    if strategy in routed_strategy_names and ensemble_method == "routed_weighted":
+                        strategy_router_modes = tuple(router_modes)
+                    else:
+                        strategy_router_modes = (None,)
                     for router in strategy_router_modes:
                         grid.append(
                             RMTStrategyGridPoint(
@@ -556,6 +558,12 @@ class RMTRegressionExperimentOrchestrator:
             "status": status,
             "records": len(run_records),
             "experiment_plan": None if self.experiment_plan is None else self.experiment_plan.to_dict(),
+            "effective_config": json_ready(asdict(self.config)),
+            "logs": {
+                "console": str(logger.console_log_path),
+                "events": str(logger.events_path),
+                "environment": str(logger.environment_path),
+            },
         }
 
     def _write_run_metadata(self, logger: BenchmarkLogger, run_records: Sequence[Mapping[str, Any]]) -> None:
@@ -577,32 +585,80 @@ class RMTRegressionExperimentOrchestrator:
 
     def _execute_experiment_plan(self, plan: ExperimentPlan) -> Path:
         context: dict[str, Any] = {}
-        for stage_id in plan.stage_ids():
-            if stage_id == ExperimentStageId.PREPARE_RUNTIME:
-                self._prepare_runtime()
-            elif stage_id == ExperimentStageId.CREATE_LOGGER:
-                context["logger"] = self._create_logger()
-            elif stage_id == ExperimentStageId.CREATE_RUNNER:
-                context["runner"] = self._create_runner(context["logger"])
-            elif stage_id == ExperimentStageId.LOAD_DATASETS:
-                context["datasets"] = self._load_available_datasets()
-            elif stage_id == ExperimentStageId.BUILD_STRATEGY_GRID:
-                context["strategy_grid"] = self._build_strategy_grid()
-            elif stage_id == ExperimentStageId.RUN_DATASETS:
-                context["run_records"] = self._run_experiment(
-                    context["datasets"],
-                    context["strategy_grid"],
-                    context["runner"],
+        console_capture = None
+        completed = False
+        try:
+            for stage_id in plan.stage_ids():
+                logger = context.get("logger")
+                stage_context = (
+                    logger.stage(f"experiment.{stage_id.value}")
+                    if logger is not None
+                    else nullcontext()
                 )
-            elif stage_id == ExperimentStageId.BUILD_REPORTS:
-                self._build_report_artifacts(context["run_records"], context["logger"])
-            elif stage_id == ExperimentStageId.WRITE_METADATA:
-                self._write_run_metadata(context["logger"], context["run_records"])
-            elif stage_id == ExperimentStageId.FINALIZE:
-                context["result_path"] = self._announce_completion(context["logger"])
-            else:
-                raise RuntimeError(f"Unsupported experiment stage: {stage_id}")
-        return context["result_path"]
+                with stage_context:
+                    if stage_id == ExperimentStageId.PREPARE_RUNTIME:
+                        self._prepare_runtime()
+                    elif stage_id == ExperimentStageId.CREATE_LOGGER:
+                        context["logger"] = self._create_logger()
+                        console_capture = context["logger"].start_console_capture()
+                        context["logger"].log_event(
+                            "experiment",
+                            status="started",
+                            details={"plan": plan.to_dict()},
+                        )
+                        print(
+                            "Benchmark logs: "
+                            f"console={context['logger'].console_log_path}, "
+                            f"events={context['logger'].events_path}",
+                            flush=True,
+                        )
+                    elif stage_id == ExperimentStageId.CREATE_RUNNER:
+                        context["runner"] = self._create_runner(context["logger"])
+                    elif stage_id == ExperimentStageId.LOAD_DATASETS:
+                        context["datasets"] = self._load_available_datasets()
+                    elif stage_id == ExperimentStageId.BUILD_STRATEGY_GRID:
+                        context["strategy_grid"] = self._build_strategy_grid()
+                    elif stage_id == ExperimentStageId.RUN_DATASETS:
+                        context["run_records"] = self._run_experiment(
+                            context["datasets"],
+                            context["strategy_grid"],
+                            context["runner"],
+                        )
+                    elif stage_id == ExperimentStageId.BUILD_REPORTS:
+                        self._build_report_artifacts(context["run_records"], context["logger"])
+                    elif stage_id == ExperimentStageId.WRITE_METADATA:
+                        self._write_run_metadata(context["logger"], context["run_records"])
+                    elif stage_id == ExperimentStageId.FINALIZE:
+                        context["result_path"] = self._announce_completion(context["logger"])
+                    else:
+                        raise RuntimeError(f"Unsupported experiment stage: {stage_id}")
+            completed = True
+            return context["result_path"]
+        except BaseException:
+            if context.get("logger") is not None:
+                traceback.print_exc()
+            raise
+        finally:
+            logger = context.get("logger")
+            if logger is not None:
+                logger.log_event(
+                    "experiment",
+                    status="completed" if completed else "failed",
+                )
+            if console_capture is not None:
+                console_capture.close()
+            if (
+                completed
+                and logger is not None
+                and self.run_identity is not None
+                and "run_records" in context
+            ):
+                materialize_experiment_artifact_manifest(
+                    run_dir=logger.paths.root,
+                    run_identity=self.run_identity,
+                    status="completed",
+                    records=context["run_records"],
+                )
 
     def run(self) -> Path:
         plan = self._build_experiment_plan()

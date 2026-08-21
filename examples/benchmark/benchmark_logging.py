@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 import json
+import os
+import platform
+import resource
+import sys
+import threading
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
+from importlib import metadata
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 import numpy as np
@@ -20,6 +28,8 @@ def _json_ready(value: Any) -> Any:
         return [_json_ready(v) for v in value]
     if isinstance(value, np.ndarray):
         return value.tolist()
+    if isinstance(value, Path):
+        return str(value)
     if isinstance(value, (np.integer,)):
         return int(value)
     if isinstance(value, (np.floating,)):
@@ -27,6 +37,90 @@ def _json_ready(value: Any) -> Any:
     if isinstance(value, (np.bool_,)):
         return bool(value)
     return value
+
+
+def _compact_details(details: Mapping[str, Any]) -> str:
+    return " ".join(
+        f"{key}={value}"
+        for key, value in details.items()
+        if value is not None
+    )
+
+
+def _process_resource_snapshot() -> Dict[str, Any]:
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    max_rss = float(usage.ru_maxrss)
+    # Linux reports KiB while macOS reports bytes.
+    max_rss_bytes = int(max_rss if sys.platform == "darwin" else max_rss * 1024.0)
+    return {
+        "pid": os.getpid(),
+        "max_rss_bytes": max_rss_bytes,
+        "user_cpu_sec": float(usage.ru_utime),
+        "system_cpu_sec": float(usage.ru_stime),
+    }
+
+
+def _total_memory_bytes() -> Optional[int]:
+    try:
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        page_count = int(os.sysconf("SC_PHYS_PAGES"))
+        return page_size * page_count
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _linux_cpu_model() -> Optional[str]:
+    cpuinfo = Path("/proc/cpuinfo")
+    if not cpuinfo.exists():
+        return None
+    try:
+        for line in cpuinfo.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.lower().startswith("model name") and ":" in line:
+                return line.split(":", 1)[1].strip()
+    except OSError:
+        return None
+    return None
+
+
+def _package_versions(names: Sequence[str]) -> Dict[str, Optional[str]]:
+    versions: Dict[str, Optional[str]] = {}
+    for name in names:
+        try:
+            versions[name] = metadata.version(name)
+        except metadata.PackageNotFoundError:
+            versions[name] = None
+    return versions
+
+
+def _accelerator_snapshot() -> Dict[str, Any]:
+    try:
+        import torch
+    except Exception:
+        return {
+            "torch_version": None,
+            "cuda_runtime": None,
+            "cuda_available": False,
+            "device_count": 0,
+            "device_names": [],
+        }
+    try:
+        cuda_available = bool(torch.cuda.is_available())
+        device_count = int(torch.cuda.device_count()) if cuda_available else 0
+        device_names = [
+            str(torch.cuda.get_device_name(index))
+            for index in range(device_count)
+        ]
+    except Exception:
+        cuda_available = False
+        device_count = 0
+        device_names = []
+    return {
+        "torch_version": str(torch.__version__),
+        "cuda_runtime": None if torch.version.cuda is None else str(torch.version.cuda),
+        "cuda_available": cuda_available,
+        "device_count": device_count,
+        "device_names": device_names,
+    }
 
 
 @dataclass
@@ -38,6 +132,106 @@ class ArtifactPaths:
     samples: Path
 
 
+class _TimestampedTee:
+    """Mirror a text stream while writing a timestamped, line-oriented log."""
+
+    def __init__(self, original: Any, log_handle: Any, stream_name: str, lock: threading.RLock) -> None:
+        self._original = original
+        self._log_handle = log_handle
+        self._stream_name = stream_name
+        self._lock = lock
+        self._buffer = ""
+
+    def write(self, value: Any) -> int:
+        text = str(value)
+        with self._lock:
+            written = self._original.write(text)
+            self._original.flush()
+            # tqdm uses carriage returns. Treat them as line boundaries in the
+            # persistent log so an interrupted run still shows its last state.
+            normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+            self._buffer += normalized
+            while "\n" in self._buffer:
+                line, self._buffer = self._buffer.split("\n", 1)
+                self._write_log_line(line)
+            self._log_handle.flush()
+        return len(text) if written is None else int(written)
+
+    def flush(self) -> None:
+        with self._lock:
+            self._original.flush()
+            self._log_handle.flush()
+
+    def close_log_buffer(self) -> None:
+        with self._lock:
+            if self._buffer:
+                self._write_log_line(self._buffer)
+                self._buffer = ""
+            self._log_handle.flush()
+
+    def _write_log_line(self, line: str) -> None:
+        timestamp = datetime.now().astimezone().isoformat(timespec="milliseconds")
+        self._log_handle.write(f"{timestamp} [{self._stream_name}] {line}\n")
+
+    def isatty(self) -> bool:
+        return bool(getattr(self._original, "isatty", lambda: False)())
+
+    def fileno(self) -> int:
+        return self._original.fileno()
+
+    @property
+    def encoding(self) -> str:
+        return getattr(self._original, "encoding", "utf-8")
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._original, name)
+
+
+class ConsoleLogCapture:
+    """Active stdout/stderr tee owned by a benchmark logger."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._handle: Any = None
+        self._stdout: Any = None
+        self._stderr: Any = None
+        self._stdout_tee: Optional[_TimestampedTee] = None
+        self._stderr_tee: Optional[_TimestampedTee] = None
+        self._closed = False
+
+    def start(self) -> "ConsoleLogCapture":
+        if self._handle is not None:
+            return self
+        self._handle = self.path.open("a", encoding="utf-8", buffering=1)
+        self._stdout, self._stderr = sys.stdout, sys.stderr
+        lock = threading.RLock()
+        self._stdout_tee = _TimestampedTee(self._stdout, self._handle, "stdout", lock)
+        self._stderr_tee = _TimestampedTee(self._stderr, self._handle, "stderr", lock)
+        sys.stdout, sys.stderr = self._stdout_tee, self._stderr_tee
+        return self
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._stdout_tee is not None:
+            self._stdout_tee.close_log_buffer()
+        if self._stderr_tee is not None:
+            self._stderr_tee.close_log_buffer()
+        if self._stdout is not None and sys.stdout is self._stdout_tee:
+            sys.stdout = self._stdout
+        if self._stderr is not None and sys.stderr is self._stderr_tee:
+            sys.stderr = self._stderr
+        if self._handle is not None:
+            self._handle.close()
+
+    def __enter__(self) -> "ConsoleLogCapture":
+        return self.start()
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        self.close()
+
+
 class BenchmarkLogger:
     """Utility to persist benchmark artifacts and strategy run logs."""
 
@@ -45,6 +239,12 @@ class BenchmarkLogger:
         self.run_id = run_id or self._generate_run_id()
         self.paths = self._init_artifacts(artifacts_root=artifacts_root, run_id=self.run_id)
         self.jsonl_path = self.paths.logs / "strategy_runs.jsonl"
+        self.events_path = self.paths.logs / "events.jsonl"
+        self.console_log_path = self.paths.logs / "console.log"
+        self.environment_path = self.paths.root / "environment.json"
+        self._started_at = perf_counter()
+        self._write_lock = threading.RLock()
+        self.save_environment_snapshot()
 
     @staticmethod
     def _generate_run_id() -> str:
@@ -91,6 +291,107 @@ class BenchmarkLogger:
 
         self._save_metrics_snapshot(dataset_name, strategy_name, payload)
         return payload
+
+    def start_console_capture(self) -> ConsoleLogCapture:
+        """Start mirroring stdout and stderr into ``logs/console.log``."""
+        return ConsoleLogCapture(self.console_log_path).start()
+
+    def log_event(
+        self,
+        event: str,
+        *,
+        status: Optional[str] = None,
+        duration_sec: Optional[float] = None,
+        details: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "run_id": self.run_id,
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "timestamp_local": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+            "elapsed_run_sec": float(perf_counter() - self._started_at),
+            "event": str(event),
+            "resources": _process_resource_snapshot(),
+        }
+        if status is not None:
+            payload["status"] = str(status)
+        if duration_sec is not None:
+            payload["duration_sec"] = float(duration_sec)
+        if details:
+            payload["details"] = _json_ready(dict(details))
+        with self._write_lock:
+            with self.events_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        return payload
+
+    @contextmanager
+    def stage(self, stage_name: str, **details: Any) -> Iterable[None]:
+        """Log a stage immediately, including duration and failure details."""
+        started = perf_counter()
+        print(f"[stage:start] {stage_name} {_compact_details(details)}".rstrip(), flush=True)
+        self.log_event(stage_name, status="started", details=details)
+        try:
+            yield
+        except BaseException as exc:
+            duration = perf_counter() - started
+            failure_details = {
+                **details,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+            self.log_event(
+                stage_name,
+                status="failed",
+                duration_sec=duration,
+                details=failure_details,
+            )
+            print(
+                f"[stage:failed] {stage_name} duration={duration:.3f}s "
+                f"error={type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            raise
+        else:
+            duration = perf_counter() - started
+            self.log_event(
+                stage_name,
+                status="completed",
+                duration_sec=duration,
+                details=details,
+            )
+            print(f"[stage:end] {stage_name} duration={duration:.3f}s", flush=True)
+
+    def save_environment_snapshot(self) -> Path:
+        """Persist the hardware/software context needed to interpret timings."""
+        payload = {
+            "captured_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "python": sys.version,
+            "platform": platform.platform(),
+            "machine": platform.machine(),
+            "processor": platform.processor() or _linux_cpu_model(),
+            "logical_cpu_count": os.cpu_count(),
+            "total_memory_bytes": _total_memory_bytes(),
+            "accelerator": _accelerator_snapshot(),
+            "packages": _package_versions(
+                ("sampling-zoo", "numpy", "pandas", "scipy", "scikit-learn", "openml", "lightgbm", "tabpfn", "tabicl", "torch")
+            ),
+            "environment": {
+                key: os.environ.get(key)
+                for key in (
+                    "CUDA_VISIBLE_DEVICES",
+                    "OMP_NUM_THREADS",
+                    "MKL_NUM_THREADS",
+                    "OPENBLAS_NUM_THREADS",
+                    "LOKY_MAX_CPU_COUNT",
+                )
+                if os.environ.get(key) is not None
+            },
+        }
+        self.environment_path.write_text(
+            json.dumps(_json_ready(payload), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return self.environment_path
 
     def _save_metrics_snapshot(self, dataset_name: str, strategy_name: str, payload: Mapping[str, Any]) -> None:
         file_name = f"{dataset_name}__{strategy_name}.json".replace("/", "_")
