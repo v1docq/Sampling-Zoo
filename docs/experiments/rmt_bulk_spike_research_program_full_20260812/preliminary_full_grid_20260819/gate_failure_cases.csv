@@ -1,0 +1,2 @@
+dataset,seed,budget_ratio,model,selected_arm_name,test_primary_metric,test_primary_value,b0_test_primary_value,test_brier_score,b0_test_brier_score,brier_score_gain_vs_b0,gate_metric,minimum_allowed_gain
+jannis__task_211979,46,0.2,lightgbm,B1_bulk_single_spike,log_loss,0.7661343937617653,0.768848420613858,0.4241345841236581,0.4192254012274427,-0.011710127491898002,brier_score_gain_vs_b0,-0.01

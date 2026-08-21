@@ -1,0 +1,16 @@
+problem_type,dataset,runs,selected_specialized,mean_b3_gain,worst_b3_gain,selection_rate
+classification,PhishingWebsites__task_359971,20,0,0.0,0.0,0.0
+classification,adult__task_359983,20,0,0.0,0.0,0.0
+classification,bank-marketing__task_359982,20,0,0.0,0.0,0.0
+classification,car__task_359960,20,0,0.0,0.0,0.0
+classification,covertype__task_7593,20,0,0.0,0.0,0.0
+classification,jannis__task_211979,20,3,0.0036580139485799016,0.0,0.15
+classification,segment__task_359963,20,3,0.04479253655522056,0.0,0.15
+classification,vehicle__task_190146,20,1,0.0025665712986310285,0.0,0.05
+regression,Brazilian_houses__task_359938,20,2,0.0008079501803501766,0.0,0.1
+regression,OnlineNewsPopularity__task_359941,20,5,0.001128607598143078,0.0,0.25
+regression,diamonds__task_233211,20,1,0.006666531557072417,0.0,0.05
+regression,elevators__task_359936,20,5,0.015825107440291968,-0.007416211350081284,0.25
+regression,house_16H__task_359952,20,1,0.003612493511730608,0.0,0.05
+regression,house_sales__task_359949,20,0,0.0,0.0,0.0
+regression,pol__task_359946,20,0,0.0,0.0,0.0

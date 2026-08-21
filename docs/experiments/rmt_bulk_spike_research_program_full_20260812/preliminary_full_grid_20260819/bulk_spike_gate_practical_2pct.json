@@ -1,0 +1,35 @@
+{
+  "status": "passed",
+  "gate_profile": {
+    "name": "practical_exploration",
+    "primary_harm_margin": 0.01,
+    "tail_harm_margin": 0.015,
+    "brier_harm_margin": 0.02,
+    "ece_harm_margin": 0.02,
+    "f1_macro_harm_margin": 0.01,
+    "worst_class_recall_harm_margin": 0.01
+  },
+  "checks": {
+    "all_records_completed": true,
+    "full_dataset_references_completed": true,
+    "specialized_topologies_preserve_exact_budget": true,
+    "median_gain_nonnegative": true,
+    "worst_harm_within_margin": true,
+    "selected_specialization_win_rate_at_least_80pct": true,
+    "regression_tail_noninferiority": true,
+    "classification_probability_and_balance_noninferiority": true
+  },
+  "expected_records": 1200,
+  "observed_records": 1200,
+  "b3_median_gain": 0.0,
+  "b3_worst_gain": -0.007416211350081284,
+  "selected_specialization_count": 21,
+  "selected_specialization_win_rate": 0.9523809523809523,
+  "regression_worst_tail_gain": -0.010513745976520852,
+  "classification_guards": {
+    "brier_score_gain_vs_b0": true,
+    "expected_calibration_error_gain_vs_b0": true,
+    "f1_macro_gain_vs_b0": true,
+    "worst_class_recall_gain_vs_b0": true
+  }
+}
