@@ -1,0 +1,23 @@
+{
+  "status": "implementation_verified",
+  "stage": "classification_routing_geometry_selector",
+  "date": "2026-08-12",
+  "expected_full_run_records": 480,
+  "datasets": {
+    "binary": ["adult", "bank-marketing", "PhishingWebsites"],
+    "multiclass": ["car", "segment", "vehicle"]
+  },
+  "seeds": [42, 43, 44, 45, 46],
+  "budget_ratios": [0.01, 0.05, 0.1, 0.2],
+  "arms": [
+    "A2_median_scaled_euclidean",
+    "A5_gmm_posterior",
+    "A6_cosine_negative_control",
+    "A10_classification_guarded_cross_fitted_selected"
+  ],
+  "verification": {
+    "command": "python -m pytest -q test/test_cross_fitted_routing_geometry_selector.py test/test_routing_geometry.py test/test_rmt_classification_sampling_gate.py",
+    "passed": 58,
+    "failed": 0
+  }
+}

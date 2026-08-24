@@ -1,0 +1,36 @@
+{
+  "date": "2026-08-15",
+  "python_environment": ".venv_rmt_cuda39",
+  "targeted_tests": {
+    "status": "passed",
+    "passed": 137
+  },
+  "classification_protocol_correction_tests": {
+    "status": "passed",
+    "passed": 75
+  },
+  "target_type_contract_tests": {
+    "status": "passed",
+    "passed": 61,
+    "scope": [
+      "classification sampling budget",
+      "integer-valued regression",
+      "routing geometry",
+      "research-stage retry"
+    ]
+  },
+  "applicable_full_suite": {
+    "status": "passed",
+    "passed": 393,
+    "ignored": [
+      "test/test_feature_based.py",
+      "test/test_temporal.py"
+    ],
+    "ignore_reason": "existing imports from core outside the current change"
+  },
+  "visual_checks": [
+    "rmt_bulk_spike_topology_real_smoke_20260812/bulk_spike_gain_by_budget.png",
+    "rmt_scaling_law_smoke_20260812/analysis/scaling_law_curves.png",
+    "rmt_research_program_real_smoke_20260812/02_bulk_spike_topology/bulk_spike_gain_by_budget.png"
+  ]
+}

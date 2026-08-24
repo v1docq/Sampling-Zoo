@@ -1,0 +1,44 @@
+{
+  "primary_metrics": {
+    "binary": {
+      "metric": "roc_auc",
+      "direction": "higher",
+      "gain_scale": "absolute",
+      "noninferiority_margin": 0.005
+    },
+    "multiclass": {
+      "metric": "log_loss",
+      "direction": "lower",
+      "gain_scale": "relative",
+      "noninferiority_margin": 0.01
+    }
+  },
+  "guard_metrics": [
+    {
+      "metric": "brier_score",
+      "direction": "lower",
+      "gain_scale": "relative",
+      "noninferiority_margin": 0.01
+    },
+    {
+      "metric": "expected_calibration_error",
+      "direction": "lower",
+      "gain_scale": "absolute",
+      "noninferiority_margin": 0.01
+    },
+    {
+      "metric": "f1_macro",
+      "direction": "higher",
+      "gain_scale": "absolute",
+      "noninferiority_margin": 0.01
+    },
+    {
+      "metric": "worst_class_recall",
+      "direction": "higher",
+      "gain_scale": "absolute",
+      "noninferiority_margin": 0.01
+    }
+  ],
+  "fallback_arm": "A2_median_scaled_euclidean",
+  "require_all_metrics": true
+}

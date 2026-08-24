@@ -5,4 +5,11 @@ scipy>=1.7.0
 tqdm>=4.62.0
 imbalanced-learn>=0.8.0
 iterative-stratification>=0.1.9
+hdbscan>=0.8.29
+tensorly>=0.5.0
 mlflow>=2.14.0
+openml>=0.14.0
+lightgbm>=4.0.0
+torch>=2.1.0
+tabpfn==6.3.2
+tabicl==2.0.3

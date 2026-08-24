@@ -1,0 +1,30 @@
+{
+  "date": "2026-08-12",
+  "base_commit": "a77ccb96",
+  "head_commit": "0fafc921",
+  "changed_files": 122,
+  "experiment_artifact_files": 86,
+  "experiment_artifact_bytes": 12294230,
+  "formats": {
+    "csv": 24,
+    "json_or_jsonl": 38,
+    "png": 7,
+    "markdown": 17
+  },
+  "checks": {
+    "credential_patterns_found": false,
+    "server_credentials_found": false,
+    "raw_openml_feature_rows_persisted": false,
+    "raw_openml_targets_persisted": false,
+    "jsonl_contains_aggregated_metrics_and_diagnostics_only": true
+  },
+  "searched_patterns": [
+    "Hugging Face token",
+    "GitHub token",
+    "OpenAI-style secret key",
+    "private-key header",
+    "server address and username",
+    "password, API key and secret markers"
+  ],
+  "conclusion": "No sensitive content was found in the experiment artifacts selected for publication."
+}

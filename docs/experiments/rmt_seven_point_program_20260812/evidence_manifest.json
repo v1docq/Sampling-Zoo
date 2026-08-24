@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "program": "rmt_seven_point_research_program",
+  "completed_at": "2026-08-12",
+  "total_primary_records": 1582,
+  "evidence": [
+    {
+      "id": "a9_independent_holdout",
+      "status": "passed",
+      "records": 320,
+      "failed_records": 0,
+      "artifact_dir": "docs/experiments/rmt_tail_guard_holdout_20260812",
+      "gate_file": "tail_guard_holdout_gate.json"
+    },
+    {
+      "id": "leverage_sketch_synthetic",
+      "status": "passed",
+      "records": 252,
+      "failed_records": 0,
+      "artifact_dir": "docs/experiments/rmt_phase_s_synthetic_20260811",
+      "gate_file": "phase_s_gate.json"
+    },
+    {
+      "id": "leverage_sketch_real",
+      "status": "failed",
+      "records": 180,
+      "failed_records": 0,
+      "artifact_dir": "docs/experiments/rmt_phase_s_real_full_20260811",
+      "gate_file": "phase_s_real_gate.json"
+    },
+    {
+      "id": "leverage_shap_composition",
+      "status": "failed",
+      "records": 800,
+      "failed_records": 0,
+      "artifact_dir": "docs/experiments/rmt_leverage_shap_20260811",
+      "gate_file": "leverage_shap_gate.json"
+    },
+    {
+      "id": "bulk_spike_identifiability",
+      "status": "passed",
+      "records": 30,
+      "failed_records": 0,
+      "artifact_dir": "docs/experiments/rmt_bulk_spike_synthetic_20260811",
+      "gate_file": "bulk_spike_gate.json"
+    }
+  ],
+  "verification": {
+    "applicable_tests_passed": 340,
+    "known_collection_exclusions": [
+      "test/test_feature_based.py",
+      "test/test_temporal.py"
+    ],
+    "exclusion_reason": "Pre-existing imports from top-level core package"
+  }
+}

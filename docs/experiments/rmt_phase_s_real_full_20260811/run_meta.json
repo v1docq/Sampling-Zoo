@@ -1,0 +1,83 @@
+{
+  "experiment": "rmt_leverage_sketch_real_phase_s",
+  "status": "completed",
+  "completed_arms": [
+    "R0_uniform",
+    "R1_capped_incumbent",
+    "R2_robust_mixture",
+    "R3_robust_mixture_ipw",
+    "R4_ridge_leverage_ipw"
+  ],
+  "record_count": 180,
+  "expected_a9_records": 180,
+  "updated_at": "2026-08-11T22:56:06.454697",
+  "config": {
+    "regression_tasks": [
+      "diamonds",
+      "OnlineNewsPopularity"
+    ],
+    "classification_tasks": [
+      "bank-marketing",
+      "covertype"
+    ],
+    "models": [
+      "lightgbm"
+    ],
+    "budget_ratios": [
+      0.05,
+      0.1,
+      0.2
+    ],
+    "seeds": [
+      11,
+      29,
+      47
+    ],
+    "arms": [
+      {
+        "arm_id": "R0_uniform",
+        "selection_method": "uniform",
+        "training_reweighting": "none",
+        "leverage_mixture_alpha": 0.25,
+        "leverage_cap_quantile": 0.95
+      },
+      {
+        "arm_id": "R1_capped_incumbent",
+        "selection_method": "capped_leverage",
+        "training_reweighting": "none",
+        "leverage_mixture_alpha": 0.25,
+        "leverage_cap_quantile": 0.95
+      },
+      {
+        "arm_id": "R2_robust_mixture",
+        "selection_method": "robust_leverage_mixture",
+        "training_reweighting": "none",
+        "leverage_mixture_alpha": 0.25,
+        "leverage_cap_quantile": 0.95
+      },
+      {
+        "arm_id": "R3_robust_mixture_ipw",
+        "selection_method": "robust_leverage_mixture",
+        "training_reweighting": "inverse_probability",
+        "leverage_mixture_alpha": 0.25,
+        "leverage_cap_quantile": 0.95
+      },
+      {
+        "arm_id": "R4_ridge_leverage_ipw",
+        "selection_method": "saturated_ridge_leverage",
+        "training_reweighting": "inverse_probability",
+        "leverage_mixture_alpha": 0.25,
+        "leverage_cap_quantile": 0.95
+      }
+    ],
+    "max_train_rows": 50000,
+    "selection_folds": 5,
+    "n_partitions": 5,
+    "tail_risk_quantile": 0.9,
+    "tail_noninferiority_margin": 0.005,
+    "regression_stratification_bins": 10,
+    "output_dir": "/home/revin_new/rmt_results/run_rmt_leverage_sketch_real_full_20260811",
+    "show_progress": false
+  },
+  "error": null
+}

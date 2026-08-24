@@ -1,0 +1,15 @@
+{
+  "passed": false,
+  "checks": {
+    "all_records_completed": true,
+    "row_budgets_exact": true,
+    "projected_efficiency_holds": true,
+    "informative_median_leverage_gain_positive": false,
+    "informative_mean_leverage_gain_positive": false,
+    "informative_leverage_win_rate_at_least_60pct": false
+  },
+  "informative_pair_count": 299,
+  "median_leverage_gain": -0.0008779207254086597,
+  "mean_leverage_gain": -0.0006426978270372041,
+  "leverage_win_rate": 0.4816053511705686
+}

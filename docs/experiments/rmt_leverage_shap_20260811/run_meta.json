@@ -1,0 +1,41 @@
+{
+  "experiment": "rmt_leverage_shap",
+  "status": "completed",
+  "record_count": 800,
+  "expected_records": 800,
+  "gate_passed": false,
+  "config": {
+    "n_players": 10,
+    "budget_multipliers": [
+      2.0,
+      4.0,
+      8.0,
+      16.0
+    ],
+    "seeds": [
+      11,
+      29,
+      47,
+      71,
+      101,
+      127,
+      151,
+      181,
+      211,
+      241,
+      271,
+      307,
+      337,
+      367,
+      397,
+      431,
+      461,
+      491,
+      521,
+      557
+    ],
+    "row_budget_ratio": 0.25,
+    "output_dir": "examples\\benchmark\\results\\run_rmt_leverage_shap_20260811_faithful",
+    "show_progress": false
+  }
+}

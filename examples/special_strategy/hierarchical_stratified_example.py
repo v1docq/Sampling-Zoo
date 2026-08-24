@@ -15,7 +15,7 @@ import pandas as pd
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.append(str(ROOT))
 
-from core.sampling_strategies.stratified_sampler import AdvancedStratifiedSampler, StratifiedSplitSampler
+from sampling_zoo.core.sampling_strategies.stratified_sampler import AdvancedStratifiedSampler, StratifiedSplitSampler
 
 
 def run_advanced_sampler():

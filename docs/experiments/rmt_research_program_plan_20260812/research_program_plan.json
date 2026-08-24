@@ -1,0 +1,117 @@
+{
+  "program": "rmt_classification_bulk_spike_scaling",
+  "created_at": "2026-08-12T10:01:44+00:00",
+  "updated_at": "2026-08-12T10:01:44+00:00",
+  "config": {
+    "output_root": "docs\\experiments\\rmt_research_program_plan_20260812",
+    "models": [
+      "lightgbm"
+    ],
+    "budgets": [
+      0.01,
+      0.05,
+      0.1,
+      0.2
+    ],
+    "scaling_budgets": [
+      0.01,
+      0.02,
+      0.03,
+      0.05,
+      0.075,
+      0.1,
+      0.15,
+      0.2,
+      0.3,
+      0.5
+    ],
+    "seeds": [
+      42,
+      43,
+      44,
+      45,
+      46
+    ],
+    "max_train_rows": 100000,
+    "bootstrap_iterations": 500
+  },
+  "plan": {
+    "stages": [
+      {
+        "stage_id": "classification_geometry_guard",
+        "title": "Защищённый выбор геометрии для классификации",
+        "artifact_directory": "01_classification_geometry_guard",
+        "expected_records": 480,
+        "dependencies": [],
+        "gate_dependencies": []
+      },
+      {
+        "stage_id": "conditional_row_policy",
+        "title": "Условный выбор uniform или capped leverage",
+        "artifact_directory": "02_conditional_row_policy",
+        "expected_records": 480,
+        "dependencies": [],
+        "gate_dependencies": []
+      },
+      {
+        "stage_id": "bulk_spike_pilot",
+        "title": "Пилот bulk/spike-топологии",
+        "artifact_directory": "03_bulk_spike_pilot",
+        "expected_records": 320,
+        "dependencies": [
+          "classification_geometry_guard",
+          "conditional_row_policy"
+        ],
+        "gate_dependencies": [
+          "classification_geometry_guard"
+        ]
+      },
+      {
+        "stage_id": "bulk_spike_confirmation",
+        "title": "Независимое подтверждение bulk/spike-топологии",
+        "artifact_directory": "04_bulk_spike_confirmation",
+        "expected_records": 640,
+        "dependencies": [
+          "bulk_spike_pilot"
+        ],
+        "gate_dependencies": [
+          "bulk_spike_pilot"
+        ]
+      },
+      {
+        "stage_id": "bulk_spike_full_grid",
+        "title": "Полная AMLB-сетка bulk/spike",
+        "artifact_directory": "05_bulk_spike_full_grid",
+        "expected_records": 1200,
+        "dependencies": [
+          "bulk_spike_confirmation"
+        ],
+        "gate_dependencies": [
+          "bulk_spike_confirmation"
+        ]
+      },
+      {
+        "stage_id": "dense_scaling_grid",
+        "title": "Плотная бюджетная сетка законов масштабирования",
+        "artifact_directory": "06_dense_scaling_grid",
+        "expected_records": 1600,
+        "dependencies": [
+          "bulk_spike_full_grid"
+        ],
+        "gate_dependencies": [
+          "bulk_spike_full_grid"
+        ]
+      },
+      {
+        "stage_id": "final_analysis",
+        "title": "Итоговый анализ и законы масштабирования",
+        "artifact_directory": "07_final_analysis",
+        "expected_records": 16,
+        "dependencies": [
+          "dense_scaling_grid"
+        ],
+        "gate_dependencies": []
+      }
+    ]
+  }
+}

@@ -1,0 +1,17 @@
+dataset,model,arm_name,budget_ratio,median_loss,predicted_loss,n_observations,is_full_reference
+synthetic_multiclass_topology,ridge,B0_standard_A9,0.05,0.5877304774034218,0.597859066524693,1,False
+synthetic_multiclass_topology,ridge,B0_standard_A9,0.1,0.4844150069838109,0.5270575411197189,1,False
+synthetic_multiclass_topology,ridge,B0_standard_A9,0.2,0.5371519219991783,0.45674507757454386,1,False
+synthetic_multiclass_topology,ridge,B0_standard_A9,1.0,0.2953520015659964,0.2953520015659965,1,True
+synthetic_multiclass_topology,ridge,B3_validation_selected,0.05,0.5877304774034218,0.597859066524693,1,False
+synthetic_multiclass_topology,ridge,B3_validation_selected,0.1,0.4844150069838109,0.5270575411197189,1,False
+synthetic_multiclass_topology,ridge,B3_validation_selected,0.2,0.5371519219991783,0.45674507757454386,1,False
+synthetic_multiclass_topology,ridge,B3_validation_selected,1.0,0.2953520015659964,0.2953520015659965,1,True
+synthetic_rmt_regression_smoke,ridge,B0_standard_A9,0.05,93.53990778508894,93.42460348923971,1,False
+synthetic_rmt_regression_smoke,ridge,B0_standard_A9,0.1,19.698398006429127,23.367953292263145,1,False
+synthetic_rmt_regression_smoke,ridge,B0_standard_A9,0.2,15.026625396097142,14.610872017641071,1,False
+synthetic_rmt_regression_smoke,ridge,B0_standard_A9,1.0,13.369868499866058,13.369868499866058,1,True
+synthetic_rmt_regression_smoke,ridge,B3_validation_selected,0.05,22.577351358819023,22.77635427590272,1,False
+synthetic_rmt_regression_smoke,ridge,B3_validation_selected,0.1,19.698398006429127,18.637439919050706,1,False
+synthetic_rmt_regression_smoke,ridge,B3_validation_selected,0.2,15.026625396097142,16.09984123561958,1,False
+synthetic_rmt_regression_smoke,ridge,B3_validation_selected,1.0,13.369868499866058,13.369868499866058,1,True

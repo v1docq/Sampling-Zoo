@@ -1,0 +1,46 @@
+{
+  "data_quality": {
+    "a9_holdout": {
+      "rows": 320,
+      "unique_identity_keys": 320,
+      "paired_comparisons": 80,
+      "failed_rows": 0,
+      "missing_primary_metrics": 0
+    },
+    "phase_s_real": {
+      "rows": 180,
+      "unique_identity_keys": 180,
+      "failed_rows": 0,
+      "missing_primary_metrics": 0,
+      "missing_regression_tail_metrics": 0
+    },
+    "phase_s_synthetic": {
+      "rows": 252,
+      "failed_rows": 0,
+      "exact_budget_rate": 1.0,
+      "unique_row_rate": 1.0
+    },
+    "leverage_shap": {
+      "rows": 800,
+      "failed_rows": 0,
+      "exact_budget_rate": 1.0,
+      "efficiency_constraint_rate": 1.0
+    },
+    "bulk_spike_synthetic": {
+      "rows": 30,
+      "failed_rows": 0,
+      "exact_budget_rate": 1.0
+    }
+  },
+  "code_verification": {
+    "pytest_passed": 340,
+    "pytest_failed": 0,
+    "py_compile": "passed",
+    "git_diff_check": "passed",
+    "visual_artifact_check": "passed",
+    "known_unrelated_collection_failures": [
+      "test/test_feature_based.py",
+      "test/test_temporal.py"
+    ]
+  }
+}
